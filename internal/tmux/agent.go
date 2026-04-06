@@ -74,6 +74,11 @@ func (b *ExecBridge) LaunchAgent(cfg AgentConfig) (*AgentResult, error) {
 		return nil, fmt.Errorf("create session: %w", err)
 	}
 
+	// Rename window to provider name so Agent Dashboard can detect it
+	if _, err := b.run("rename-window", "-t", cfg.Name+":0", provider); err != nil {
+		return nil, fmt.Errorf("rename window: %w", err)
+	}
+
 	if err := b.SendKeys(cfg.Name, cmd); err != nil {
 		return nil, fmt.Errorf("send command: %w", err)
 	}

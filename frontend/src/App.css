@@ -482,7 +482,21 @@
   font-size: 0.8rem;
 }
 .pane-target { color: var(--accent); font-family: monospace; }
-.pane-terminal { flex: 1; min-height: 0; overflow: hidden; background: var(--bg-tertiary); }
+.pane-terminal {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--bg-tertiary);
+  position: relative;
+}
+/* Ensure xterm.js terminal fills container and handles scrolling */
+.pane-terminal .xterm {
+  height: 100%;
+  width: 100%;
+}
+.pane-terminal .xterm-viewport {
+  overflow-y: auto !important;
+}
 .pane-dims { color: var(--text-dim); font-family: monospace; margin-left: 0.5rem; }
 
 .btn-switcher {

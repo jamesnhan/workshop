@@ -34,7 +34,7 @@ const sections = [
       ['Ctrl + P', 'Pane switcher'],
       ['Ctrl + Shift + P', 'Command palette'],
       ['Ctrl + Shift + F', 'Search pane output'],
-      ['Ctrl + Shift + K', 'Kanban board'],
+      ['Ctrl + Shift + B', 'Kanban board'],
       ['Ctrl + Shift + D', 'Agent dashboard'],
       ['?', 'This hotkey menu'],
       ['Escape', 'Close any panel'],
@@ -66,6 +66,29 @@ const sections = [
 ];
 
 export function HotkeyMenu({ onClose }: Props) {
+  // On Mac: Cmd for panels/views, Ctrl for navigation/layout (avoids conflicts)
+  const isMac = navigator.platform.toUpperCase().indexOf('MAC') >= 0;
+
+  // Map shortcuts dynamically based on platform
+  const displaySections = sections.map((section) => {
+    if (isMac) {
+      // On Mac: Ctrl stays Ctrl (navigation), Alt becomes Ctrl (for consistency)
+      // Views & Panels section: Ctrl → Cmd
+      if (section.title === 'Views & Panels' || section.title === 'Terminal') {
+        return {
+          ...section,
+          keys: section.keys.map(([key, desc]) => [key.replace(/Ctrl/g, 'Cmd'), desc] as [string, string])
+        };
+      }
+      // Navigation, Layout, Tabs: Alt → Ctrl (for conflict-free navigation)
+      return {
+        ...section,
+        keys: section.keys.map(([key, desc]) => [key.replace(/Alt/g, 'Ctrl'), desc] as [string, string])
+      };
+    }
+    return section;
+  });
+
   return (
     <div className="switcher-overlay" onClick={onClose}>
       <div className="hotkey-menu" onClick={(e) => e.stopPropagation()}>
@@ -74,7 +97,7 @@ export function HotkeyMenu({ onClose }: Props) {
           <button className="search-close" onClick={onClose}>x</button>
         </div>
         <div className="hotkey-body">
-          {sections.map((section) => (
+          {displaySections.map((section) => (
             <div key={section.title} className="hotkey-section">
               <h3 className="hotkey-section-title">{section.title}</h3>
               {section.keys.map(([key, desc]) => (

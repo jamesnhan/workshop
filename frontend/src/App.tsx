@@ -340,13 +340,19 @@ function App() {
       const key = normalize || settings.capsLockNormalization ? (e.key.length === 1 ? e.key.toLowerCase() : e.key) : e.key;
       const shift = normalize ? !e.shiftKey : e.shiftKey;
 
-      if (e.ctrlKey && key === 'p' && !shift && !e.altKey) {
+      // On Mac, use Cmd (metaKey) for panels/views, Ctrl for navigation/layout
+      const isMac = navigator.platform.toUpperCase().indexOf('MAC') >= 0;
+      const modKey = isMac ? e.metaKey : e.ctrlKey; // Cmd on Mac, Ctrl elsewhere (for panels)
+      const altModKey = isMac ? e.ctrlKey : e.metaKey; // Ctrl on Mac as fallback
+      const navKey = e.ctrlKey; // Always Ctrl for navigation (avoids conflicts with Glean/browser)
+
+      if ((modKey || altModKey) && key === 'p' && !shift && !e.altKey) {
         e.preventDefault(); e.stopPropagation();
         switcherOpen ? setSwitcherOpen(false) : openSwitcher();
         return;
       }
-      // Ctrl+Shift+P — command palette
-      if (e.ctrlKey && shift && key === 'p') {
+      // Ctrl+Shift+P (or Cmd+Shift+P on Mac) — command palette
+      if ((modKey || altModKey) && shift && key === 'p') {
         e.preventDefault(); e.stopPropagation();
         setCmdPaletteOpen((p) => !p);
         return;
@@ -372,43 +378,44 @@ function App() {
         }
       }
 
-      // Ctrl+Shift+D — agent dashboard (works even with terminal focused)
-      if (e.ctrlKey && shift && key === 'd') {
+      // Ctrl+Shift+D (or Cmd+Shift+D on Mac) — agent dashboard (works even with terminal focused)
+      if ((modKey || altModKey) && shift && key === 'd') {
         e.preventDefault(); e.stopPropagation();
         setDashboardOpen((p) => !p);
         return;
       }
 
-      // Ctrl+Shift+K — kanban board (works even with terminal focused)
-      if (e.ctrlKey && shift && key === 'k') {
+      // Cmd+Shift+B — kanban board (works even with terminal focused)
+      // Changed from Cmd+Shift+K to avoid conflict with Ctrl+Shift+K (merge up)
+      if ((modKey || altModKey) && shift && key === 'b') {
         e.preventDefault(); e.stopPropagation();
         setKanbanOpen((p) => !p);
         return;
       }
 
-      // Alt+B — toggle sidebar
-      if (e.altKey && !e.ctrlKey && !shift && key === 'b') {
+      // Toggle sidebar: Ctrl+B
+      if (navKey && !e.metaKey && !shift && key === 'b') {
         e.preventDefault(); e.stopPropagation();
         setSidebarCollapsed((p) => !p);
         return;
       }
 
-      if (e.ctrlKey && shift && key === 'f') {
+      if ((modKey || altModKey) && shift && key === 'f') {
         e.preventDefault(); e.stopPropagation();
         setSearchOpen((p) => !p);
         return;
       }
 
-      // Alt+h/j/k/l — navigate cells
-      if (e.altKey && !e.ctrlKey && !shift && 'hjkl'.includes(key)) {
+      // Navigate cells: Ctrl+HJKL (all platforms - avoids conflicts)
+      if (navKey && !e.metaKey && !shift && 'hjkl'.includes(key)) {
         e.preventDefault(); e.stopPropagation();
         const newId = navigateGrid(layoutRef.current, key as 'h' | 'j' | 'k' | 'l');
         if (newId !== layoutRef.current.focusedId) handleFocusCell(newId);
         return;
       }
 
-      // Alt+1-9 — direct cell focus
-      if (e.altKey && !e.ctrlKey && key >= '1' && key <= '9') {
+      // Direct cell focus: Ctrl+1-9 (all platforms)
+      if (navKey && !e.metaKey && key >= '1' && key <= '9') {
         e.preventDefault(); e.stopPropagation();
         const idx = parseInt(key) - 1;
         const cells = layoutRef.current.cells;
@@ -416,29 +423,29 @@ function App() {
         return;
       }
 
-      // Alt+f — toggle maximize focused cell
-      if (e.altKey && !e.ctrlKey && !shift && key === 'f') {
+      // Maximize: Ctrl+F (all platforms)
+      if (navKey && !e.metaKey && !shift && key === 'f') {
         e.preventDefault(); e.stopPropagation();
         toggleMaximize();
         return;
       }
 
-      // Alt+Shift+h/j/k/l — merge focused cell in direction
-      if (e.altKey && shift && !e.ctrlKey && 'hjkl'.includes(key)) {
+      // Merge cells: Ctrl+Shift+HJKL (all platforms)
+      if (navKey && shift && !e.metaKey && 'hjkl'.includes(key)) {
         e.preventDefault(); e.stopPropagation();
         mergeInDirection(key as 'h' | 'j' | 'k' | 'l');
         return;
       }
 
-      // Alt+Shift+S — split focused cell back into individual cells
-      if (e.altKey && shift && !e.ctrlKey && key === 's') {
+      // Split cell: Ctrl+Shift+S (all platforms)
+      if (navKey && shift && !e.metaKey && key === 's') {
         e.preventDefault(); e.stopPropagation();
         splitFocused();
         return;
       }
 
-      // Alt+] — next tab in focused cell
-      if (e.altKey && !e.ctrlKey && !shift && key === ']') {
+      // Next tab: Ctrl+]
+      if (navKey && !e.metaKey && !shift && key === ']') {
         e.preventDefault(); e.stopPropagation();
         setLayout((prev) => {
           const cell = prev.cells.find((c) => c.id === prev.focusedId);
@@ -454,8 +461,8 @@ function App() {
         return;
       }
 
-      // Alt+[ — previous tab in focused cell
-      if (e.altKey && !e.ctrlKey && !shift && key === '[') {
+      // Previous tab: Ctrl+[
+      if (navKey && !e.metaKey && !shift && key === '[') {
         e.preventDefault(); e.stopPropagation();
         setLayout((prev) => {
           const cell = prev.cells.find((c) => c.id === prev.focusedId);
@@ -471,8 +478,8 @@ function App() {
         return;
       }
 
-      // Alt+W — close current tab in focused cell
-      if (e.altKey && !e.ctrlKey && !shift && key === 'w') {
+      // Close tab: Ctrl+W
+      if (navKey && !e.metaKey && !shift && key === 'w') {
         e.preventDefault(); e.stopPropagation();
         const cell = layout.cells.find((c) => c.id === layout.focusedId);
         if (cell?.target) {
@@ -481,8 +488,8 @@ function App() {
         return;
       }
 
-      // Alt+Left — history back (only when terminal not focused, otherwise it's word nav)
-      if (e.altKey && !e.ctrlKey && !shift && key === 'ArrowLeft' && !document.activeElement?.classList.contains('xterm-helper-textarea')) {
+      // History back: Ctrl+Left (only when terminal not focused)
+      if (navKey && !e.metaKey && !shift && key === 'ArrowLeft' && !document.activeElement?.classList.contains('xterm-helper-textarea')) {
         e.preventDefault(); e.stopPropagation();
         setLayout((prev) => {
           const cell = prev.cells.find((c) => c.id === prev.focusedId);
@@ -496,8 +503,8 @@ function App() {
         return;
       }
 
-      // Alt+Right — history forward (only when terminal not focused)
-      if (e.altKey && !e.ctrlKey && !shift && key === 'ArrowRight' && !document.activeElement?.classList.contains('xterm-helper-textarea')) {
+      // History forward: Ctrl+Right (only when terminal not focused)
+      if (navKey && !e.metaKey && !shift && key === 'ArrowRight' && !document.activeElement?.classList.contains('xterm-helper-textarea')) {
         e.preventDefault(); e.stopPropagation();
         setLayout((prev) => {
           const cell = prev.cells.find((c) => c.id === prev.focusedId);
@@ -597,7 +604,7 @@ function App() {
     { id: 'notifications', label: 'Toggle Notifications', category: 'Panel', action: () => setNotifOpen((p) => !p) },
     { id: 'hotkeys', label: 'Show Keyboard Shortcuts', category: 'Panel', shortcut: '?', action: () => setHotkeyMenuOpen(true) },
     { id: 'toggle-sidebar', label: 'Toggle Sidebar', category: 'Panel', shortcut: 'Alt+B', action: () => setSidebarCollapsed((p) => !p) },
-    { id: 'kanban', label: 'Open Kanban Board', category: 'Panel', shortcut: 'Ctrl+Shift+K', action: () => setKanbanOpen(true) },
+    { id: 'kanban', label: 'Open Kanban Board', category: 'Panel', shortcut: 'Cmd+Shift+B', action: () => setKanbanOpen(true) },
     { id: 'dashboard', label: 'Open Agent Dashboard', category: 'Panel', shortcut: 'Ctrl+Shift+D', action: () => setDashboardOpen(true) },
     { id: 'docs', label: 'Open Docs', category: 'Panel', action: () => { setDocsOpen(true); setKanbanOpen(false); setDashboardOpen(false); } },
     { id: 'enable-notifs', label: `Notifications: ${permissionState}`, category: 'Settings', action: requestPermission },

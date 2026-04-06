@@ -48,15 +48,28 @@ export const PaneViewer = forwardRef<PaneViewerHandle, Props>(
     const searchRef = useRef<SearchAddon | null>(null);
     const onDataRef = useRef(onData);
     const onResizeRef = useRef(onResize);
+    const scrollTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
     onDataRef.current = onData;
     onResizeRef.current = onResize;
 
     useImperativeHandle(ref, () => ({
       write: (data: string) => {
-        termRef.current?.write(data);
+        const term = termRef.current;
+        if (!term) return;
+        term.write(data);
+        // Debounce scroll to bottom - only scroll after writes settle
+        // This is critical for Claude sessions which output rapidly
+        if (scrollTimerRef.current) clearTimeout(scrollTimerRef.current);
+        scrollTimerRef.current = setTimeout(() => {
+          term.scrollToBottom();
+        }, 50);
       },
       focus: () => {
-        termRef.current?.focus();
+        const term = termRef.current;
+        if (!term) return;
+        term.focus();
+        // Scroll to bottom when focusing terminal
+        term.scrollToBottom();
       },
       searchInTerminal: (text: string) => {
         return searchRef.current?.findNext(text, { caseSensitive: false }) ?? false;
@@ -87,9 +100,13 @@ export const PaneViewer = forwardRef<PaneViewerHandle, Props>(
       searchRef.current = search;
 
       // Fit to cell size, then tell backend the dimensions
+      // Use multiple RAF passes for Mac rendering timing
       requestAnimationFrame(() => {
-        fit.fit();
-        onResizeRef.current(term.cols, term.rows);
+        requestAnimationFrame(() => {
+          fit.fit();
+          term.scrollToBottom();
+          onResizeRef.current(term.cols, term.rows);
+        });
       });
 
       term.onData((data) => {
@@ -109,14 +126,19 @@ export const PaneViewer = forwardRef<PaneViewerHandle, Props>(
       const handleKeyDown = (e: KeyboardEvent) => {
         if (!container.contains(document.activeElement)) return;
 
+        const isMac = navigator.platform.toUpperCase().indexOf('MAC') >= 0;
+
         if (e.key === 'Tab' && !e.ctrlKey && !e.altKey) {
           if (e.shiftKey) return intercept(e, '\x1b[Z');
           return intercept(e, '\x09');
         }
+        // Ctrl+C for SIGINT (terminal convention, always Ctrl)
         if (e.ctrlKey && !e.shiftKey && !e.altKey && e.key === 'c') {
           return intercept(e, '\x03');
         }
-        if (e.ctrlKey && e.shiftKey && e.key === 'C') {
+        // Copy: Cmd+C on Mac, Ctrl+Shift+C on others
+        if ((isMac && e.metaKey && !e.shiftKey && e.key === 'c') ||
+            (!isMac && e.ctrlKey && e.shiftKey && e.key === 'C')) {
           if (term.hasSelection()) {
             navigator.clipboard.writeText(term.getSelection()).catch(() => {});
           }
@@ -124,7 +146,9 @@ export const PaneViewer = forwardRef<PaneViewerHandle, Props>(
           e.stopPropagation();
           return;
         }
-        if (e.ctrlKey && (e.key === 'v' || e.key === 'V')) {
+        // Paste: Cmd+V on Mac, Ctrl+V on others
+        if ((isMac && e.metaKey && (e.key === 'v' || e.key === 'V')) ||
+            (!isMac && e.ctrlKey && (e.key === 'v' || e.key === 'V'))) {
           e.preventDefault();
           e.stopPropagation();
           navigator.clipboard.readText().then((text) => {
@@ -154,10 +178,22 @@ export const PaneViewer = forwardRef<PaneViewerHandle, Props>(
         clearTimeout(resizeTimer);
         resizeTimer = setTimeout(() => {
           fit.fit();
+          term.scrollToBottom();
           onResizeRef.current(term.cols, term.rows);
         }, 150);
       });
       observer.observe(container);
+
+      // Additional resize listener for window resize (Mac Safari needs this)
+      const handleWindowResize = () => {
+        clearTimeout(resizeTimer);
+        resizeTimer = setTimeout(() => {
+          fit.fit();
+          term.scrollToBottom();
+          onResizeRef.current(term.cols, term.rows);
+        }, 150);
+      };
+      window.addEventListener('resize', handleWindowResize);
 
       // Touch scroll → mouse wheel escape sequences for tmux
       let touchStartY = 0;
@@ -195,7 +231,9 @@ export const PaneViewer = forwardRef<PaneViewerHandle, Props>(
 
       return () => {
         clearTimeout(resizeTimer);
+        if (scrollTimerRef.current) clearTimeout(scrollTimerRef.current);
         observer.disconnect();
+        window.removeEventListener('resize', handleWindowResize);
         container.removeEventListener('touchstart', handleTouchStart);
         container.removeEventListener('touchmove', handleTouchMove);
         document.removeEventListener('keydown', handleKeyDown, true);
