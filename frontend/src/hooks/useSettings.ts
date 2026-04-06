@@ -2,20 +2,30 @@ import { useState, useCallback } from 'react';
 
 const SETTINGS_KEY = 'workshop:settings';
 
+export type PreviewSize = 'small' | 'medium' | 'large';
+
 export interface WorkshopSettings {
   capsLockNormalization: boolean;
-  // Future settings go here
+  previewSize: PreviewSize;
 }
 
 const defaults: WorkshopSettings = {
   capsLockNormalization: true,
+  previewSize: 'medium',
 };
 
 function load(): WorkshopSettings {
   try {
     const raw = localStorage.getItem(SETTINGS_KEY);
-    if (!raw) return { ...defaults };
-    return { ...defaults, ...JSON.parse(raw) };
+    const base = raw ? { ...defaults, ...JSON.parse(raw) } : { ...defaults };
+    // Migrate legacy preview size if settings don't have it yet
+    if (!raw) {
+      const legacy = localStorage.getItem('workshop-preview-size');
+      if (legacy === 'small' || legacy === 'medium' || legacy === 'large') {
+        base.previewSize = legacy;
+      }
+    }
+    return base;
   } catch {
     return { ...defaults };
   }
@@ -23,6 +33,8 @@ function load(): WorkshopSettings {
 
 function save(settings: WorkshopSettings) {
   localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+  // Sync preview size to legacy key for Sidebar compatibility
+  localStorage.setItem('workshop-preview-size', settings.previewSize);
 }
 
 export function useSettings() {

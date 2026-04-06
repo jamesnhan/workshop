@@ -958,7 +958,16 @@ function App() {
           />
         )}
         {activeView === 'docs' && <DocsView />}
-        {activeView === 'settings' && <SettingsView settings={settings} onUpdate={updateSettings} />}
+        {activeView === 'settings' && (
+          <SettingsView
+            settings={settings}
+            onUpdate={updateSettings}
+            themeName={themeName}
+            onThemeChange={handleSetTheme}
+            notificationPermission={permissionState}
+            onRequestNotifications={requestPermission}
+          />
+        )}
       </main>
       {/* Mobile FAB for command palette */}
       <button className="mobile-fab" onClick={() => setCmdPaletteOpen(true)} title="Command Palette">
