@@ -276,6 +276,16 @@ func (b *ExecBridge) ResizePane(target string, cols, rows int) error {
 	return nil
 }
 
+// ResizeWindow tells tmux to resize the window containing the target to
+// match the smallest client (-A). This forces a full redraw which is
+// needed after the PTY is resized client-side.
+func (b *ExecBridge) ResizeWindow(target string, cols, rows int) error {
+	if out, err := b.run("resize-window", "-t", target, "-A"); err != nil {
+		return fmt.Errorf("resize-window: %w: %s", err, out)
+	}
+	return nil
+}
+
 // PaneTTY returns the TTY device path for a pane.
 func (b *ExecBridge) PaneTTY(target string) (string, error) {
 	out, err := b.run("display-message", "-p", "-t", target, "#{pane_tty}")

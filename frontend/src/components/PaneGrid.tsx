@@ -83,30 +83,37 @@ export function PaneGrid({
             {/* Tab bar */}
             {cell.tabs.length > 1 && (
               <div className="pane-tabs">
-                {cell.tabs.map((tab) => (
-                  <div
-                    key={tab.target}
-                    className={`pane-tab${tab.target === cell.target ? ' active' : ''}`}
-                    onClick={(e) => { e.stopPropagation(); onSwitchTab(cell.id, tab.target); }}
-                    onAuxClick={(e) => {
-                      if (e.button === 1) { e.stopPropagation(); onCloseTab(cell.id, tab.target); }
-                    }}
-                  >
-                    <span className="pane-tab-label">{tab.label}</span>
-                    <button
-                      className="pane-tab-close"
-                      onClick={(e) => { e.stopPropagation(); onCloseTab(cell.id, tab.target); }}
+                {cell.tabs.map((tab) => {
+                  const tabStatus = paneStatuses[tab.target];
+                  return (
+                    <div
+                      key={tab.target}
+                      className={`pane-tab${tab.target === cell.target ? ' active' : ''}${tabStatus ? ` tab-status-${tabStatus.status}` : ''}`}
+                      onClick={(e) => { e.stopPropagation(); onSwitchTab(cell.id, tab.target); }}
+                      onAuxClick={(e) => {
+                        if (e.button === 1) { e.stopPropagation(); onCloseTab(cell.id, tab.target); }
+                      }}
+                      title={tabStatus?.message || tabStatus?.status || tab.label}
                     >
-                      x
-                    </button>
-                  </div>
-                ))}
+                      {tabStatus && (
+                        <span className="pane-tab-status-dot" style={{ background: STATUS_COLORS[tabStatus.status] }} />
+                      )}
+                      <span className="pane-tab-label">{tab.label}</span>
+                      <button
+                        className="pane-tab-close"
+                        onClick={(e) => { e.stopPropagation(); onCloseTab(cell.id, tab.target); }}
+                      >
+                        x
+                      </button>
+                    </div>
+                  );
+                })}
               </div>
             )}
 
             {cell.target ? (
               <PaneViewer
-                key={cell.target}
+                key={cell.id}
                 ref={viewerRefs.get(cell.id) ?? null}
                 target={cell.target}
                 terminalTheme={theme.terminal}

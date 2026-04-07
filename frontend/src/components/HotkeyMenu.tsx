@@ -29,6 +29,7 @@ const sections = [
       [`${nav} + F`, 'Maximize / restore cell'],
       [`${nav} + Shift + H/J/K/L`, 'Merge cell in direction'],
       [`${nav} + Shift + S`, 'Split merged cell'],
+      [`${nav} + Shift + Arrows`, 'Swap focused cell with neighbor'],
       [`${nav} + B`, 'Toggle sidebar'],
     ],
   },

@@ -7,6 +7,55 @@ import (
 	"strings"
 )
 
+// confineToHome ensures path (after ~ expansion by caller) resolves within the
+// user's home directory. It rejects paths outside home *before* touching the
+// filesystem to avoid leaking existence of files outside home. If the path
+// exists, it additionally resolves symlinks and re-checks to block symlink
+// escapes. Returns the resolved path to use for I/O.
+func confineToHome(path string) (resolved string, status int, err error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", http.StatusInternalServerError, err
+	}
+	homeReal, err := filepath.EvalSymlinks(home)
+	if err != nil {
+		return "", http.StatusInternalServerError, err
+	}
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return "", http.StatusBadRequest, err
+	}
+	// First check: lexical containment against real home. This rejects
+	// non-existent paths outside home with 403 rather than leaking via 404.
+	if !withinDir(homeReal, absPath) {
+		return "", http.StatusForbidden, os.ErrPermission
+	}
+	// Second check: resolve symlinks and re-verify, to block symlink escapes
+	// from within home. If the path doesn't exist, fall through with absPath.
+	realPath, evalErr := filepath.EvalSymlinks(absPath)
+	if evalErr != nil {
+		if os.IsNotExist(evalErr) {
+			return absPath, 0, nil
+		}
+		return "", http.StatusInternalServerError, evalErr
+	}
+	if !withinDir(homeReal, realPath) {
+		return "", http.StatusForbidden, os.ErrPermission
+	}
+	return realPath, 0, nil
+}
+
+func withinDir(dir, path string) bool {
+	rel, err := filepath.Rel(dir, path)
+	if err != nil {
+		return false
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return false
+	}
+	return true
+}
+
 func (a *API) handleReadFile(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Query().Get("path")
 	if path == "" {
@@ -28,15 +77,32 @@ func (a *API) handleReadFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	content, err := os.ReadFile(path)
+	realPath, status, err := confineToHome(path)
 	if err != nil {
-		a.jsonError(w, "file not found", http.StatusNotFound)
+		switch status {
+		case http.StatusForbidden:
+			a.jsonError(w, "path not allowed", http.StatusForbidden)
+		case http.StatusBadRequest:
+			a.jsonError(w, "invalid path", http.StatusBadRequest)
+		default:
+			a.jsonError(w, "cannot resolve path", http.StatusInternalServerError)
+		}
+		return
+	}
+
+	content, err := os.ReadFile(realPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			a.jsonError(w, "file not found", http.StatusNotFound)
+		} else {
+			a.jsonError(w, "cannot read file", http.StatusInternalServerError)
+		}
 		return
 	}
 
 	a.jsonOK(w, map[string]string{
-		"path":    path,
-		"name":    filepath.Base(path),
+		"path":    realPath,
+		"name":    filepath.Base(realPath),
 		"content": string(content),
 	})
 }
@@ -51,6 +117,20 @@ func (a *API) handleListMarkdown(w http.ResponseWriter, r *http.Request) {
 		home, _ := os.UserHomeDir()
 		dir = filepath.Join(home, dir[2:])
 	}
+
+	realDir, status, err := confineToHome(dir)
+	if err != nil {
+		switch status {
+		case http.StatusForbidden:
+			a.jsonError(w, "path not allowed", http.StatusForbidden)
+		case http.StatusBadRequest:
+			a.jsonError(w, "invalid dir", http.StatusBadRequest)
+		default:
+			a.jsonError(w, "cannot resolve path", http.StatusInternalServerError)
+		}
+		return
+	}
+	dir = realDir
 
 	var files []map[string]string
 	filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {

@@ -254,7 +254,7 @@ export function KanbanBoard({ onNavigateToPane, defaultProject, focusedPath }: P
 
     try {
       const res = await post<{ target: string }>('/agents/launch', {
-        name: `card-${card.id}`,
+        name: `card-${card.id}-${Date.now().toString(36).slice(-5)}`,
         provider: 'claude',
         directory: undefined,
         prompt,

@@ -9,6 +9,7 @@ export interface PaneViewerHandle {
   focus: () => void;
   searchInTerminal: (text: string) => boolean;
   clearSearch: () => void;
+  refit: () => void;
 }
 
 interface TerminalTheme {
@@ -48,6 +49,7 @@ export const PaneViewer = forwardRef<PaneViewerHandle, Props>(
     const containerRef = useRef<HTMLDivElement>(null);
     const termRef = useRef<Terminal | null>(null);
     const searchRef = useRef<SearchAddon | null>(null);
+    const fitRef = useRef<FitAddon | null>(null);
     const onDataRef = useRef(onData);
     const onResizeRef = useRef(onResize);
     const onTicketHoverRef = useRef(onTicketHover);
@@ -81,7 +83,36 @@ export const PaneViewer = forwardRef<PaneViewerHandle, Props>(
       clearSearch: () => {
         searchRef.current?.clearDecorations();
       },
+      refit: () => {
+        const term = termRef.current;
+        const fit = fitRef.current;
+        if (!term || !fit) return;
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => {
+            fit.fit();
+            term.scrollToBottom();
+            onResizeRef.current(term.cols, term.rows);
+          });
+        });
+      },
     }));
+
+    // When the target prop changes (e.g. after a swap), clear the terminal
+    // and refit. The new target's data will repopulate via the App's
+    // onOutput → write() flow.
+    useEffect(() => {
+      const term = termRef.current;
+      const fit = fitRef.current;
+      if (!term || !fit) return;
+      term.clear();
+      term.reset();
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          fit.fit();
+          onResizeRef.current(term.cols, term.rows);
+        });
+      });
+    }, [target]);
 
     useEffect(() => {
       if (!containerRef.current) return;
@@ -102,6 +133,7 @@ export const PaneViewer = forwardRef<PaneViewerHandle, Props>(
       term.loadAddon(search);
       term.open(containerRef.current);
       searchRef.current = search;
+      fitRef.current = fit;
 
       // Register link provider for ticket references like #123
       const ticketLinkProvider = term.registerLinkProvider({
@@ -284,6 +316,7 @@ export const PaneViewer = forwardRef<PaneViewerHandle, Props>(
         container.removeEventListener('paste', handlePaste);
         term.dispose();
         termRef.current = null;
+        fitRef.current = null;
         searchRef.current = null;
       };
     }, [target]);

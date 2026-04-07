@@ -498,6 +498,24 @@
   background: var(--bg-secondary);
   border-bottom: 2px solid var(--accent);
 }
+.pane-tab-status-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-right: 0.3rem;
+  flex-shrink: 0;
+  box-shadow: 0 0 6px currentColor;
+  animation: pane-tab-pulse 2s ease-in-out infinite;
+}
+@keyframes pane-tab-pulse {
+  0%, 100% { opacity: 0.7; }
+  50% { opacity: 1; }
+}
+.pane-tab.tab-status-yellow .pane-tab-label,
+.pane-tab.tab-status-red .pane-tab-label {
+  font-weight: 600;
+}
 .pane-tab-label { max-width: 120px; overflow: hidden; text-overflow: ellipsis; }
 .pane-tab-close {
   background: transparent; border: none; color: var(--text-dim);

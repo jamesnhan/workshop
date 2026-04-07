@@ -21,7 +21,7 @@ import { useWorkshopSocket } from './hooks/useWebSocket';
 import { useNotifications } from './hooks/useNotifications';
 import { get, post } from './api/client';
 import type { LayoutState, PaneInfo } from './types';
-import { createGrid, navigateGrid, addRow, addCol, removeRow, removeCol, mergeCells, splitCell } from './types';
+import { createGrid, navigateGrid, addRow, addCol, removeRow, removeCol, mergeCells, splitCell, swapCellContents } from './types';
 import {
   loadLayout,
   restoreLayout,
@@ -159,6 +159,12 @@ function App() {
         ref.current.write('\x1b[2J\x1b[H'); // clear screen + cursor home
       }
     }
+    // Refit all viewers after reconnect — dimensions may have changed
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        viewerRefsMap.current.forEach((ref) => ref.current?.refit());
+      });
+    });
   }, []));
 
   // Load all panes
@@ -186,6 +192,10 @@ function App() {
         subscribePane(cell.target);
       }
     }
+    // Refit restored panes to their cell dimensions
+    setTimeout(() => {
+      viewerRefsMap.current.forEach((ref) => ref.current?.refit());
+    }, 100);
   }, [allPanes, layout.cells, subscribe]);
 
   // Assign pane to cell by ID, adding it to the cell's tab history
@@ -314,6 +324,22 @@ function App() {
   // Split focused cell back into individual cells
   const splitFocused = useCallback(() => {
     setLayout((prev) => splitCell(prev, prev.focusedId));
+  }, []);
+
+  // Swap focused cell's contents with the cell in the given direction
+  const swapInDirection = useCallback((dir: 'h' | 'j' | 'k' | 'l') => {
+    setLayout((prev) => {
+      const neighborId = navigateGrid(prev, dir);
+      if (neighborId === prev.focusedId) return prev;
+      const swapped = swapCellContents(prev, prev.focusedId, neighborId);
+      return { ...swapped, focusedId: neighborId };
+    });
+    // Refit all viewers after the swap settles in the DOM
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        viewerRefsMap.current.forEach((ref) => ref.current?.refit());
+      });
+    });
   }, []);
 
   // Clear status on user keyboard input in focused terminal
@@ -448,6 +474,19 @@ function App() {
         return;
       }
 
+      // Nav+Shift+Arrow — swap focused cell with neighbor
+      if (nav && shift && !mod && (key === 'ArrowLeft' || key === 'ArrowRight' || key === 'ArrowUp' || key === 'ArrowDown')) {
+        e.preventDefault(); e.stopPropagation();
+        const dirMap: Record<string, 'h' | 'j' | 'k' | 'l'> = {
+          ArrowLeft: 'h',
+          ArrowRight: 'l',
+          ArrowUp: 'k',
+          ArrowDown: 'j',
+        };
+        swapInDirection(dirMap[key]);
+        return;
+      }
+
       // Nav+] — next tab in focused cell
       if (nav && !mod && !shift && key === ']') {
         e.preventDefault(); e.stopPropagation();
@@ -532,7 +571,7 @@ function App() {
     document.addEventListener('keydown', handleGlobalKey, true);
     document.addEventListener('keydown', handleCapsLock);
     return () => { document.removeEventListener('keydown', handleGlobalKey, true); document.removeEventListener('keydown', handleCapsLock); };
-  }, [switcherOpen, openSwitcher, toggleMaximize, mergeInDirection, splitFocused, subscribe, unsubscribe, closeTab, layout.cells, layout.focusedId]);
+  }, [switcherOpen, openSwitcher, toggleMaximize, mergeInDirection, splitFocused, swapInDirection, subscribe, unsubscribe, closeTab, layout.cells, layout.focusedId]);
 
   const activeTargets = layout.cells
     .map((c) => c.target)
@@ -601,6 +640,10 @@ function App() {
     { id: 'merge-down', label: 'Merge Down', category: 'Layout', shortcut: 'Alt+Shift+J', action: () => mergeInDirection('j') },
     { id: 'merge-up', label: 'Merge Up', category: 'Layout', shortcut: 'Alt+Shift+K', action: () => mergeInDirection('k') },
     { id: 'merge-right', label: 'Merge Right', category: 'Layout', shortcut: 'Alt+Shift+L', action: () => mergeInDirection('l') },
+    { id: 'swap-left', label: 'Swap Cell Left', category: 'Layout', shortcut: 'Alt+Shift+←', action: () => swapInDirection('h') },
+    { id: 'swap-right', label: 'Swap Cell Right', category: 'Layout', shortcut: 'Alt+Shift+→', action: () => swapInDirection('l') },
+    { id: 'swap-up', label: 'Swap Cell Up', category: 'Layout', shortcut: 'Alt+Shift+↑', action: () => swapInDirection('k') },
+    { id: 'swap-down', label: 'Swap Cell Down', category: 'Layout', shortcut: 'Alt+Shift+↓', action: () => swapInDirection('j') },
 
     // Panels
     { id: 'pane-switcher', label: 'Open Pane Switcher', category: 'Panel', shortcut: 'Ctrl+P', action: () => openSwitcher() },

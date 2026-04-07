@@ -112,6 +112,37 @@ export function navigateGrid(layout: LayoutState, direction: 'h' | 'j' | 'k' | '
   return target?.id ?? layout.focusedId;
 }
 
+// Swap the contents (target, tabs, history) of two cells without
+// changing their positions or spans. Used for rearranging the grid.
+export function swapCellContents(layout: LayoutState, sourceId: string, targetId: string): LayoutState {
+  const source = layout.cells.find((c) => c.id === sourceId);
+  const target = layout.cells.find((c) => c.id === targetId);
+  if (!source || !target || source.id === target.id) return layout;
+
+  const newCells = layout.cells.map((c) => {
+    if (c.id === sourceId) {
+      return {
+        ...c,
+        target: target.target,
+        tabs: target.tabs,
+        history: target.history,
+        historyIndex: target.historyIndex,
+      };
+    }
+    if (c.id === targetId) {
+      return {
+        ...c,
+        target: source.target,
+        tabs: source.tabs,
+        history: source.history,
+        historyIndex: source.historyIndex,
+      };
+    }
+    return c;
+  });
+  return { ...layout, cells: newCells };
+}
+
 // Merge two adjacent cells — the focused cell absorbs the target cell
 export function mergeCells(layout: LayoutState, sourceId: string, targetId: string): LayoutState {
   const source = layout.cells.find((c) => c.id === sourceId);

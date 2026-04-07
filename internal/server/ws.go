@@ -289,6 +289,11 @@ func wsHandler(logger *slog.Logger, bridge tmuxpkg.Bridge, outputBuffer *OutputB
 						Cols: uint16(req.Cols),
 						Rows: uint16(req.Rows),
 					})
+					// Tell tmux to auto-resize the window to the smallest client.
+					// This forces a full redraw at the new dimensions.
+					if eb, ok := bridge.(*tmuxpkg.ExecBridge); ok {
+						go eb.ResizeWindow(req.Target, req.Cols, req.Rows)
+					}
 				}
 
 			case "input":
