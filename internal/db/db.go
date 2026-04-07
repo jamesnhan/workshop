@@ -25,6 +25,7 @@ type Card struct {
 	Labels      string    `json:"labels"`       // comma-separated labels
 	CardType    string    `json:"cardType"`     // bug, feature, task, chore
 	Priority    string    `json:"priority"`     // P0, P1, P2, P3
+	ParentID    int64     `json:"parentId"`     // 0 if root; otherwise the parent card's ID
 	CreatedAt   time.Time `json:"createdAt"`
 	UpdatedAt   time.Time `json:"updatedAt"`
 }
@@ -77,6 +78,7 @@ func (d *DB) migrate() error {
 	// Add columns if they don't exist (for existing databases)
 	d.db.Exec(`ALTER TABLE cards ADD COLUMN card_type TEXT DEFAULT ''`)
 	d.db.Exec(`ALTER TABLE cards ADD COLUMN priority TEXT DEFAULT ''`)
+	d.db.Exec(`ALTER TABLE cards ADD COLUMN parent_id INTEGER DEFAULT 0`)
 
 	// Recordings table
 	d.db.Exec(`
@@ -159,6 +161,7 @@ func (d *DB) migrate() error {
 	d.db.Exec(`CREATE INDEX IF NOT EXISTS idx_rec_frames ON recording_frames(recording_id, offset_ms)`)
 	d.db.Exec(`CREATE INDEX IF NOT EXISTS idx_consensus_agents_run ON consensus_agents(run_id)`)
 	d.db.Exec(`CREATE INDEX IF NOT EXISTS idx_card_log_card ON card_log(card_id, created_at DESC)`)
+	d.db.Exec(`CREATE INDEX IF NOT EXISTS idx_cards_parent ON cards(parent_id)`)
 
 	return nil
 }
@@ -166,7 +169,7 @@ func (d *DB) migrate() error {
 // --- Card CRUD ---
 
 func (d *DB) ListCards(project string) ([]Card, error) {
-	query := `SELECT id, title, description, "column", project, position, pane_target, labels, card_type, priority, created_at, updated_at FROM cards`
+	query := `SELECT id, title, description, "column", project, position, pane_target, labels, card_type, priority, parent_id, created_at, updated_at FROM cards`
 	args := []any{}
 	if project != "" {
 		query += ` WHERE project = ?`
@@ -183,7 +186,7 @@ func (d *DB) ListCards(project string) ([]Card, error) {
 	var cards []Card
 	for rows.Next() {
 		var c Card
-		if err := rows.Scan(&c.ID, &c.Title, &c.Description, &c.Column, &c.Project, &c.Position, &c.PaneTarget, &c.Labels, &c.CardType, &c.Priority, &c.CreatedAt, &c.UpdatedAt); err != nil {
+		if err := rows.Scan(&c.ID, &c.Title, &c.Description, &c.Column, &c.Project, &c.Position, &c.PaneTarget, &c.Labels, &c.CardType, &c.Priority, &c.ParentID, &c.CreatedAt, &c.UpdatedAt); err != nil {
 			return nil, err
 		}
 		cards = append(cards, c)
@@ -194,8 +197,8 @@ func (d *DB) ListCards(project string) ([]Card, error) {
 func (d *DB) GetCard(id int64) (*Card, error) {
 	var c Card
 	err := d.db.QueryRow(
-		`SELECT id, title, description, "column", project, position, pane_target, labels, card_type, priority, created_at, updated_at FROM cards WHERE id=?`, id,
-	).Scan(&c.ID, &c.Title, &c.Description, &c.Column, &c.Project, &c.Position, &c.PaneTarget, &c.Labels, &c.CardType, &c.Priority, &c.CreatedAt, &c.UpdatedAt)
+		`SELECT id, title, description, "column", project, position, pane_target, labels, card_type, priority, parent_id, created_at, updated_at FROM cards WHERE id=?`, id,
+	).Scan(&c.ID, &c.Title, &c.Description, &c.Column, &c.Project, &c.Position, &c.PaneTarget, &c.Labels, &c.CardType, &c.Priority, &c.ParentID, &c.CreatedAt, &c.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -211,8 +214,8 @@ func (d *DB) CreateCard(c *Card) error {
 	c.Position = maxPos + 1
 
 	result, err := d.db.Exec(
-		`INSERT INTO cards (title, description, "column", project, position, pane_target, labels, card_type, priority) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		c.Title, c.Description, c.Column, c.Project, c.Position, c.PaneTarget, c.Labels, c.CardType, c.Priority,
+		`INSERT INTO cards (title, description, "column", project, position, pane_target, labels, card_type, priority, parent_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		c.Title, c.Description, c.Column, c.Project, c.Position, c.PaneTarget, c.Labels, c.CardType, c.Priority, c.ParentID,
 	)
 	if err != nil {
 		return err
@@ -232,8 +235,8 @@ func (d *DB) UpdateCard(c *Card) error {
 	).Scan(&old.Title, &old.Description, &old.Column, &old.Priority, &old.CardType)
 
 	_, err := d.db.Exec(
-		`UPDATE cards SET title=?, description=?, "column"=?, project=?, position=?, pane_target=?, labels=?, card_type=?, priority=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`,
-		c.Title, c.Description, c.Column, c.Project, c.Position, c.PaneTarget, c.Labels, c.CardType, c.Priority, c.ID,
+		`UPDATE cards SET title=?, description=?, "column"=?, project=?, position=?, pane_target=?, labels=?, card_type=?, priority=?, parent_id=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`,
+		c.Title, c.Description, c.Column, c.Project, c.Position, c.PaneTarget, c.Labels, c.CardType, c.Priority, c.ParentID, c.ID,
 	)
 	if err != nil {
 		return err

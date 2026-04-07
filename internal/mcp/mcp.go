@@ -115,6 +115,7 @@ func Serve() {
 		mcp.WithString("labels", mcp.Description("Comma-separated labels")),
 		mcp.WithString("card_type", mcp.Description("Card type: bug, feature, task, chore")),
 		mcp.WithString("priority", mcp.Description("Priority: P0, P1, P2, P3")),
+		mcp.WithNumber("parent_id", mcp.Description("Parent card ID for hierarchical tasks (0 = no parent)")),
 	), kanbanCreateHandler())
 
 	s.AddTool(mcp.NewTool("kanban_edit",
@@ -128,6 +129,7 @@ func Serve() {
 		mcp.WithString("labels", mcp.Description("New labels")),
 		mcp.WithString("card_type", mcp.Description("Card type: bug, feature, task, chore")),
 		mcp.WithString("priority", mcp.Description("Priority: P0, P1, P2, P3")),
+		mcp.WithNumber("parent_id", mcp.Description("Parent card ID for hierarchical tasks (0 = no parent)")),
 	), kanbanEditHandler())
 
 	s.AddTool(mcp.NewTool("kanban_move",
@@ -379,7 +381,7 @@ func renameSessionHandler(bridge tmux.Bridge) server.ToolHandlerFunc {
 }
 
 func workshopAPIURL() string {
-	u := os.Getenv("YUNA_API_URL")
+	u := os.Getenv("WORKSHOP_API_URL")
 	if u == "" {
 		return "http://localhost:9090"
 	}
@@ -442,6 +444,7 @@ func kanbanCreateHandler() server.ToolHandlerFunc {
 			"labels":      mcp.ParseString(req, "labels", ""),
 			"cardType":    mcp.ParseString(req, "card_type", ""),
 			"priority":    mcp.ParseString(req, "priority", ""),
+			"parentId":    mcp.ParseInt(req, "parent_id", 0),
 		}
 		body, _ := json.Marshal(card)
 		resp, err := http.Post(workshopAPIURL()+"/api/v1/cards", "application/json", strings.NewReader(string(body)))
@@ -511,6 +514,12 @@ func kanbanEditHandler() server.ToolHandlerFunc {
 		}
 		if v := mcp.ParseString(req, "priority", ""); v != "" {
 			card["priority"] = v
+		}
+		// parent_id can be 0 to clear, so check if the key was provided rather than its value
+		if req.GetArguments() != nil {
+			if _, ok := req.GetArguments()["parent_id"]; ok {
+				card["parentId"] = mcp.ParseInt(req, "parent_id", 0)
+			}
 		}
 
 		// PUT update

@@ -1054,6 +1054,44 @@
   font-family: monospace;
   flex-shrink: 0;
 }
+.kanban-card.has-children { border-left: 3px solid var(--accent); }
+.kanban-card-child {
+  margin-left: 1rem;
+  border-left: 1px dashed var(--border);
+  background: color-mix(in srgb, var(--bg-secondary) 50%, transparent);
+}
+.kanban-card-tree-line {
+  color: var(--text-dim);
+  font-family: monospace;
+  font-size: 0.7rem;
+  margin-right: 0.2rem;
+}
+.kanban-card-completion {
+  font-size: 0.65rem;
+  color: var(--accent);
+  font-family: monospace;
+  background: var(--accent-dim);
+  padding: 0.05rem 0.3rem;
+  border-radius: 3px;
+  margin-left: auto;
+}
+.kanban-card-check {
+  color: var(--success);
+  font-size: 0.8rem;
+  font-weight: bold;
+  margin-left: 0.3rem;
+}
+.kanban-tree-toggle {
+  background: transparent;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 0.6rem;
+  padding: 0;
+  width: 12px;
+  flex-shrink: 0;
+}
+.kanban-tree-toggle:hover { color: var(--accent); }
 .kanban-card-id-badge {
   font-size: 0.7rem;
   color: var(--text-dim);

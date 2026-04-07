@@ -155,7 +155,15 @@ func (a *API) handleRenameWindow(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) handleListAllPanes(w http.ResponseWriter, r *http.Request) {
-	sessions, err := a.tmux.ListSessions()
+	// Include hidden sessions (consensus-*, workshop-ctrl-*) so the agent
+	// dashboard can detect consensus agents.
+	var sessions []tmux.Session
+	var err error
+	if eb, ok := a.tmux.(*tmux.ExecBridge); ok {
+		sessions, err = eb.ListAllSessions()
+	} else {
+		sessions, err = a.tmux.ListSessions()
+	}
 	if err != nil {
 		a.serverErr(w, "operation failed", err)
 		return

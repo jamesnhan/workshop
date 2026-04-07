@@ -129,18 +129,22 @@ func (b *ExecBridge) waitAndSendPrompt(target, prompt, provider string) {
 			continue
 		}
 
-		// Handle trust/setup prompts per provider
-		if handleTrustPrompt(b, target, output, provider) {
-			time.Sleep(2 * time.Second)
-			continue
-		}
-
-		// Check if the agent's input prompt is ready
+		// Check ready FIRST — with --no-alt-screen, dismissed trust
+		// prompts linger in scrollback and would otherwise cause the
+		// trust handler to loop forever.
 		if isAgentReady(output, provider) {
+			// Small settle delay so the input box has a tick to focus
+			// before we start streaming keys into it.
+			time.Sleep(500 * time.Millisecond)
 			sendLongPrompt(b, target, prompt)
 			time.Sleep(200 * time.Millisecond)
 			b.run("send-keys", "-t", target, "Enter")
 			return
+		}
+
+		// Not ready — try dismissing any trust/setup prompt.
+		if handleTrustPrompt(b, target, output, provider) {
+			time.Sleep(2 * time.Second)
 		}
 	}
 }
@@ -182,6 +186,11 @@ func handleTrustPrompt(b *ExecBridge, target, output, provider string) bool {
 			b.run("send-keys", "-t", target, "Enter")
 			return true
 		}
+		// Codex: model upgrade picker ("Try new model" / "Use existing model")
+		if strings.Contains(output, "Choose how you'd like Codex to proceed") || strings.Contains(output, "Try new model") {
+			b.run("send-keys", "-t", target, "Enter")
+			return true
+		}
 	default: // claude
 		if strings.Contains(output, "Enter to confirm") {
 			b.run("send-keys", "-t", target, "Enter")
@@ -204,9 +213,11 @@ func isAgentReady(output, provider string) bool {
 		// Gemini: "Type your message" in the input box
 		return strings.Contains(output, "Type your message")
 	case ProviderCodex:
-		// Codex with --no-alt-screen: ">" prompt line after startup
-		// Look for the model info line which appears when ready
-		return strings.Contains(output, "model:") && !strings.Contains(output, "Press enter to continue")
+		// Codex with --no-alt-screen: the "% left" token in the status line
+		// under the input box only renders after the input box is fully
+		// initialized and ready to accept keystrokes. Checking only for
+		// "model:" races the input box and causes prompts to be dropped.
+		return strings.Contains(output, "% left") && !strings.Contains(output, "Press enter to continue")
 	default: // claude
 		return strings.Contains(output, "❯") || strings.Contains(output, "Type")
 	}

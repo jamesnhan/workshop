@@ -12,6 +12,7 @@ interface Card {
   labels: string;
   cardType: string;
   priority: string;
+  parentId: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -93,6 +94,7 @@ export function KanbanBoard({ onNavigateToPane, defaultProject, focusedPath }: P
     }
   }, [focusedPath]);
   const [collapsedCols, setCollapsedCols] = useState<Set<string>>(new Set());
+  const [collapsedParents, setCollapsedParents] = useState<Set<number>>(new Set());
   const [dragCard, setDragCard] = useState<Card | null>(null);
   const [dropTarget, setDropTarget] = useState<{ column: string; position: number } | null>(null);
   const [expandedCard, setExpandedCard] = useState<Card | null>(null);
@@ -289,8 +291,27 @@ export function KanbanBoard({ onNavigateToPane, defaultProject, focusedPath }: P
     setDropTarget({ column, position });
   };
 
-  const columnCards = (col: string) => cards.filter((c) => c.column === col);
+  // Only show root cards (no parent) in column lists.
+  // Children render nested under their parent.
+  const columnCards = (col: string) => cards.filter((c) => c.column === col && !c.parentId);
   const cardById = new Map(cards.map((c) => [c.id, c]));
+  // Build a children index: parentId → child cards
+  const childrenByParent = new Map<number, Card[]>();
+  for (const c of cards) {
+    if (c.parentId) {
+      const arr = childrenByParent.get(c.parentId) ?? [];
+      arr.push(c);
+      childrenByParent.set(c.parentId, arr);
+    }
+  }
+  // Track which parents are collapsed (component-local state)
+  const childrenOf = (id: number) => childrenByParent.get(id) ?? [];
+  const completionFor = (id: number) => {
+    const kids = childrenOf(id);
+    if (kids.length === 0) return null;
+    const done = kids.filter((k) => k.column === 'done').length;
+    return { done, total: kids.length };
+  };
 
   return (
     <div className="kanban-overlay">
@@ -407,6 +428,12 @@ export function KanbanBoard({ onNavigateToPane, defaultProject, focusedPath }: P
               <input type="text" placeholder="Project" value={editCard.project} onChange={(e) => setEditCard({ ...editCard, project: e.target.value })} />
               <input type="text" placeholder="Pane target" value={editCard.paneTarget} onChange={(e) => setEditCard({ ...editCard, paneTarget: e.target.value })} />
               <input type="text" placeholder="Labels" value={editCard.labels} onChange={(e) => setEditCard({ ...editCard, labels: e.target.value })} />
+              <input
+                type="number"
+                placeholder="Parent ticket # (0 = no parent)"
+                value={editCard.parentId || ''}
+                onChange={(e) => setEditCard({ ...editCard, parentId: parseInt(e.target.value, 10) || 0 })}
+              />
               <div className="kanban-card-actions">
                 <button className="btn-create" onClick={handleUpdate}>Save</button>
                 <button className="btn-small" onClick={() => setEditCard(null)}>Cancel</button>
@@ -480,14 +507,18 @@ export function KanbanBoard({ onNavigateToPane, defaultProject, focusedPath }: P
               </div>
             )}
 
-            {!collapsedCols.has(col.id) && columnCards(col.id).map((card, idx) => (
+            {!collapsedCols.has(col.id) && columnCards(col.id).map((card, idx) => {
+              const kids = childrenOf(card.id);
+              const completion = completionFor(card.id);
+              const isCollapsed = collapsedParents.has(card.id);
+              return (
               <div key={card.id}>
                 {/* Drop indicator before this card */}
                 {dropTarget?.column === col.id && dropTarget.position === idx && dragCard?.id !== card.id && (
                   <div className="kanban-drop-indicator" />
                 )}
                 <div
-                  className={`kanban-card${dragCard?.id === card.id ? ' dragging' : ''}`}
+                  className={`kanban-card${dragCard?.id === card.id ? ' dragging' : ''}${kids.length ? ' has-children' : ''}`}
                   draggable
                   onDragStart={() => { setDragCard(card); wasDragging.current = true; }}
                   onDragEnd={() => { setDragCard(null); setDropTarget(null); setTimeout(() => { wasDragging.current = false; }, 100); }}
@@ -500,11 +531,35 @@ export function KanbanBoard({ onNavigateToPane, defaultProject, focusedPath }: P
                   onMouseDown={() => { wasDragging.current = false; }}
                 >
                 <div className="kanban-card-top">
+                  {kids.length > 0 && (
+                    <button
+                      className="kanban-tree-toggle"
+                      onMouseDown={(e) => { e.stopPropagation(); }}
+                      onMouseUp={(e) => { e.stopPropagation(); }}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setCollapsedParents((prev) => {
+                          const next = new Set(prev);
+                          if (next.has(card.id)) next.delete(card.id);
+                          else next.add(card.id);
+                          return next;
+                        });
+                      }}
+                      title={isCollapsed ? 'Expand subtasks' : 'Collapse subtasks'}
+                    >
+                      {isCollapsed ? '▶' : '▼'}
+                    </button>
+                  )}
                   {card.cardType && (
                     <span className="kanban-type-dot" style={{ background: typeColors[card.cardType] || 'var(--text-dim)' }} title={card.cardType} />
                   )}
                   <span className="kanban-card-id">#{card.id}</span>
                   <span className="kanban-card-title">{card.title}</span>
+                  {completion && (
+                    <span className="kanban-card-completion" title={`${completion.done} of ${completion.total} subtasks done`}>
+                      {completion.done}/{completion.total}
+                    </span>
+                  )}
                   {card.priority && (
                     <span className="kanban-priority-sm" style={{ color: priorityColors[card.priority] }}>{card.priority}</span>
                   )}
@@ -517,8 +572,30 @@ export function KanbanBoard({ onNavigateToPane, defaultProject, focusedPath }: P
                   ))}
                 </div>
               </div>
+              {/* Render children nested */}
+              {!isCollapsed && kids.map((child) => (
+                <div
+                  key={child.id}
+                  className="kanban-card kanban-card-child"
+                  onMouseUp={() => { if (!wasDragging.current) setExpandedCard(child); }}
+                >
+                  <div className="kanban-card-top">
+                    <span className="kanban-card-tree-line">└</span>
+                    {child.cardType && (
+                      <span className="kanban-type-dot" style={{ background: typeColors[child.cardType] || 'var(--text-dim)' }} title={child.cardType} />
+                    )}
+                    <span className="kanban-card-id">#{child.id}</span>
+                    <span className="kanban-card-title">{child.title}</span>
+                    {child.column === 'done' && <span className="kanban-card-check">✓</span>}
+                    {child.priority && (
+                      <span className="kanban-priority-sm" style={{ color: priorityColors[child.priority] }}>{child.priority}</span>
+                    )}
+                  </div>
+                </div>
+              ))}
               </div>
-            ))}
+              );
+            })}
             {/* Drop indicator at end of column */}
             {!collapsedCols.has(col.id) && dropTarget?.column === col.id && dropTarget.position === columnCards(col.id).length && dragCard && (
               <div className="kanban-drop-indicator" />
