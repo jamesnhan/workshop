@@ -54,22 +54,61 @@ export const PaneViewer = forwardRef<PaneViewerHandle, Props>(
     const onResizeRef = useRef(onResize);
     const onTicketHoverRef = useRef(onTicketHover);
     const onTicketClickRef = useRef(onTicketClick);
-    const scrollTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+    const pendingWriteRef = useRef('');
+    const writeFrameRef = useRef<number | null>(null);
+    const lastSizeRef = useRef<{ cols: number; rows: number } | null>(null);
     onDataRef.current = onData;
     onResizeRef.current = onResize;
     onTicketHoverRef.current = onTicketHover;
     onTicketClickRef.current = onTicketClick;
 
+    const notifyResizeIfChanged = () => {
+      const term = termRef.current;
+      if (!term) return;
+      const next = { cols: term.cols, rows: term.rows };
+      if (lastSizeRef.current?.cols === next.cols && lastSizeRef.current?.rows === next.rows) {
+        return;
+      }
+      lastSizeRef.current = next;
+      onResizeRef.current(next.cols, next.rows);
+    };
+
+    const scheduleWriteFlush = () => {
+      if (writeFrameRef.current !== null) return;
+      writeFrameRef.current = requestAnimationFrame(() => {
+        writeFrameRef.current = null;
+        const term = termRef.current;
+        const pending = pendingWriteRef.current;
+        pendingWriteRef.current = '';
+        if (!term || !pending) return;
+
+        const shouldStickToBottom = term.buffer.active.viewportY >= term.buffer.active.baseY;
+        term.write(pending, () => {
+          if (shouldStickToBottom) {
+            term.scrollToBottom();
+          }
+          if (pendingWriteRef.current) {
+            scheduleWriteFlush();
+          }
+        });
+      });
+    };
+
+    const runFit = () => {
+      const term = termRef.current;
+      const fit = fitRef.current;
+      const container = containerRef.current;
+      if (!term || !fit || !container) return;
+      if (container.offsetWidth === 0 || container.offsetHeight === 0) return;
+      fit.fit();
+      notifyResizeIfChanged();
+    };
+
     useImperativeHandle(ref, () => ({
       write: (data: string) => {
-        const term = termRef.current;
-        if (!term) return;
-        term.write(data);
-        // Debounce scroll to bottom — only scroll after writes settle
-        if (scrollTimerRef.current) clearTimeout(scrollTimerRef.current);
-        scrollTimerRef.current = setTimeout(() => {
-          term.scrollToBottom();
-        }, 50);
+        if (!data) return;
+        pendingWriteRef.current += data;
+        scheduleWriteFlush();
       },
       focus: () => {
         const term = termRef.current;
@@ -84,14 +123,9 @@ export const PaneViewer = forwardRef<PaneViewerHandle, Props>(
         searchRef.current?.clearDecorations();
       },
       refit: () => {
-        const term = termRef.current;
-        const fit = fitRef.current;
-        if (!term || !fit) return;
         requestAnimationFrame(() => {
           requestAnimationFrame(() => {
-            fit.fit();
-            term.scrollToBottom();
-            onResizeRef.current(term.cols, term.rows);
+            runFit();
           });
         });
       },
@@ -106,10 +140,11 @@ export const PaneViewer = forwardRef<PaneViewerHandle, Props>(
       if (!term || !fit) return;
       term.clear();
       term.reset();
+      pendingWriteRef.current = '';
+      lastSizeRef.current = null;
       requestAnimationFrame(() => {
         requestAnimationFrame(() => {
-          fit.fit();
-          onResizeRef.current(term.cols, term.rows);
+          runFit();
         });
       });
     }, [target]);
@@ -178,9 +213,7 @@ export const PaneViewer = forwardRef<PaneViewerHandle, Props>(
       // Double RAF for Mac rendering timing
       requestAnimationFrame(() => {
         requestAnimationFrame(() => {
-          fit.fit();
-          term.scrollToBottom();
-          onResizeRef.current(term.cols, term.rows);
+          runFit();
         });
       });
 
@@ -252,9 +285,7 @@ export const PaneViewer = forwardRef<PaneViewerHandle, Props>(
       const observer = new ResizeObserver(() => {
         clearTimeout(resizeTimer);
         resizeTimer = setTimeout(() => {
-          fit.fit();
-          term.scrollToBottom();
-          onResizeRef.current(term.cols, term.rows);
+          runFit();
         }, 150);
       });
       observer.observe(container);
@@ -263,9 +294,7 @@ export const PaneViewer = forwardRef<PaneViewerHandle, Props>(
       const handleWindowResize = () => {
         clearTimeout(resizeTimer);
         resizeTimer = setTimeout(() => {
-          fit.fit();
-          term.scrollToBottom();
-          onResizeRef.current(term.cols, term.rows);
+          runFit();
         }, 150);
       };
       window.addEventListener('resize', handleWindowResize);
@@ -306,7 +335,8 @@ export const PaneViewer = forwardRef<PaneViewerHandle, Props>(
 
       return () => {
         clearTimeout(resizeTimer);
-        if (scrollTimerRef.current) clearTimeout(scrollTimerRef.current);
+        pendingWriteRef.current = '';
+        if (writeFrameRef.current !== null) cancelAnimationFrame(writeFrameRef.current);
         observer.disconnect();
         ticketLinkProvider.dispose();
         window.removeEventListener('resize', handleWindowResize);
@@ -318,6 +348,8 @@ export const PaneViewer = forwardRef<PaneViewerHandle, Props>(
         termRef.current = null;
         fitRef.current = null;
         searchRef.current = null;
+        writeFrameRef.current = null;
+        lastSizeRef.current = null;
       };
     }, [target]);
 

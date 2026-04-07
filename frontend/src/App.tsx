@@ -68,6 +68,8 @@ function App() {
   const mountTime = useRef(Date.now());
   const cellLastOutput = useRef<Record<string, number>>({});
   const cellLastFocused = useRef<Record<string, number>>({});
+  const pendingScanData = useRef<Record<string, string>>({});
+  const scanTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
   // Unread tracking is disabled (see TODO below) — use ref to avoid root re-renders
   const unreadTickRef = useRef(0);
   const { notifications, unreadCount, scanOutput, markSubscribed, markAllRead, dismiss, clearAll, requestPermission, permissionState } = useNotifications();
@@ -113,8 +115,19 @@ function App() {
   const unreadThrottle = useRef(0);
   onOutput(useCallback((target: string, data: string) => {
     const focusedId = layoutRef.current.focusedId;
-    const focused = layoutRef.current.cells.find((c) => c.id === focusedId);
-    scanOutput(target, data, focused?.target ?? null);
+    pendingScanData.current[target] = (pendingScanData.current[target] ?? '') + data;
+    if (!scanTimers.current[target]) {
+      scanTimers.current[target] = setTimeout(() => {
+        delete scanTimers.current[target];
+        const buffered = pendingScanData.current[target];
+        delete pendingScanData.current[target];
+        if (buffered) {
+          const currentFocusedId = layoutRef.current.focusedId;
+          const currentFocused = layoutRef.current.cells.find((c) => c.id === currentFocusedId);
+          scanOutput(target, buffered, currentFocused?.target ?? null);
+        }
+      }, 500);
+    }
     // Track output timestamps for unfocused cells (skip grace period after subscribe)
     const now = Date.now();
     let changed = false;
@@ -137,6 +150,14 @@ function App() {
       }
     }
   }, [scanOutput]));
+
+  useEffect(() => () => {
+    for (const timer of Object.values(scanTimers.current)) {
+      clearTimeout(timer);
+    }
+    scanTimers.current = {};
+    pendingScanData.current = {};
+  }, []);
 
   // Handle pane status updates from WS
   onStatus(useCallback((target: string, status: string, message: string) => {

@@ -1,4 +1,4 @@
-import { useRef, useState, useCallback } from 'react';
+import { useRef, useState, useCallback, useEffect } from 'react';
 
 export interface Notification {
   id: string;
@@ -18,6 +18,7 @@ export interface CustomPattern {
 }
 
 const CUSTOM_PATTERNS_KEY = 'workshop:notifPatterns';
+const CUSTOM_PATTERNS_CHANGED = 'workshop:notif-patterns-changed';
 
 export function loadCustomPatterns(): CustomPattern[] {
   try {
@@ -27,6 +28,7 @@ export function loadCustomPatterns(): CustomPattern[] {
 
 export function saveCustomPatterns(patterns: CustomPattern[]) {
   localStorage.setItem(CUSTOM_PATTERNS_KEY, JSON.stringify(patterns));
+  window.dispatchEvent(new Event(CUSTOM_PATTERNS_CHANGED));
 }
 
 // Built-in patterns
@@ -65,13 +67,26 @@ export function useNotifications() {
   const [notifications, setNotifications] = useState<Notification[]>([]);
   const lastNotifyTime = useRef<Record<string, number>>({});
   const permissionGranted = useRef(false);
-  // Cache compiled custom patterns — refreshed when settings change, not on every chunk
+  // Cache compiled custom patterns — refresh outside the terminal output hot path.
   const customPatternsRef = useRef<CompiledPattern[]>(compileCustomPatterns());
-  const customPatternsVersion = useRef(localStorage.getItem(CUSTOM_PATTERNS_KEY) || '[]');
 
   const [permissionState, setPermissionState] = useState<'default' | 'granted' | 'denied' | 'unsupported'>(
     'Notification' in window ? Notification.permission as any : 'unsupported'
   );
+
+  useEffect(() => {
+    const refreshPatterns = () => {
+      customPatternsRef.current = compileCustomPatterns();
+    };
+    window.addEventListener(CUSTOM_PATTERNS_CHANGED, refreshPatterns);
+    window.addEventListener('storage', refreshPatterns);
+    window.addEventListener('focus', refreshPatterns);
+    return () => {
+      window.removeEventListener(CUSTOM_PATTERNS_CHANGED, refreshPatterns);
+      window.removeEventListener('storage', refreshPatterns);
+      window.removeEventListener('focus', refreshPatterns);
+    };
+  }, []);
 
   // Request browser notification permission (must be called from user gesture on mobile)
   const requestPermission = useCallback(async () => {
@@ -116,13 +131,6 @@ export function useNotifications() {
     if (subTime && now - subTime < 5000) return;
 
     const clean = stripAnsi(data);
-
-    // Refresh cached custom patterns only if localStorage changed
-    const currentRaw = localStorage.getItem(CUSTOM_PATTERNS_KEY) || '[]';
-    if (currentRaw !== customPatternsVersion.current) {
-      customPatternsVersion.current = currentRaw;
-      customPatternsRef.current = compileCustomPatterns();
-    }
     const allPatterns = [...builtinPatterns, ...customPatternsRef.current];
 
     for (const pattern of allPatterns) {

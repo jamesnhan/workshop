@@ -137,8 +137,26 @@ func (b *ExecBridge) waitAndSendPrompt(target, prompt, provider string) {
 			// before we start streaming keys into it.
 			time.Sleep(500 * time.Millisecond)
 			sendLongPrompt(b, target, prompt)
-			time.Sleep(200 * time.Millisecond)
-			b.run("send-keys", "-t", target, "Enter")
+			// Retry loop: send Enter, then verify the prompt was actually
+			// submitted. Long multiline prompts can still be buffering when
+			// the first Enter fires, leaving the input box unchanged.
+			// We detect this by checking whether the ready-state signal is
+			// still present (meaning output hasn't changed — prompt still
+			// sitting in the input box).
+			for attempt := 0; attempt < 3; attempt++ {
+				time.Sleep(300 * time.Millisecond)
+				b.run("send-keys", "-t", target, "Enter")
+				time.Sleep(1 * time.Second)
+				confirmed, err := b.CapturePanePlain(target, 10)
+				if err != nil {
+					break
+				}
+				// If the agent is no longer showing "ready" state, the
+				// prompt was submitted and it's thinking/working.
+				if !isAgentReady(confirmed, provider) {
+					break
+				}
+			}
 			return
 		}
 

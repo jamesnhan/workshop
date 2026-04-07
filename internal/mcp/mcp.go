@@ -178,6 +178,11 @@ func Serve() {
 		mcp.WithString("id", mcp.Required(), mcp.Description("Consensus run ID")),
 	), consensusReviewHandler())
 
+	s.AddTool(mcp.NewTool("consensus_cleanup",
+		mcp.WithDescription("Kill all tmux sessions for a finished consensus run (agents + coordinator). ALWAYS call this when you're done reviewing a consensus run — the sessions linger otherwise and clutter tmux."),
+		mcp.WithString("id", mcp.Required(), mcp.Description("Consensus run ID")),
+	), consensusCleanupHandler())
+
 	s.AddTool(mcp.NewTool("run_config",
 		mcp.WithDescription("Run a Lua config script. Requires Workshop web server running."),
 		mcp.WithString("path", mcp.Description("Path to workshop.lua file")),
@@ -821,6 +826,31 @@ func consensusCaptureHandler() server.ToolHandlerFunc {
 	}
 }
 
+func consensusCleanupHandler() server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		id := mcp.ParseString(req, "id", "")
+		if id == "" {
+			return mcp.NewToolResultError("id is required"), nil
+		}
+		httpReq, err := http.NewRequest("DELETE", fmt.Sprintf("%s/api/v1/consensus/%s", workshopAPIURL(), id), nil)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Failed to build request: %v", err)), nil
+		}
+		resp, err := http.DefaultClient.Do(httpReq)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Failed to reach Workshop: %v", err)), nil
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != 200 {
+			return mcp.NewToolResultError(string(body)), nil
+		}
+		var result map[string]any
+		json.Unmarshal(body, &result)
+		return mcp.NewToolResultText(fmt.Sprintf("Cleaned up consensus %s: killed %v sessions", id, result["killed"])), nil
+	}
+}
+
 func consensusReviewHandler() server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		id := mcp.ParseString(req, "id", "")
@@ -894,6 +924,23 @@ func consensusReviewHandler() server.ToolHandlerFunc {
 				sb.WriteString(clean)
 			}
 			sb.WriteString("\n")
+		}
+
+		// Auto-cleanup: now that we've captured all outputs, kill the
+		// tmux sessions so they don't linger. Only if the run is in a
+		// terminal state — we don't want to nuke a still-running consensus.
+		status, _ := run["status"].(string)
+		if status == "done" || status == "error" || status == "timeout" {
+			delReq, err := http.NewRequest("DELETE", fmt.Sprintf("%s/api/v1/consensus/%s", workshopAPIURL(), id), nil)
+			if err == nil {
+				if delResp, err := http.DefaultClient.Do(delReq); err == nil {
+					delBody, _ := io.ReadAll(delResp.Body)
+					delResp.Body.Close()
+					var delResult map[string]any
+					json.Unmarshal(delBody, &delResult)
+					fmt.Fprintf(&sb, "\n(cleaned up %v tmux sessions)\n", delResult["killed"])
+				}
+			}
 		}
 
 		return mcp.NewToolResultText(sb.String()), nil
