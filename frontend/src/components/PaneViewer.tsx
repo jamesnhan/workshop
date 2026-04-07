@@ -39,26 +39,31 @@ interface Props {
   terminalTheme: TerminalTheme;
   onData: (data: string) => void;
   onResize: (cols: number, rows: number) => void;
+  onTicketHover?: (cardId: number | null, x: number, y: number) => void;
+  onTicketClick?: (cardId: number) => void;
 }
 
 export const PaneViewer = forwardRef<PaneViewerHandle, Props>(
-  ({ target, terminalTheme, onData, onResize }, ref) => {
+  ({ target, terminalTheme, onData, onResize, onTicketHover, onTicketClick }, ref) => {
     const containerRef = useRef<HTMLDivElement>(null);
     const termRef = useRef<Terminal | null>(null);
     const searchRef = useRef<SearchAddon | null>(null);
     const onDataRef = useRef(onData);
     const onResizeRef = useRef(onResize);
+    const onTicketHoverRef = useRef(onTicketHover);
+    const onTicketClickRef = useRef(onTicketClick);
     const scrollTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
     onDataRef.current = onData;
     onResizeRef.current = onResize;
+    onTicketHoverRef.current = onTicketHover;
+    onTicketClickRef.current = onTicketClick;
 
     useImperativeHandle(ref, () => ({
       write: (data: string) => {
         const term = termRef.current;
         if (!term) return;
         term.write(data);
-        // Debounce scroll to bottom - only scroll after writes settle
-        // This is critical for Claude sessions which output rapidly
+        // Debounce scroll to bottom — only scroll after writes settle
         if (scrollTimerRef.current) clearTimeout(scrollTimerRef.current);
         scrollTimerRef.current = setTimeout(() => {
           term.scrollToBottom();
@@ -68,7 +73,6 @@ export const PaneViewer = forwardRef<PaneViewerHandle, Props>(
         const term = termRef.current;
         if (!term) return;
         term.focus();
-        // Scroll to bottom when focusing terminal
         term.scrollToBottom();
       },
       searchInTerminal: (text: string) => {
@@ -99,8 +103,47 @@ export const PaneViewer = forwardRef<PaneViewerHandle, Props>(
       term.open(containerRef.current);
       searchRef.current = search;
 
+      // Register link provider for ticket references like #123
+      const ticketLinkProvider = term.registerLinkProvider({
+        provideLinks(bufferLineNumber, callback) {
+          const line = term.buffer.active.getLine(bufferLineNumber - 1);
+          if (!line) {
+            callback(undefined);
+            return;
+          }
+          const text = line.translateToString(true);
+          type Link = {
+            range: { start: { x: number; y: number }; end: { x: number; y: number } };
+            text: string;
+            activate: () => void;
+            hover: (e: MouseEvent) => void;
+            leave: () => void;
+          };
+          const matches: Link[] = [];
+          const regex = /#(\d+)/g;
+          let m: RegExpExecArray | null;
+          while ((m = regex.exec(text)) !== null) {
+            const id = parseInt(m[1], 10);
+            if (id <= 0) continue;
+            const startCol = m.index + 1;
+            const endCol = m.index + m[0].length;
+            matches.push({
+              range: {
+                start: { x: startCol, y: bufferLineNumber },
+                end: { x: endCol, y: bufferLineNumber },
+              },
+              text: m[0],
+              activate: () => onTicketClickRef.current?.(id),
+              hover: (e: MouseEvent) => onTicketHoverRef.current?.(id, e.clientX, e.clientY),
+              leave: () => onTicketHoverRef.current?.(null, 0, 0),
+            });
+          }
+          callback(matches);
+        },
+      });
+
       // Fit to cell size, then tell backend the dimensions
-      // Use multiple RAF passes for Mac rendering timing
+      // Double RAF for Mac rendering timing
       requestAnimationFrame(() => {
         requestAnimationFrame(() => {
           fit.fit();
@@ -184,7 +227,7 @@ export const PaneViewer = forwardRef<PaneViewerHandle, Props>(
       });
       observer.observe(container);
 
-      // Additional resize listener for window resize (Mac Safari needs this)
+      // Window resize listener (Mac Safari needs this)
       const handleWindowResize = () => {
         clearTimeout(resizeTimer);
         resizeTimer = setTimeout(() => {
@@ -233,6 +276,7 @@ export const PaneViewer = forwardRef<PaneViewerHandle, Props>(
         clearTimeout(resizeTimer);
         if (scrollTimerRef.current) clearTimeout(scrollTimerRef.current);
         observer.disconnect();
+        ticketLinkProvider.dispose();
         window.removeEventListener('resize', handleWindowResize);
         container.removeEventListener('touchstart', handleTouchStart);
         container.removeEventListener('touchmove', handleTouchMove);

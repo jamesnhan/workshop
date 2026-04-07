@@ -38,6 +38,7 @@ interface Props {
   onSelectPane: (target: string) => void;
   activeTargets: string[];
   paneStatuses: Record<string, { status: string; message: string }>;
+  style?: React.CSSProperties;
 }
 
 const ansiConverter = new AnsiToHtml({
@@ -61,7 +62,7 @@ const STATUS_COLORS: Record<string, string> = {
   red: 'var(--error)',
 };
 
-export function Sidebar({ collapsed, onToggleCollapse, onSelectPane, activeTargets, paneStatuses }: Props) {
+export function Sidebar({ collapsed, onToggleCollapse, onSelectPane, activeTargets, paneStatuses, style }: Props) {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [panes, setPanes] = useState<Record<string, Pane[]>>({});
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
@@ -147,7 +148,7 @@ export function Sidebar({ collapsed, onToggleCollapse, onSelectPane, activeTarge
   }
 
   return (
-    <aside className="sidebar">
+    <aside className="sidebar" style={style}>
       <div className="sidebar-header">
         <button className="sidebar-toggle" onClick={onToggleCollapse} title="Collapse sidebar">‹</button>
         <h2>Sessions</h2>

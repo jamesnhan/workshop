@@ -2,6 +2,7 @@ import { useState, useCallback } from 'react';
 import Markdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { get } from '../api/client';
+import { ResizeHandle } from './ResizeHandle';
 
 interface DocFile {
   path: string;
@@ -67,9 +68,11 @@ export function DocsView() {
 
   const isPinned = (path: string) => pins.some((p) => p.path === path);
 
+  const [sidebarWidth, setSidebarWidth] = useState(280);
+
   return (
     <div className="docs-view">
-      <div className="docs-sidebar">
+      <div className="docs-sidebar" style={{ width: sidebarWidth }}>
         <div className="docs-sidebar-header">
           <h3>Pinned</h3>
         </div>
@@ -126,7 +129,7 @@ export function DocsView() {
           </>
         )}
       </div>
-
+      <ResizeHandle onResize={(d) => setSidebarWidth((w) => Math.min(600, Math.max(180, w + d)))} />
       <div className="docs-content">
         {loading && <div className="docs-loading">Loading...</div>}
         {!loading && !activeDoc && (

@@ -26,6 +26,7 @@ func Serve() {
 
 	s.AddTool(mcp.NewTool("list_sessions",
 		mcp.WithDescription("List all tmux sessions"),
+		mcp.WithBoolean("include_hidden", mcp.Description("Include hidden sessions (consensus-*, workshop-ctrl-*). Default: false")),
 	), listSessionsHandler(bridge))
 
 	s.AddTool(mcp.NewTool("list_panes",
@@ -150,7 +151,7 @@ func Serve() {
 		mcp.WithDescription("Start a consensus run — multiple agents work on the same prompt, then a coordinator synthesizes. Requires Workshop server."),
 		mcp.WithString("prompt", mcp.Required(), mcp.Description("The prompt for all agents")),
 		mcp.WithString("directory", mcp.Description("Working directory for agents")),
-		mcp.WithString("agents", mcp.Description("Comma-separated agent specs: name:model or name:provider:model (e.g. 'fast:sonnet,deep:gemini:pro'). Default: 3 sonnet agents")),
+		mcp.WithString("agents", mcp.Description("Comma-separated agent specs. Formats: 'provider' (e.g. 'codex'), 'provider:model' (e.g. 'claude:opus'), or 'name:provider:model' (e.g. 'deep:gemini:pro'). Provider must be claude/gemini/codex. Default: 3 sonnet claude agents.")),
 		mcp.WithNumber("timeout", mcp.Description("Timeout in seconds (default 300)")),
 	), consensusStartHandler())
 
@@ -203,7 +204,18 @@ func Serve() {
 
 func listSessionsHandler(bridge tmux.Bridge) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		sessions, err := bridge.ListSessions()
+		includeHidden := mcp.ParseBoolean(req, "include_hidden", false)
+		var sessions []tmux.Session
+		var err error
+		if includeHidden {
+			if eb, ok := bridge.(*tmux.ExecBridge); ok {
+				sessions, err = eb.ListAllSessions()
+			} else {
+				sessions, err = bridge.ListSessions()
+			}
+		} else {
+			sessions, err = bridge.ListSessions()
+		}
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
@@ -367,7 +379,7 @@ func renameSessionHandler(bridge tmux.Bridge) server.ToolHandlerFunc {
 }
 
 func workshopAPIURL() string {
-	u := os.Getenv("WORKSHOP_API_URL")
+	u := os.Getenv("YUNA_API_URL")
 	if u == "" {
 		return "http://localhost:9090"
 	}
@@ -587,20 +599,60 @@ func consensusStartHandler() server.ToolHandlerFunc {
 		timeout := mcp.ParseInt(req, "timeout", 300)
 		agentsStr := mcp.ParseString(req, "agents", "agent1:sonnet,agent2:sonnet,agent3:sonnet")
 
-		// Parse agent specs: name:model or name:provider:model
+		// Parse agent specs. Supported formats per agent (comma-separated):
+		//   provider                    → e.g. "codex" (auto name, default model)
+		//   provider:model              → e.g. "claude:opus", "gemini:pro"
+		//   name:provider:model         → e.g. "deep:claude:opus"
+		// Provider must be one of: claude, gemini, codex
+		// Model defaults: sonnet (claude), pro (gemini), gpt-5.4 (codex)
+		validProviders := map[string]bool{"claude": true, "gemini": true, "codex": true}
+		defaultModels := map[string]string{"claude": "sonnet", "gemini": "pro", "codex": "gpt-5.4"}
 		var agents []map[string]string
-		for _, spec := range strings.Split(agentsStr, ",") {
-			parts := strings.SplitN(strings.TrimSpace(spec), ":", 3)
-			agent := map[string]string{"name": parts[0], "model": "sonnet", "provider": "claude"}
-			if len(parts) == 2 {
-				// name:model (provider defaults to claude)
-				agent["model"] = parts[1]
-			} else if len(parts) == 3 {
-				// name:provider:model
-				agent["provider"] = parts[1]
-				agent["model"] = parts[2]
+		for i, spec := range strings.Split(agentsStr, ",") {
+			spec = strings.TrimSpace(spec)
+			if spec == "" {
+				continue
 			}
-			agents = append(agents, agent)
+			parts := strings.SplitN(spec, ":", 3)
+			var name, provider, model string
+
+			switch len(parts) {
+			case 1:
+				// Single part: must be a provider name
+				if validProviders[parts[0]] {
+					provider = parts[0]
+					name = fmt.Sprintf("agent%d", i+1)
+					model = defaultModels[provider]
+				} else {
+					return mcp.NewToolResultError(fmt.Sprintf("invalid agent spec %q: single value must be a provider (claude/gemini/codex)", spec)), nil
+				}
+			case 2:
+				// provider:model OR name:model (legacy, only if first part isn't a provider)
+				if validProviders[parts[0]] {
+					provider = parts[0]
+					model = parts[1]
+					name = fmt.Sprintf("agent%d", i+1)
+				} else {
+					// Legacy: name:model defaults to claude
+					name = parts[0]
+					provider = "claude"
+					model = parts[1]
+				}
+			case 3:
+				// name:provider:model
+				name = parts[0]
+				provider = parts[1]
+				model = parts[2]
+				if !validProviders[provider] {
+					return mcp.NewToolResultError(fmt.Sprintf("invalid agent spec %q: provider %q must be claude/gemini/codex", spec, provider)), nil
+				}
+			}
+
+			agents = append(agents, map[string]string{"name": name, "provider": provider, "model": model})
+		}
+
+		if len(agents) == 0 {
+			return mcp.NewToolResultError("no valid agents in spec"), nil
 		}
 
 		body, _ := json.Marshal(map[string]any{

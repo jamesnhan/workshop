@@ -14,6 +14,8 @@ import { AgentDashboard } from './components/AgentDashboard';
 import { DocsView } from './components/DocsView';
 import { WorkspaceManager } from './components/WorkspaceManager';
 import { SettingsView } from './components/SettingsView';
+import { ResizeHandle } from './components/ResizeHandle';
+import { TicketHoverPreview } from './components/TicketHoverPreview';
 import { useSettings } from './hooks/useSettings';
 import { useWorkshopSocket } from './hooks/useWebSocket';
 import { useNotifications } from './hooks/useNotifications';
@@ -47,6 +49,9 @@ function App() {
   const [searchOpen, setSearchOpen] = useState(false);
   const [notifOpen, setNotifOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [sidebarWidth, setSidebarWidth] = useState(260);
+  const [searchPanelWidth, setSearchPanelWidth] = useState(() => Math.min(800, window.innerWidth * 0.6));
+  const [ticketHover, setTicketHover] = useState<{ id: number; x: number; y: number } | null>(null);
   const [hotkeyMenuOpen, setHotkeyMenuOpen] = useState(false);
   const [cmdPaletteOpen, setCmdPaletteOpen] = useState(false);
   const [kanbanOpen, setKanbanOpen] = useState(false);
@@ -339,20 +344,19 @@ function App() {
       const normalize = settings.capsLockNormalization && capsLock;
       const key = normalize || settings.capsLockNormalization ? (e.key.length === 1 ? e.key.toLowerCase() : e.key) : e.key;
       const shift = normalize ? !e.shiftKey : e.shiftKey;
-
-      // On Mac, use Cmd (metaKey) for panels/views, Ctrl for navigation/layout
+      // Mac uses Cmd (metaKey) where Linux/Windows uses Ctrl
       const isMac = navigator.platform.toUpperCase().indexOf('MAC') >= 0;
-      const modKey = isMac ? e.metaKey : e.ctrlKey; // Cmd on Mac, Ctrl elsewhere (for panels)
-      const altModKey = isMac ? e.ctrlKey : e.metaKey; // Ctrl on Mac as fallback
-      const navKey = e.ctrlKey; // Always Ctrl for navigation (avoids conflicts with Glean/browser)
+      const mod = isMac ? e.metaKey : e.ctrlKey; // Cmd on Mac, Ctrl on others
+      const nav = isMac ? e.ctrlKey : e.altKey;   // Ctrl on Mac, Alt on others
 
-      if ((modKey || altModKey) && key === 'p' && !shift && !e.altKey) {
+      // Mod+P — pane switcher (Cmd+P on Mac, Ctrl+P on Linux/Win)
+      if (mod && key === 'p' && !shift && !nav) {
         e.preventDefault(); e.stopPropagation();
         switcherOpen ? setSwitcherOpen(false) : openSwitcher();
         return;
       }
-      // Ctrl+Shift+P (or Cmd+Shift+P on Mac) — command palette
-      if ((modKey || altModKey) && shift && key === 'p') {
+      // Mod+Shift+P — command palette
+      if (mod && shift && key === 'p') {
         e.preventDefault(); e.stopPropagation();
         setCmdPaletteOpen((p) => !p);
         return;
@@ -368,7 +372,7 @@ function App() {
       if (key === 'Escape' && notifOpen) { setNotifOpen(false); return; }
 
       // ? — hotkey menu (only when not typing in a terminal)
-      if (e.key === '?' && !e.ctrlKey && !e.altKey) {
+      if (e.key === '?' && !mod && !nav) {
         const active = document.activeElement;
         const inTerminal = active?.classList.contains('xterm-helper-textarea');
         if (!inTerminal) {
@@ -378,44 +382,44 @@ function App() {
         }
       }
 
-      // Ctrl+Shift+D (or Cmd+Shift+D on Mac) — agent dashboard (works even with terminal focused)
-      if ((modKey || altModKey) && shift && key === 'd') {
+      // Mod+Shift+D — agent dashboard
+      if (mod && shift && key === 'd') {
         e.preventDefault(); e.stopPropagation();
         setDashboardOpen((p) => !p);
         return;
       }
 
-      // Cmd+Shift+B — kanban board (works even with terminal focused)
-      // Changed from Cmd+Shift+K to avoid conflict with Ctrl+Shift+K (merge up)
-      if ((modKey || altModKey) && shift && key === 'b') {
+      // Mod+Shift+K — kanban board
+      if (mod && shift && key === 'k') {
         e.preventDefault(); e.stopPropagation();
         setKanbanOpen((p) => !p);
         return;
       }
 
-      // Toggle sidebar: Ctrl+B
-      if (navKey && !e.metaKey && !shift && key === 'b') {
+      // Nav+B — toggle sidebar (Alt on Linux, Ctrl on Mac)
+      if (nav && !mod && !shift && key === 'b') {
         e.preventDefault(); e.stopPropagation();
         setSidebarCollapsed((p) => !p);
         return;
       }
 
-      if ((modKey || altModKey) && shift && key === 'f') {
+      // Mod+Shift+F — search
+      if (mod && shift && key === 'f') {
         e.preventDefault(); e.stopPropagation();
         setSearchOpen((p) => !p);
         return;
       }
 
-      // Navigate cells: Ctrl+HJKL (all platforms - avoids conflicts)
-      if (navKey && !e.metaKey && !shift && 'hjkl'.includes(key)) {
+      // Nav+h/j/k/l — navigate cells
+      if (nav && !mod && !shift && 'hjkl'.includes(key)) {
         e.preventDefault(); e.stopPropagation();
         const newId = navigateGrid(layoutRef.current, key as 'h' | 'j' | 'k' | 'l');
         if (newId !== layoutRef.current.focusedId) handleFocusCell(newId);
         return;
       }
 
-      // Direct cell focus: Ctrl+1-9 (all platforms)
-      if (navKey && !e.metaKey && key >= '1' && key <= '9') {
+      // Nav+1-9 — direct cell focus
+      if (nav && !mod && key >= '1' && key <= '9') {
         e.preventDefault(); e.stopPropagation();
         const idx = parseInt(key) - 1;
         const cells = layoutRef.current.cells;
@@ -423,29 +427,29 @@ function App() {
         return;
       }
 
-      // Maximize: Ctrl+F (all platforms)
-      if (navKey && !e.metaKey && !shift && key === 'f') {
+      // Nav+F — toggle maximize focused cell
+      if (nav && !mod && !shift && key === 'f') {
         e.preventDefault(); e.stopPropagation();
         toggleMaximize();
         return;
       }
 
-      // Merge cells: Ctrl+Shift+HJKL (all platforms)
-      if (navKey && shift && !e.metaKey && 'hjkl'.includes(key)) {
+      // Nav+Shift+h/j/k/l — merge focused cell in direction
+      if (nav && shift && !mod && 'hjkl'.includes(key)) {
         e.preventDefault(); e.stopPropagation();
         mergeInDirection(key as 'h' | 'j' | 'k' | 'l');
         return;
       }
 
-      // Split cell: Ctrl+Shift+S (all platforms)
-      if (navKey && shift && !e.metaKey && key === 's') {
+      // Nav+Shift+S — split focused cell
+      if (nav && shift && !mod && key === 's') {
         e.preventDefault(); e.stopPropagation();
         splitFocused();
         return;
       }
 
-      // Next tab: Ctrl+]
-      if (navKey && !e.metaKey && !shift && key === ']') {
+      // Nav+] — next tab in focused cell
+      if (nav && !mod && !shift && key === ']') {
         e.preventDefault(); e.stopPropagation();
         setLayout((prev) => {
           const cell = prev.cells.find((c) => c.id === prev.focusedId);
@@ -461,8 +465,8 @@ function App() {
         return;
       }
 
-      // Previous tab: Ctrl+[
-      if (navKey && !e.metaKey && !shift && key === '[') {
+      // Nav+[ — previous tab in focused cell
+      if (nav && !mod && !shift && key === '[') {
         e.preventDefault(); e.stopPropagation();
         setLayout((prev) => {
           const cell = prev.cells.find((c) => c.id === prev.focusedId);
@@ -478,8 +482,8 @@ function App() {
         return;
       }
 
-      // Close tab: Ctrl+W
-      if (navKey && !e.metaKey && !shift && key === 'w') {
+      // Nav+W — close current tab in focused cell
+      if (nav && !mod && !shift && key === 'w') {
         e.preventDefault(); e.stopPropagation();
         const cell = layout.cells.find((c) => c.id === layout.focusedId);
         if (cell?.target) {
@@ -488,8 +492,8 @@ function App() {
         return;
       }
 
-      // History back: Ctrl+Left (only when terminal not focused)
-      if (navKey && !e.metaKey && !shift && key === 'ArrowLeft' && !document.activeElement?.classList.contains('xterm-helper-textarea')) {
+      // Nav+Left — history back (only when terminal not focused, otherwise it's word nav)
+      if (nav && !mod && !shift && key === 'ArrowLeft' && !document.activeElement?.classList.contains('xterm-helper-textarea')) {
         e.preventDefault(); e.stopPropagation();
         setLayout((prev) => {
           const cell = prev.cells.find((c) => c.id === prev.focusedId);
@@ -503,8 +507,8 @@ function App() {
         return;
       }
 
-      // History forward: Ctrl+Right (only when terminal not focused)
-      if (navKey && !e.metaKey && !shift && key === 'ArrowRight' && !document.activeElement?.classList.contains('xterm-helper-textarea')) {
+      // Nav+Right — history forward (only when terminal not focused)
+      if (nav && !mod && !shift && key === 'ArrowRight' && !document.activeElement?.classList.contains('xterm-helper-textarea')) {
         e.preventDefault(); e.stopPropagation();
         setLayout((prev) => {
           const cell = prev.cells.find((c) => c.id === prev.focusedId);
@@ -604,7 +608,7 @@ function App() {
     { id: 'notifications', label: 'Toggle Notifications', category: 'Panel', action: () => setNotifOpen((p) => !p) },
     { id: 'hotkeys', label: 'Show Keyboard Shortcuts', category: 'Panel', shortcut: '?', action: () => setHotkeyMenuOpen(true) },
     { id: 'toggle-sidebar', label: 'Toggle Sidebar', category: 'Panel', shortcut: 'Alt+B', action: () => setSidebarCollapsed((p) => !p) },
-    { id: 'kanban', label: 'Open Kanban Board', category: 'Panel', shortcut: 'Cmd+Shift+B', action: () => setKanbanOpen(true) },
+    { id: 'kanban', label: 'Open Kanban Board', category: 'Panel', shortcut: 'Ctrl+Shift+K', action: () => setKanbanOpen(true) },
     { id: 'dashboard', label: 'Open Agent Dashboard', category: 'Panel', shortcut: 'Ctrl+Shift+D', action: () => setDashboardOpen(true) },
     { id: 'docs', label: 'Open Docs', category: 'Panel', action: () => { setDocsOpen(true); setKanbanOpen(false); setDashboardOpen(false); } },
     { id: 'enable-notifs', label: `Notifications: ${permissionState}`, category: 'Settings', action: requestPermission },
@@ -768,11 +772,16 @@ function App() {
         onToggleCollapse={() => setSidebarCollapsed((p) => !p)}
         onSelectPane={(target) => {
           assignPaneToCell(layout.focusedId, target);
-          setSidebarCollapsed(true); // auto-close on mobile
+          // Auto-close sidebar only on mobile
+          if (window.innerWidth < 768) setSidebarCollapsed(true);
         }}
         activeTargets={activeTargets}
         paneStatuses={paneStatuses}
+        style={{ width: sidebarCollapsed ? undefined : sidebarWidth }}
       />
+      {!sidebarCollapsed && (
+        <ResizeHandle onResize={(d) => setSidebarWidth((w) => Math.min(500, Math.max(180, w + d)))} />
+      )}
       <main className="main-content">
         {/* Notification permission banner — shown until user grants/denies */}
         {permissionState === 'default' && !notifBannerDismissed && (
@@ -908,18 +917,21 @@ function App() {
           />
         )}
         {searchOpen && (
-          <SearchPanel
-            onSelectResult={(target, searchText) => {
-              const cell = layout.cells.find((c) => c.target === target);
-              if (cell) {
-                handleFocusCell(cell.id);
-                viewerRefsMap.current.get(cell.id)?.current?.searchInTerminal(searchText);
-              } else {
-                assignPaneToCell(layout.focusedId, target);
-              }
-            }}
-            onClose={() => setSearchOpen(false)}
-          />
+          <div className="search-panel-wrapper" style={{ width: searchPanelWidth }}>
+            <ResizeHandle onResize={(d) => setSearchPanelWidth((w) => Math.min(window.innerWidth * 0.9, Math.max(350, w - d)))} />
+            <SearchPanel
+              onSelectResult={(target, searchText) => {
+                const cell = layout.cells.find((c) => c.target === target);
+                if (cell) {
+                  handleFocusCell(cell.id);
+                  viewerRefsMap.current.get(cell.id)?.current?.searchInTerminal(searchText);
+                } else {
+                  assignPaneToCell(layout.focusedId, target);
+                }
+              }}
+              onClose={() => setSearchOpen(false)}
+            />
+          </div>
         )}
         {/* PaneGrid always mounted (hidden when not active) to preserve terminal state */}
         <div style={{ display: activeView === 'sessions' ? 'contents' : 'none' }}>
@@ -935,8 +947,11 @@ function App() {
             onAssignPane={openSwitcher}
             onSwitchTab={switchTab}
             onCloseTab={closeTab}
+            onTicketHover={(id, x, y) => setTicketHover(id ? { id, x, y } : null)}
+            onTicketClick={(id) => { setKanbanOpen(true); /* TODO: focus the card */ void id; }}
           />
         </div>
+        {ticketHover && <TicketHoverPreview cardId={ticketHover.id} x={ticketHover.x} y={ticketHover.y} />}
         {activeView === 'kanban' && (
           <KanbanBoard
             defaultProject={focusedTarget?.split(':')[0]}

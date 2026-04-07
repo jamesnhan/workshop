@@ -21,6 +21,21 @@ func (a *API) handleListCards(w http.ResponseWriter, r *http.Request) {
 	a.jsonOK(w, cards)
 }
 
+func (a *API) handleGetCard(w http.ResponseWriter, r *http.Request) {
+	idStr := r.PathValue("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		a.jsonError(w, "invalid id", http.StatusBadRequest)
+		return
+	}
+	card, err := a.db.GetCard(id)
+	if err != nil {
+		a.jsonError(w, "not found", http.StatusNotFound)
+		return
+	}
+	a.jsonOK(w, card)
+}
+
 func (a *API) handleCreateCard(w http.ResponseWriter, r *http.Request) {
 	var card db.Card
 	if err := json.NewDecoder(r.Body).Decode(&card); err != nil {
@@ -96,6 +111,43 @@ func (a *API) handleDeleteCard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (a *API) handleListCardLog(w http.ResponseWriter, r *http.Request) {
+	idStr := r.PathValue("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		a.jsonError(w, "invalid id", http.StatusBadRequest)
+		return
+	}
+	entries, err := a.db.ListCardLog(id)
+	if err != nil {
+		a.serverErr(w, "list card log", err)
+		return
+	}
+	if entries == nil {
+		entries = []db.CardLogEntry{}
+	}
+	a.jsonOK(w, entries)
+}
+
+func (a *API) handleListProjectLog(w http.ResponseWriter, r *http.Request) {
+	project := r.URL.Query().Get("project")
+	limit := 100
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if n, err := strconv.Atoi(l); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	entries, err := a.db.ListProjectLog(project, limit)
+	if err != nil {
+		a.serverErr(w, "list project log", err)
+		return
+	}
+	if entries == nil {
+		entries = []db.CardLogEntry{}
+	}
+	a.jsonOK(w, entries)
 }
 
 func (a *API) handleListNotes(w http.ResponseWriter, r *http.Request) {

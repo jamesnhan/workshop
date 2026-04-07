@@ -57,7 +57,6 @@ func (a *API) Routes() http.Handler {
 	mux.HandleFunc("POST /sessions/{name}/windows", a.handleCreateWindow)
 	mux.HandleFunc("PATCH /windows/{target}", a.handleRenameWindow)
 	mux.HandleFunc("GET /panes", a.handleListAllPanes)
-	mux.HandleFunc("GET /agents/providers", a.handleListProviders)
 	mux.HandleFunc("POST /agents/launch", a.handleLaunchAgent)
 	mux.HandleFunc("GET /search", a.handleSearch)
 	mux.HandleFunc("GET /search/lines", a.handleListLines)
@@ -66,12 +65,15 @@ func (a *API) Routes() http.Handler {
 	// Kanban
 	mux.HandleFunc("GET /cards", a.handleListCards)
 	mux.HandleFunc("POST /cards", a.handleCreateCard)
+	mux.HandleFunc("GET /cards/{id}", a.handleGetCard)
 	mux.HandleFunc("PUT /cards/{id}", a.handleUpdateCard)
 	mux.HandleFunc("POST /cards/{id}/move", a.handleMoveCard)
 	mux.HandleFunc("DELETE /cards/{id}", a.handleDeleteCard)
 	mux.HandleFunc("GET /projects", a.handleListProjects)
 	mux.HandleFunc("GET /cards/{id}/notes", a.handleListNotes)
 	mux.HandleFunc("POST /cards/{id}/notes", a.handleAddNote)
+	mux.HandleFunc("GET /cards/{id}/log", a.handleListCardLog)
+	mux.HandleFunc("GET /cards/log", a.handleListProjectLog)
 
 	// Recordings
 	mux.HandleFunc("GET /recordings", a.handleListRecordings)

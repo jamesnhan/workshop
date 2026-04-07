@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { get, post, del } from '../api/client';
+import { post, del } from '../api/client';
 
 interface PaneInfo {
   id: string;
@@ -83,14 +83,6 @@ export function PaneSwitcher({ panes, activeTargets, onSelect, onClose, onRefres
   const [agentPrompt, setAgentPrompt] = useState('');
   const [agentModel, setAgentModel] = useState('');
   const [agentLaunching, setAgentLaunching] = useState(false);
-  const [availableProviders, setAvailableProviders] = useState<string[]>(['claude']);
-
-  // Fetch available providers on mount
-  useEffect(() => {
-    get<string[]>('/agents/providers')
-      .then((p) => { if (p?.length) { setAvailableProviders(p); setAgentProvider(p[0]); } })
-      .catch(() => {});
-  }, []);
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLUListElement>(null);
 
@@ -309,9 +301,9 @@ export function PaneSwitcher({ panes, activeTargets, onSelect, onClose, onRefres
                   setAgentModel('');
                 }}
               >
-                {availableProviders.map((p) => (
-                  <option key={p} value={p}>{p.charAt(0).toUpperCase() + p.slice(1)}</option>
-                ))}
+                <option value="claude">Claude</option>
+                <option value="gemini">Gemini</option>
+                <option value="codex">Codex</option>
               </select>
               <input
                 type="text"

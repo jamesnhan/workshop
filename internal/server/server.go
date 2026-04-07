@@ -37,7 +37,7 @@ func New(logger *slog.Logger, frontendFS embed.FS) (*Server, error) {
 	outputBuffer := NewOutputBuffer(10000)
 	recorder := NewRecordingManager(logger, database)
 	statusStore := NewStatusStore()
-	consensusEngine := consensus.NewEngine(bridge, logger)
+	consensusEngine := consensus.NewEngine(bridge, database, logger)
 	api := apiv1.New(logger, bridge, outputBuffer, database, consensusEngine, recorder, statusStore)
 
 	mux.Handle("/api/v1/", http.StripPrefix("/api/v1", api.Routes()))

@@ -23,6 +23,16 @@ interface CardNote {
   createdAt: string;
 }
 
+interface CardLogEntry {
+  id: number;
+  cardId: number;
+  action: string;
+  beforeValue: string;
+  afterValue: string;
+  source: string;
+  createdAt: string;
+}
+
 const COLUMNS = [
   { id: 'backlog', label: 'Backlog' },
   { id: 'in_progress', label: 'In Progress' },
@@ -46,6 +56,20 @@ const priorityColors: Record<string, string> = {
   P2: 'var(--text-muted)',
   P3: 'var(--text-dim)',
 };
+
+function formatLogAction(entry: { action: string; beforeValue: string; afterValue: string }): string {
+  switch (entry.action) {
+    case 'created': return `Created card`;
+    case 'moved': return `Moved from ${entry.beforeValue || '?'} → ${entry.afterValue}`;
+    case 'title_changed': return `Renamed: "${entry.beforeValue}" → "${entry.afterValue}"`;
+    case 'priority_changed': return `Priority: ${entry.beforeValue || 'none'} → ${entry.afterValue || 'none'}`;
+    case 'type_changed': return `Type: ${entry.beforeValue || 'none'} → ${entry.afterValue || 'none'}`;
+    case 'description_changed': return `Description updated`;
+    case 'note_added': return `Added note: "${entry.afterValue.slice(0, 60)}${entry.afterValue.length > 60 ? '…' : ''}"`;
+    case 'deleted': return `Deleted`;
+    default: return entry.action;
+  }
+}
 
 interface Props {
   onNavigateToPane: (target: string) => void;
@@ -74,6 +98,9 @@ export function KanbanBoard({ onNavigateToPane, defaultProject, focusedPath }: P
   const [expandedCard, setExpandedCard] = useState<Card | null>(null);
   const [editCard, setEditCard] = useState<Card | null>(null);
   const [notes, setNotes] = useState<CardNote[]>([]);
+  const [cardLog, setCardLog] = useState<CardLogEntry[]>([]);
+  const [showChangelog, setShowChangelog] = useState(false);
+  const [projectLog, setProjectLog] = useState<CardLogEntry[]>([]);
   const [newNote, setNewNote] = useState('');
   const noteInputRef = useRef<HTMLInputElement>(null);
   const [newCardCol, setNewCardCol] = useState<string | null>(null);
@@ -84,15 +111,25 @@ export function KanbanBoard({ onNavigateToPane, defaultProject, focusedPath }: P
   const [newLabels, setNewLabels] = useState('');
   const [newType, setNewType] = useState('');
   const [newPriority, setNewPriority] = useState('');
-  // Fetch notes when expanding a card
+  // Fetch notes and activity log when expanding a card
   useEffect(() => {
     if (expandedCard) {
       get<CardNote[]>(`/cards/${expandedCard.id}/notes`).then((n) => setNotes(n ?? [])).catch(() => setNotes([]));
+      get<CardLogEntry[]>(`/cards/${expandedCard.id}/log`).then((l) => setCardLog(l ?? [])).catch(() => setCardLog([]));
       setNewNote('');
     } else {
       setNotes([]);
+      setCardLog([]);
     }
   }, [expandedCard]);
+
+  // Fetch project changelog when toggled on
+  useEffect(() => {
+    if (showChangelog) {
+      const q = filterProject ? `?project=${encodeURIComponent(filterProject)}&limit=200` : '?limit=200';
+      get<CardLogEntry[]>(`/cards/log${q}`).then((l) => setProjectLog(l ?? [])).catch(() => setProjectLog([]));
+    }
+  }, [showChangelog, filterProject]);
 
   const handleAddNote = async () => {
     if (!expandedCard || !newNote.trim()) return;
@@ -120,11 +157,11 @@ export function KanbanBoard({ onNavigateToPane, defaultProject, focusedPath }: P
         if (defaultProject && projects.includes(defaultProject)) {
           match = defaultProject;
         }
-        // 2. Git repo name match (e.g. remote "user/repo.git" → "repo")
+        // 2. Git repo name match (e.g. remote "jamesnhan/workshop.git" → "workshop")
         if (!match && repoName && projects.includes(repoName)) {
           match = repoName;
         }
-        // 3. Path basename match (e.g. /home/user/repos/myproject → "myproject")
+        // 3. Path basename match (e.g. /home/james/repos/workshop → "workshop")
         if (!match && focusedPath) {
           const basename = focusedPath.split('/').filter(Boolean).pop() || '';
           if (projects.includes(basename)) match = basename;
@@ -198,6 +235,44 @@ export function KanbanBoard({ onNavigateToPane, defaultProject, focusedPath }: P
     }
   };
 
+  const handleDispatch = async (card: Card) => {
+    // Build a prompt from the card
+    const lines = [
+      `Working on ticket #${card.id}: ${card.title}`,
+    ];
+    if (card.cardType) lines.push(`Type: ${card.cardType}`);
+    if (card.priority) lines.push(`Priority: ${card.priority}`);
+    if (card.project) lines.push(`Project: ${card.project}`);
+    if (card.description) {
+      lines.push('');
+      lines.push('Description:');
+      lines.push(card.description);
+    }
+    lines.push('');
+    lines.push('Please move this ticket to in_progress and start working on it. Update the card with notes as you make progress.');
+    const prompt = lines.join('\n');
+
+    try {
+      const res = await post<{ target: string }>('/agents/launch', {
+        name: `card-${card.id}`,
+        provider: 'claude',
+        directory: undefined,
+        prompt,
+      });
+      // Link the launched session back to the card
+      await fetch(`/api/v1/cards/${card.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...card, paneTarget: res.target }),
+      });
+      setExpandedCard(null);
+      onNavigateToPane(res.target);
+      refresh();
+    } catch (err) {
+      alert('Failed to dispatch agent: ' + err);
+    }
+  };
+
   const handleDrop = async (column: string, position?: number) => {
     if (!dragCard) { setDragCard(null); setDropTarget(null); return; }
     const pos = position ?? 0;
@@ -215,6 +290,7 @@ export function KanbanBoard({ onNavigateToPane, defaultProject, focusedPath }: P
   };
 
   const columnCards = (col: string) => cards.filter((c) => c.column === col);
+  const cardById = new Map(cards.map((c) => [c.id, c]));
 
   return (
     <div className="kanban-overlay">
@@ -223,6 +299,13 @@ export function KanbanBoard({ onNavigateToPane, defaultProject, focusedPath }: P
           <option value="">All Projects</option>
           {projects.map((p) => <option key={p} value={p}>{p}</option>)}
         </select>
+        <button
+          className={`btn-toggle${showChangelog ? ' active' : ''}`}
+          onClick={() => setShowChangelog((s) => !s)}
+          title="Toggle changelog view"
+        >
+          {showChangelog ? 'Board' : 'Changelog'}
+        </button>
       </div>
 
       {/* Expanded card modal */}
@@ -231,6 +314,7 @@ export function KanbanBoard({ onNavigateToPane, defaultProject, focusedPath }: P
           <div className="kanban-modal" onClick={(e) => e.stopPropagation()}>
             <div className="kanban-modal-header">
               <div className="kanban-modal-badges">
+                <span className="kanban-card-id-badge">#{expandedCard.id}</span>
                 {expandedCard.cardType && (
                   <span className="kanban-type-badge" style={{ borderColor: typeColors[expandedCard.cardType] || 'var(--border)' }}>
                     {expandedCard.cardType}
@@ -279,9 +363,23 @@ export function KanbanBoard({ onNavigateToPane, defaultProject, focusedPath }: P
                 <button className="btn-create" onClick={handleAddNote} disabled={!newNote.trim()}>Add</button>
               </div>
             </div>
+            {/* Activity log */}
+            {cardLog.length > 0 && (
+              <div className="kanban-log">
+                <h4 className="kanban-notes-title">Activity</h4>
+                {cardLog.map((entry) => (
+                  <div key={entry.id} className="kanban-log-entry">
+                    <span className="kanban-log-date">{new Date(entry.createdAt).toLocaleString()}</span>
+                    <span className="kanban-log-action">{formatLogAction(entry)}</span>
+                    {entry.source !== 'user' && <span className="kanban-log-source">{entry.source}</span>}
+                  </div>
+                ))}
+              </div>
+            )}
             <div className="kanban-modal-footer">
               <span className="kanban-modal-date">Created: {new Date(expandedCard.createdAt).toLocaleDateString()}</span>
               <div className="kanban-card-actions">
+                <button className="btn-dispatch" onClick={() => handleDispatch(expandedCard)} title="Launch a Claude agent to work on this ticket">⚡ Dispatch</button>
                 <button className="btn-create" onClick={() => setEditCard(expandedCard)}>Edit</button>
                 <button className="btn-danger-small" onClick={() => handleDelete(expandedCard.id)}>Delete</button>
               </div>
@@ -318,7 +416,29 @@ export function KanbanBoard({ onNavigateToPane, defaultProject, focusedPath }: P
         </div>
       )}
 
-      <div className="kanban-columns">
+      {showChangelog && (
+        <div className="kanban-changelog">
+          <h3 className="kanban-changelog-title">Changelog {filterProject && <span className="kanban-changelog-project">— {filterProject}</span>}</h3>
+          {projectLog.length === 0 && <p className="muted">No activity yet</p>}
+          {projectLog.map((entry) => {
+            const card = cardById.get(entry.cardId);
+            return (
+              <div key={entry.id} className="kanban-changelog-entry" onClick={() => card && setExpandedCard(card)}>
+                <span className="kanban-log-date">{new Date(entry.createdAt).toLocaleString()}</span>
+                {card ? (
+                  <span className="kanban-changelog-card">#{card.id} {card.title}</span>
+                ) : (
+                  <span className="kanban-changelog-card muted">#{entry.cardId} (deleted)</span>
+                )}
+                <span className="kanban-log-action">{formatLogAction(entry)}</span>
+                {entry.source !== 'user' && <span className="kanban-log-source">{entry.source}</span>}
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {!showChangelog && <div className="kanban-columns">
         {COLUMNS.map((col) => (
           <div
             key={col.id}
@@ -383,6 +503,7 @@ export function KanbanBoard({ onNavigateToPane, defaultProject, focusedPath }: P
                   {card.cardType && (
                     <span className="kanban-type-dot" style={{ background: typeColors[card.cardType] || 'var(--text-dim)' }} title={card.cardType} />
                   )}
+                  <span className="kanban-card-id">#{card.id}</span>
                   <span className="kanban-card-title">{card.title}</span>
                   {card.priority && (
                     <span className="kanban-priority-sm" style={{ color: priorityColors[card.priority] }}>{card.priority}</span>
@@ -404,7 +525,7 @@ export function KanbanBoard({ onNavigateToPane, defaultProject, focusedPath }: P
             )}
           </div>
         ))}
-      </div>
+      </div>}
     </div>
   );
 }

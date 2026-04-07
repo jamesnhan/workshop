@@ -2,7 +2,6 @@ package tmux
 
 import (
 	"fmt"
-	"os/exec"
 	"strings"
 	"time"
 )
@@ -13,23 +12,6 @@ const (
 	ProviderGemini = "gemini"
 	ProviderCodex  = "codex"
 )
-
-// AvailableProviders returns providers whose CLI tools are installed.
-func AvailableProviders() []string {
-	providers := []string{}
-	for _, p := range []string{ProviderClaude, ProviderGemini, ProviderCodex} {
-		if _, err := exec.LookPath(p); err == nil {
-			providers = append(providers, p)
-		}
-	}
-	return providers
-}
-
-// IsProviderAvailable checks if a provider's CLI tool is installed.
-func IsProviderAvailable(provider string) bool {
-	_, err := exec.LookPath(provider)
-	return err == nil
-}
 
 // AgentConfig defines the parameters for launching an agent.
 type AgentConfig struct {
@@ -74,10 +56,10 @@ func (b *ExecBridge) LaunchAgent(cfg AgentConfig) (*AgentResult, error) {
 		return nil, fmt.Errorf("create session: %w", err)
 	}
 
-	// Rename window to provider name so Agent Dashboard can detect it
-	if _, err := b.run("rename-window", "-t", cfg.Name+":0", provider); err != nil {
-		return nil, fmt.Errorf("rename window: %w", err)
-	}
+	// Rename the first window to provider name so Agent Dashboard can detect it.
+	// Use session-relative window selector instead of hardcoded index — base-index
+	// may be 0 or 1 depending on user tmux config.
+	b.run("rename-window", "-t", cfg.Name+":^", provider)
 
 	if err := b.SendKeys(cfg.Name, cmd); err != nil {
 		return nil, fmt.Errorf("send command: %w", err)
@@ -155,11 +137,31 @@ func (b *ExecBridge) waitAndSendPrompt(target, prompt, provider string) {
 
 		// Check if the agent's input prompt is ready
 		if isAgentReady(output, provider) {
-			b.run("send-keys", "-t", target, "-l", prompt)
-			time.Sleep(100 * time.Millisecond)
+			sendLongPrompt(b, target, prompt)
+			time.Sleep(200 * time.Millisecond)
 			b.run("send-keys", "-t", target, "Enter")
 			return
 		}
+	}
+}
+
+// sendLongPrompt chunks a long prompt into multiple send-keys calls.
+// Tmux send-keys has practical limits on argument length and very long
+// inputs can be truncated or corrupted. Sending in chunks with brief
+// delays gives the terminal time to process each piece.
+func sendLongPrompt(b *ExecBridge, target, prompt string) {
+	const chunkSize = 1024
+	if len(prompt) <= chunkSize {
+		b.run("send-keys", "-t", target, "-l", prompt)
+		return
+	}
+	for i := 0; i < len(prompt); i += chunkSize {
+		end := i + chunkSize
+		if end > len(prompt) {
+			end = len(prompt)
+		}
+		b.run("send-keys", "-t", target, "-l", prompt[i:end])
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 

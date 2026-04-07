@@ -21,6 +21,8 @@ interface Props {
   onAssignPane: (cellId: string) => void;
   onSwitchTab: (cellId: string, target: string) => void;
   onCloseTab: (cellId: string, target: string) => void;
+  onTicketHover?: (cardId: number | null, x: number, y: number) => void;
+  onTicketClick?: (cardId: number) => void;
 }
 
 const STATUS_COLORS: Record<string, string> = {
@@ -37,7 +39,7 @@ const STATUS_TO_CHIBI: Record<string, ChibiState> = {
 
 export function PaneGrid({
   layout, viewerRefs, theme, unreadCells, paneStatuses, onInput, onResize,
-  onFocusCell, onAssignPane, onSwitchTab, onCloseTab,
+  onFocusCell, onAssignPane, onSwitchTab, onCloseTab, onTicketHover, onTicketClick,
 }: Props) {
   const { gridRows, gridCols, cells, focusedId, maximizedId } = layout;
 
@@ -110,6 +112,8 @@ export function PaneGrid({
                 terminalTheme={theme.terminal}
                 onData={(data) => onInput(cell.target!, data)}
                 onResize={(cols, rows) => onResize(cell.target!, cols, rows)}
+                onTicketHover={onTicketHover}
+                onTicketClick={onTicketClick}
               />
             ) : (
               <div className="pane-empty" onClick={() => onAssignPane(cell.id)}>

@@ -111,10 +111,54 @@ func (d *DB) migrate() error {
 		)
 	`)
 
+	// Card activity log — tracks all changes to cards over time
+	d.db.Exec(`
+		CREATE TABLE IF NOT EXISTS card_log (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			card_id INTEGER NOT NULL,
+			action TEXT NOT NULL,
+			before_value TEXT DEFAULT '',
+			after_value TEXT DEFAULT '',
+			source TEXT DEFAULT 'user',
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			FOREIGN KEY (card_id) REFERENCES cards(id) ON DELETE CASCADE
+		)
+	`)
+
+	// Consensus runs
+	d.db.Exec(`
+		CREATE TABLE IF NOT EXISTS consensus_runs (
+			id TEXT PRIMARY KEY,
+			prompt TEXT NOT NULL,
+			directory TEXT DEFAULT '',
+			status TEXT DEFAULT 'running',
+			coordinator_pane TEXT DEFAULT '',
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		)
+	`)
+	d.db.Exec(`
+		CREATE TABLE IF NOT EXISTS consensus_agents (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			run_id TEXT NOT NULL,
+			name TEXT NOT NULL,
+			model TEXT DEFAULT '',
+			provider TEXT DEFAULT '',
+			target TEXT DEFAULT '',
+			status TEXT DEFAULT 'running',
+			output TEXT DEFAULT '',
+			needs_input INTEGER DEFAULT 0,
+			input_prompt TEXT DEFAULT '',
+			FOREIGN KEY (run_id) REFERENCES consensus_runs(id) ON DELETE CASCADE
+		)
+	`)
+
 	// Indexes for hot query paths
 	d.db.Exec(`CREATE INDEX IF NOT EXISTS idx_cards_proj_col ON cards(project, "column", position)`)
 	d.db.Exec(`CREATE INDEX IF NOT EXISTS idx_notes_card ON card_notes(card_id, created_at)`)
 	d.db.Exec(`CREATE INDEX IF NOT EXISTS idx_rec_frames ON recording_frames(recording_id, offset_ms)`)
+	d.db.Exec(`CREATE INDEX IF NOT EXISTS idx_consensus_agents_run ON consensus_agents(run_id)`)
+	d.db.Exec(`CREATE INDEX IF NOT EXISTS idx_card_log_card ON card_log(card_id, created_at DESC)`)
 
 	return nil
 }
@@ -147,6 +191,17 @@ func (d *DB) ListCards(project string) ([]Card, error) {
 	return cards, rows.Err()
 }
 
+func (d *DB) GetCard(id int64) (*Card, error) {
+	var c Card
+	err := d.db.QueryRow(
+		`SELECT id, title, description, "column", project, position, pane_target, labels, card_type, priority, created_at, updated_at FROM cards WHERE id=?`, id,
+	).Scan(&c.ID, &c.Title, &c.Description, &c.Column, &c.Project, &c.Position, &c.PaneTarget, &c.Labels, &c.CardType, &c.Priority, &c.CreatedAt, &c.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &c, nil
+}
+
 func (d *DB) CreateCard(c *Card) error {
 	// Set position to end of column
 	var maxPos int
@@ -165,15 +220,42 @@ func (d *DB) CreateCard(c *Card) error {
 	c.ID, _ = result.LastInsertId()
 	c.CreatedAt = time.Now()
 	c.UpdatedAt = time.Now()
+	d.LogCardEvent(c.ID, "created", "", c.Title, "user")
 	return nil
 }
 
 func (d *DB) UpdateCard(c *Card) error {
+	// Fetch the old card to diff for the log
+	var old Card
+	d.db.QueryRow(
+		`SELECT title, description, "column", priority, card_type FROM cards WHERE id=?`, c.ID,
+	).Scan(&old.Title, &old.Description, &old.Column, &old.Priority, &old.CardType)
+
 	_, err := d.db.Exec(
 		`UPDATE cards SET title=?, description=?, "column"=?, project=?, position=?, pane_target=?, labels=?, card_type=?, priority=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`,
 		c.Title, c.Description, c.Column, c.Project, c.Position, c.PaneTarget, c.Labels, c.CardType, c.Priority, c.ID,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+
+	// Log significant field changes
+	if old.Title != c.Title {
+		d.LogCardEvent(c.ID, "title_changed", old.Title, c.Title, "user")
+	}
+	if old.Column != c.Column {
+		d.LogCardEvent(c.ID, "moved", old.Column, c.Column, "user")
+	}
+	if old.Priority != c.Priority {
+		d.LogCardEvent(c.ID, "priority_changed", old.Priority, c.Priority, "user")
+	}
+	if old.CardType != c.CardType {
+		d.LogCardEvent(c.ID, "type_changed", old.CardType, c.CardType, "user")
+	}
+	if old.Description != c.Description {
+		d.LogCardEvent(c.ID, "description_changed", "", "", "user")
+	}
+	return nil
 }
 
 func (d *DB) MoveCard(id int64, toColumn string, toPosition int) error {
@@ -183,9 +265,9 @@ func (d *DB) MoveCard(id int64, toColumn string, toPosition int) error {
 	}
 	defer tx.Rollback()
 
-	// Get the card's project so we scope the shift correctly
-	var project string
-	if err := tx.QueryRow(`SELECT project FROM cards WHERE id = ?`, id).Scan(&project); err != nil {
+	// Get the card's project and current column for the shift + log
+	var project, oldColumn string
+	if err := tx.QueryRow(`SELECT project, "column" FROM cards WHERE id = ?`, id).Scan(&project, &oldColumn); err != nil {
 		return fmt.Errorf("lookup card project: %w", err)
 	}
 
@@ -205,10 +287,17 @@ func (d *DB) MoveCard(id int64, toColumn string, toPosition int) error {
 		return fmt.Errorf("move card: %w", err)
 	}
 
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if oldColumn != toColumn {
+		d.LogCardEvent(id, "moved", oldColumn, toColumn, "user")
+	}
+	return nil
 }
 
 func (d *DB) DeleteCard(id int64) error {
+	d.LogCardEvent(id, "deleted", "", "", "user")
 	_, err := d.db.Exec(`DELETE FROM cards WHERE id=?`, id)
 	return err
 }
@@ -230,6 +319,80 @@ func (d *DB) ListProjects() ([]string, error) {
 	return projects, rows.Err()
 }
 
+// --- Card Activity Log ---
+
+type CardLogEntry struct {
+	ID          int64  `json:"id"`
+	CardID      int64  `json:"cardId"`
+	Action      string `json:"action"`      // moved, updated, created, deleted, note_added, etc.
+	BeforeValue string `json:"beforeValue"` // optional, for diff display
+	AfterValue  string `json:"afterValue"`
+	Source      string `json:"source"`      // "user", "agent", "system"
+	CreatedAt   string `json:"createdAt"`
+}
+
+func (d *DB) LogCardEvent(cardID int64, action, before, after, source string) {
+	if source == "" {
+		source = "user"
+	}
+	d.db.Exec(
+		`INSERT INTO card_log (card_id, action, before_value, after_value, source) VALUES (?, ?, ?, ?, ?)`,
+		cardID, action, before, after, source,
+	)
+}
+
+func (d *DB) ListCardLog(cardID int64) ([]CardLogEntry, error) {
+	rows, err := d.db.Query(
+		`SELECT id, card_id, action, before_value, after_value, source, created_at FROM card_log WHERE card_id=? ORDER BY created_at DESC`, cardID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var entries []CardLogEntry
+	for rows.Next() {
+		var e CardLogEntry
+		if err := rows.Scan(&e.ID, &e.CardID, &e.Action, &e.BeforeValue, &e.AfterValue, &e.Source, &e.CreatedAt); err != nil {
+			continue
+		}
+		entries = append(entries, e)
+	}
+	return entries, rows.Err()
+}
+
+// ListProjectLog returns recent activity across all cards in a project (or all if empty).
+func (d *DB) ListProjectLog(project string, limit int) ([]CardLogEntry, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	var query string
+	var args []any
+	if project != "" {
+		query = `SELECT l.id, l.card_id, l.action, l.before_value, l.after_value, l.source, l.created_at
+			FROM card_log l JOIN cards c ON l.card_id = c.id
+			WHERE c.project = ? ORDER BY l.created_at DESC LIMIT ?`
+		args = []any{project, limit}
+	} else {
+		query = `SELECT id, card_id, action, before_value, after_value, source, created_at
+			FROM card_log ORDER BY created_at DESC LIMIT ?`
+		args = []any{limit}
+	}
+	rows, err := d.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var entries []CardLogEntry
+	for rows.Next() {
+		var e CardLogEntry
+		if err := rows.Scan(&e.ID, &e.CardID, &e.Action, &e.BeforeValue, &e.AfterValue, &e.Source, &e.CreatedAt); err != nil {
+			continue
+		}
+		entries = append(entries, e)
+	}
+	return entries, rows.Err()
+}
+
 // --- Card Notes ---
 
 type CardNote struct {
@@ -245,6 +408,7 @@ func (d *DB) AddNote(cardID int64, text string) (*CardNote, error) {
 		return nil, err
 	}
 	id, _ := result.LastInsertId()
+	d.LogCardEvent(cardID, "note_added", "", text, "user")
 	return &CardNote{ID: id, CardID: cardID, Text: text}, nil
 }
 
@@ -361,4 +525,140 @@ func (d *DB) DeleteRecording(id int64) error {
 	d.db.Exec(`DELETE FROM recording_frames WHERE recording_id=?`, id)
 	_, err := d.db.Exec(`DELETE FROM recordings WHERE id=?`, id)
 	return err
+}
+
+// --- Consensus Runs ---
+
+type ConsensusRun struct {
+	ID              string           `json:"id"`
+	Prompt          string           `json:"prompt"`
+	Directory       string           `json:"directory"`
+	Status          string           `json:"status"`
+	CoordinatorPane string           `json:"coordinatorPane"`
+	CreatedAt       string           `json:"createdAt"`
+	Agents          []ConsensusAgent `json:"agentOutputs"`
+}
+
+type ConsensusAgent struct {
+	ID          int64  `json:"dbId,omitempty"`
+	RunID       string `json:"-"`
+	Name        string `json:"name"`
+	Model       string `json:"model"`
+	Provider    string `json:"provider"`
+	Target      string `json:"target"`
+	Status      string `json:"status"`
+	Output      string `json:"output"`
+	NeedsInput  bool   `json:"needsInput"`
+	InputPrompt string `json:"inputPrompt"`
+}
+
+func (d *DB) CreateConsensusRun(id, prompt, directory string) error {
+	_, err := d.db.Exec(
+		`INSERT INTO consensus_runs (id, prompt, directory) VALUES (?, ?, ?)`,
+		id, prompt, directory,
+	)
+	return err
+}
+
+func (d *DB) CreateConsensusAgent(runID, name, model, provider, target, status string) error {
+	_, err := d.db.Exec(
+		`INSERT INTO consensus_agents (run_id, name, model, provider, target, status) VALUES (?, ?, ?, ?, ?, ?)`,
+		runID, name, model, provider, target, status,
+	)
+	return err
+}
+
+func (d *DB) UpdateConsensusRunStatus(id, status string) error {
+	_, err := d.db.Exec(
+		`UPDATE consensus_runs SET status=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`,
+		status, id,
+	)
+	return err
+}
+
+func (d *DB) UpdateConsensusRunCoordinator(id, coordinatorPane string) error {
+	_, err := d.db.Exec(
+		`UPDATE consensus_runs SET coordinator_pane=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`,
+		coordinatorPane, id,
+	)
+	return err
+}
+
+func (d *DB) UpdateConsensusAgent(runID, name, status, output string, needsInput bool, inputPrompt string) error {
+	ni := 0
+	if needsInput {
+		ni = 1
+	}
+	_, err := d.db.Exec(
+		`UPDATE consensus_agents SET status=?, output=?, needs_input=?, input_prompt=? WHERE run_id=? AND name=?`,
+		status, output, ni, inputPrompt, runID, name,
+	)
+	return err
+}
+
+func (d *DB) GetConsensusRun(id string) (*ConsensusRun, error) {
+	var run ConsensusRun
+	err := d.db.QueryRow(
+		`SELECT id, prompt, directory, status, coordinator_pane, created_at FROM consensus_runs WHERE id=?`, id,
+	).Scan(&run.ID, &run.Prompt, &run.Directory, &run.Status, &run.CoordinatorPane, &run.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := d.db.Query(
+		`SELECT name, model, provider, target, status, output, needs_input, input_prompt FROM consensus_agents WHERE run_id=?`, id,
+	)
+	if err != nil {
+		return &run, nil
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var a ConsensusAgent
+		var ni int
+		if err := rows.Scan(&a.Name, &a.Model, &a.Provider, &a.Target, &a.Status, &a.Output, &ni, &a.InputPrompt); err != nil {
+			continue
+		}
+		a.NeedsInput = ni != 0
+		run.Agents = append(run.Agents, a)
+	}
+	return &run, nil
+}
+
+func (d *DB) ListConsensusRuns() ([]ConsensusRun, error) {
+	rows, err := d.db.Query(`SELECT id, prompt, directory, status, coordinator_pane, created_at FROM consensus_runs ORDER BY created_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var runs []ConsensusRun
+	for rows.Next() {
+		var r ConsensusRun
+		if err := rows.Scan(&r.ID, &r.Prompt, &r.Directory, &r.Status, &r.CoordinatorPane, &r.CreatedAt); err != nil {
+			continue
+		}
+		runs = append(runs, r)
+	}
+
+	// Load agents for each run
+	for i := range runs {
+		agentRows, err := d.db.Query(
+			`SELECT name, model, provider, target, status, output, needs_input, input_prompt FROM consensus_agents WHERE run_id=?`, runs[i].ID,
+		)
+		if err != nil {
+			continue
+		}
+		for agentRows.Next() {
+			var a ConsensusAgent
+			var ni int
+			if err := agentRows.Scan(&a.Name, &a.Model, &a.Provider, &a.Target, &a.Status, &a.Output, &ni, &a.InputPrompt); err != nil {
+				continue
+			}
+			a.NeedsInput = ni != 0
+			runs[i].Agents = append(runs[i].Agents, a)
+		}
+		agentRows.Close()
+	}
+	return runs, nil
 }

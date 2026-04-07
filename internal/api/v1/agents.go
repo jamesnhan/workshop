@@ -7,10 +7,6 @@ import (
 	"github.com/jamesnhan/workshop/internal/tmux"
 )
 
-func (a *API) handleListProviders(w http.ResponseWriter, r *http.Request) {
-	a.jsonOK(w, tmux.AvailableProviders())
-}
-
 func (a *API) handleLaunchAgent(w http.ResponseWriter, r *http.Request) {
 	var cfg tmux.AgentConfig
 	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {

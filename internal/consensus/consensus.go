@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jamesnhan/workshop/internal/db"
 	"github.com/jamesnhan/workshop/internal/tmux"
 )
 
@@ -50,13 +51,15 @@ type ConsensusResult struct {
 type Engine struct {
 	bridge tmux.Bridge
 	logger *slog.Logger
+	db     *db.DB
 	mu     sync.Mutex
 	runs   map[string]*ConsensusResult
 }
 
-func NewEngine(bridge tmux.Bridge, logger *slog.Logger) *Engine {
+func NewEngine(bridge tmux.Bridge, database *db.DB, logger *slog.Logger) *Engine {
 	return &Engine{
 		bridge: bridge,
+		db:     database,
 		logger: logger,
 		runs:   make(map[string]*ConsensusResult),
 	}
@@ -85,25 +88,54 @@ func (e *Engine) StartRun(req ConsensusRequest) (*ConsensusResult, error) {
 	e.runs[id] = result
 	e.mu.Unlock()
 
+	// Persist to DB
+	if e.db != nil {
+		e.db.CreateConsensusRun(id, req.Prompt, req.Directory)
+	}
+
 	go e.runConsensus(id, req)
 
 	return result, nil
 }
 
 // GetRun returns the current state of a consensus run.
+// Checks in-memory first (active runs), then falls back to DB (historical).
 func (e *Engine) GetRun(id string) *ConsensusResult {
 	e.mu.Lock()
-	defer e.mu.Unlock()
-	return e.runs[id]
+	r := e.runs[id]
+	e.mu.Unlock()
+	if r != nil {
+		return r
+	}
+	// Fall back to DB for historical/orphaned runs
+	if e.db != nil {
+		if dbRun, err := e.db.GetConsensusRun(id); err == nil {
+			return dbRunToResult(dbRun)
+		}
+	}
+	return nil
 }
 
-// ListRuns returns all consensus runs.
+// ListRuns returns all consensus runs (in-memory active + DB historical).
 func (e *Engine) ListRuns() []*ConsensusResult {
 	e.mu.Lock()
-	defer e.mu.Unlock()
-	runs := make([]*ConsensusResult, 0, len(e.runs))
+	activeIDs := make(map[string]bool)
+	runs := make([]*ConsensusResult, 0)
 	for _, r := range e.runs {
 		runs = append(runs, r)
+		activeIDs[r.ID] = true
+	}
+	e.mu.Unlock()
+
+	// Add historical runs from DB that aren't already in memory
+	if e.db != nil {
+		if dbRuns, err := e.db.ListConsensusRuns(); err == nil {
+			for _, dr := range dbRuns {
+				if !activeIDs[dr.ID] {
+					runs = append(runs, dbRunToResult(&dr))
+				}
+			}
+		}
 	}
 	return runs
 }
@@ -157,6 +189,13 @@ func (e *Engine) runConsensus(id string, req ConsensusRequest) {
 	e.runs[id].AgentOutputs = outputs
 	e.mu.Unlock()
 
+	// Persist agents to DB
+	if e.db != nil {
+		for _, o := range outputs {
+			e.db.CreateConsensusAgent(id, o.Name, o.Model, o.Provider, o.Target, o.Status)
+		}
+	}
+
 	// Phase 2: Wait for all agents to complete
 	e.setStatus(id, "collecting")
 	deadline := time.Now().Add(time.Duration(req.Timeout) * time.Second)
@@ -174,6 +213,10 @@ func (e *Engine) runConsensus(id string, req ConsensusRequest) {
 		}
 		outputs[i].Output = captured
 		e.logger.Info("consensus: agent finished", "name", outputs[i].Name, "status", outputs[i].Status)
+		// Persist agent completion to DB
+		if e.db != nil {
+			e.db.UpdateConsensusAgent(id, outputs[i].Name, outputs[i].Status, captured, false, "")
+		}
 	}
 
 	e.mu.Lock()
@@ -187,6 +230,7 @@ func (e *Engine) runConsensus(id string, req ConsensusRequest) {
 	coordName := fmt.Sprintf("%s-coordinator", id)
 	coordCfg := tmux.AgentConfig{
 		Name:      coordName,
+		Provider:  tmux.ProviderClaude,
 		Model:     "opus",
 		Directory: req.Directory,
 		Prompt:    coordinatorPrompt,
@@ -202,6 +246,11 @@ func (e *Engine) runConsensus(id string, req ConsensusRequest) {
 	e.mu.Lock()
 	e.runs[id].CoordinatorPane = coordResult.Target
 	e.mu.Unlock()
+
+	// Persist coordinator pane to DB
+	if e.db != nil {
+		e.db.UpdateConsensusRunCoordinator(id, coordResult.Target)
+	}
 
 	e.logger.Info("consensus: coordinator launched", "target", coordResult.Target)
 	e.setStatus(id, "done")
@@ -368,4 +417,30 @@ func (e *Engine) setStatus(id, status string) {
 	if r, ok := e.runs[id]; ok {
 		r.Status = status
 	}
+	if e.db != nil {
+		e.db.UpdateConsensusRunStatus(id, status)
+	}
+}
+
+// dbRunToResult converts a DB consensus run to the in-memory result format.
+func dbRunToResult(r *db.ConsensusRun) *ConsensusResult {
+	result := &ConsensusResult{
+		ID:              r.ID,
+		Prompt:          r.Prompt,
+		CoordinatorPane: r.CoordinatorPane,
+		Status:          r.Status,
+	}
+	for _, a := range r.Agents {
+		result.AgentOutputs = append(result.AgentOutputs, AgentOutput{
+			Name:        a.Name,
+			Model:       a.Model,
+			Provider:    a.Provider,
+			Target:      a.Target,
+			Status:      a.Status,
+			Output:      a.Output,
+			NeedsInput:  a.NeedsInput,
+			InputPrompt: a.InputPrompt,
+		})
+	}
+	return result
 }
