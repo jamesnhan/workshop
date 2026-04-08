@@ -23,6 +23,7 @@ interface Props {
   onCloseTab: (cellId: string, target: string) => void;
   onTicketHover?: (cardId: number | null, x: number, y: number) => void;
   onTicketClick?: (cardId: number) => void;
+  onHashKey?: () => void;
 }
 
 const STATUS_COLORS: Record<string, string> = {
@@ -39,7 +40,7 @@ const STATUS_TO_CHIBI: Record<string, ChibiState> = {
 
 export function PaneGrid({
   layout, viewerRefs, theme, unreadCells, paneStatuses, onInput, onResize,
-  onFocusCell, onAssignPane, onSwitchTab, onCloseTab, onTicketHover, onTicketClick,
+  onFocusCell, onAssignPane, onSwitchTab, onCloseTab, onTicketHover, onTicketClick, onHashKey,
 }: Props) {
   const { gridRows, gridCols, cells, focusedId, maximizedId } = layout;
 
@@ -68,7 +69,8 @@ export function PaneGrid({
             className={`pane-cell${cell.id === focusedId ? ' focused' : ''}${unreadCells.has(cell.id) ? ' unread' : ''}${cellStatus ? ` pane-status-${cellStatus.status}` : ''}`}
             style={{
               ...cellStyle,
-              ...(cellStatus ? { borderColor: STATUS_COLORS[cellStatus.status] } : {}),
+              // Don't override border with status color when focused — let .focused accent class win
+              ...(cellStatus && cell.id !== focusedId ? { borderColor: STATUS_COLORS[cellStatus.status] } : {}),
             }}
             onClick={() => onFocusCell(cell.id)}
           >
@@ -77,6 +79,7 @@ export function PaneGrid({
               <div className="pane-status-bar" style={{ background: STATUS_COLORS[cellStatus.status] }}>
                 <ChibiAvatar state={STATUS_TO_CHIBI[cellStatus.status] || 'idle'} variant={variantFromName(cell.target || '')} size="sm" />
                 <span>{cellStatus.message || cellStatus.status}</span>
+                {cell.id === focusedId && <span className="pane-status-focused-indicator">▶ focused</span>}
               </div>
             )}
 
@@ -121,6 +124,7 @@ export function PaneGrid({
                 onResize={(cols, rows) => onResize(cell.target!, cols, rows)}
                 onTicketHover={onTicketHover}
                 onTicketClick={onTicketClick}
+                onHashKey={cell.id === focusedId ? onHashKey : undefined}
               />
             ) : (
               <div className="pane-empty" onClick={() => onAssignPane(cell.id)}>

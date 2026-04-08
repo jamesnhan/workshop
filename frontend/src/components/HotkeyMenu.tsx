@@ -66,6 +66,7 @@ const sections = [
       ['Ctrl + Arrow', 'Word navigation'],
       [`${nav} + Arrow`, 'Word navigation'],
       [`${nav} + T`, 'Toggle thinking mode'],
+      ['#', 'Ticket lookup — insert #id into terminal'],
     ],
   },
 ];

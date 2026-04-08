@@ -1,6 +1,7 @@
 package v1
 
 import (
+	"encoding/json"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -105,6 +106,45 @@ func (a *API) handleReadFile(w http.ResponseWriter, r *http.Request) {
 		"name":    filepath.Base(realPath),
 		"content": string(content),
 	})
+}
+
+func (a *API) handleOpenDoc(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Path string `json:"path"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Path == "" {
+		a.jsonError(w, "path is required", http.StatusBadRequest)
+		return
+	}
+
+	path := req.Path
+	if strings.HasPrefix(path, "~/") {
+		home, _ := os.UserHomeDir()
+		path = filepath.Join(home, path[2:])
+	}
+
+	ext := strings.ToLower(filepath.Ext(path))
+	allowed := map[string]bool{".md": true, ".txt": true, ".yaml": true, ".yml": true, ".json": true, ".lua": true, ".toml": true}
+	if !allowed[ext] {
+		a.jsonError(w, "file type not allowed", http.StatusForbidden)
+		return
+	}
+
+	realPath, status, err := confineToHome(path)
+	if err != nil {
+		switch status {
+		case http.StatusForbidden:
+			a.jsonError(w, "path not allowed", http.StatusForbidden)
+		case http.StatusBadRequest:
+			a.jsonError(w, "invalid path", http.StatusBadRequest)
+		default:
+			a.jsonError(w, "cannot resolve path", http.StatusInternalServerError)
+		}
+		return
+	}
+
+	a.status.Broadcast("open_doc", map[string]string{"path": realPath})
+	a.jsonOK(w, map[string]string{"path": realPath})
 }
 
 func (a *API) handleListMarkdown(w http.ResponseWriter, r *http.Request) {

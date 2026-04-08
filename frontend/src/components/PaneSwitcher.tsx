@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
-import { post, del } from '../api/client';
+import { get, post, del } from '../api/client';
+import { useTicketAutocomplete, type AutocompleteCard } from '../hooks/useTicketAutocomplete';
+import { TicketSuggestions } from './TicketSuggestions';
 
 interface PaneInfo {
   id: string;
@@ -18,6 +20,7 @@ interface Props {
   onSelect: (target: string) => void;
   onClose: () => void;
   onRefresh: () => void;
+  ticketAutocomplete?: boolean;
 }
 
 // Simple fuzzy match: all query chars must appear in order in the haystack
@@ -71,7 +74,7 @@ const tabs: { key: Mode; label: string }[] = [
   { key: 'manage', label: 'Manage' },
 ];
 
-export function PaneSwitcher({ panes, activeTargets, onSelect, onClose, onRefresh }: Props) {
+export function PaneSwitcher({ panes, activeTargets, onSelect, onClose, onRefresh, ticketAutocomplete = true }: Props) {
   const [query, setQuery] = useState('');
   const [selectedIdx, setSelectedIdx] = useState(0);
   const [mode, setMode] = useState<Mode>('search');
@@ -83,8 +86,12 @@ export function PaneSwitcher({ panes, activeTargets, onSelect, onClose, onRefres
   const [agentPrompt, setAgentPrompt] = useState('');
   const [agentModel, setAgentModel] = useState('');
   const [agentLaunching, setAgentLaunching] = useState(false);
+  const [acCards, setAcCards] = useState<AutocompleteCard[]>([]);
+  const agentPromptRef = useRef<HTMLTextAreaElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLUListElement>(null);
+
+  const promptAC = useTicketAutocomplete({ inputRef: agentPromptRef, value: agentPrompt, onChange: setAgentPrompt, cards: acCards, enabled: ticketAutocomplete });
 
   const filtered = query.length === 0
     ? panes
@@ -97,6 +104,13 @@ export function PaneSwitcher({ panes, activeTargets, onSelect, onClose, onRefres
   useEffect(() => {
     inputRef.current?.focus();
   }, [mode]);
+
+  // Lazy-load cards when agent tab is opened (for # autocomplete)
+  useEffect(() => {
+    if (mode === 'agent' && acCards.length === 0) {
+      get<AutocompleteCard[]>('/cards').then((c) => { if (c) setAcCards(c); }).catch(() => {});
+    }
+  }, [mode]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     setSelectedIdx(0);
@@ -180,7 +194,7 @@ export function PaneSwitcher({ panes, activeTargets, onSelect, onClose, onRefres
     const name = newSessionName.trim();
     if (!name) return;
     try {
-      await post('/sessions', { name });
+      await post('/sessions', { name, background: false });
       setNewSessionName('');
       setMode('search');
       onRefresh();
@@ -320,13 +334,18 @@ export function PaneSwitcher({ panes, activeTargets, onSelect, onClose, onRefres
               value={agentDir}
               onChange={(e) => setAgentDir(e.target.value)}
             />
-            <textarea
-              className="switcher-textarea"
-              placeholder="Initial prompt (optional — launches interactive if empty)"
-              value={agentPrompt}
-              onChange={(e) => setAgentPrompt(e.target.value)}
-              rows={3}
-            />
+            <div className="kanban-autocomplete-wrapper">
+              <textarea
+                ref={agentPromptRef}
+                className="switcher-textarea"
+                placeholder="Initial prompt (optional — launches interactive if empty)"
+                value={agentPrompt}
+                onChange={promptAC.handleChange}
+                onKeyDown={promptAC.handleKeyDown}
+                rows={3}
+              />
+              {promptAC.showDropdown && <TicketSuggestions suggestions={promptAC.suggestions} selectedIdx={promptAC.selectedIdx} onSelect={promptAC.accept} />}
+            </div>
             <button
               className="btn-create"
               onClick={handleLaunchAgent}

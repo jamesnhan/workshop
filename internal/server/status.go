@@ -19,6 +19,24 @@ type StatusStore struct {
 	mu        sync.RWMutex
 	statuses  map[string]PaneStatus // target → status
 	listeners []chan []byte
+	monitor   *PaneMonitor // for MarkSeen delegation; set after construction
+}
+
+// AttachMonitor wires a PaneMonitor so MarkSeen can forward to it.
+func (s *StatusStore) AttachMonitor(m *PaneMonitor) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.monitor = m
+}
+
+// MarkSeen delegates to the attached pane monitor.
+func (s *StatusStore) MarkSeen(target string) {
+	s.mu.RLock()
+	m := s.monitor
+	s.mu.RUnlock()
+	if m != nil {
+		m.MarkSeen(target)
+	}
 }
 
 func NewStatusStore() *StatusStore {
@@ -86,6 +104,15 @@ func (s *StatusStore) Unsubscribe(ch chan []byte) {
 			return
 		}
 	}
+}
+
+// Broadcast sends an arbitrary message to all connected WS clients.
+func (s *StatusStore) Broadcast(msgType string, data any) {
+	s.mu.RLock()
+	listeners := make([]chan []byte, len(s.listeners))
+	copy(listeners, s.listeners)
+	s.mu.RUnlock()
+	s.broadcast(msgType, data, listeners)
 }
 
 func (s *StatusStore) broadcast(msgType string, data any, listeners []chan []byte) {

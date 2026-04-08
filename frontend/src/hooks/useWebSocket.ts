@@ -2,13 +2,35 @@ import { useEffect, useRef, useState, useCallback } from 'react';
 
 interface WsMessage {
   type: string;
-  data?: { target: string; data: string; status?: string; message?: string };
+  data?: {
+    target: string;
+    data: string;
+    status?: string;
+    message?: string;
+    path?: string;
+    cardId?: number;
+    id?: number | string;
+    session?: string;
+    background?: boolean;
+    action?: string;
+    payload?: Record<string, unknown>;
+  };
+}
+
+export interface UICommand {
+  id?: string;
+  action: string;
+  payload: Record<string, unknown>;
 }
 
 type OutputHandler = (target: string, data: string) => void;
 type StatusHandler = (target: string, status: string, message: string) => void;
 type StatusClearHandler = (target: string) => void;
 type ReconnectHandler = () => void;
+type OpenDocHandler = (path: string) => void;
+type DispatchUpdateHandler = (cardId: number, dispatchId: number, status: string) => void;
+type SessionCreatedHandler = (target: string, background: boolean) => void;
+type UICommandHandler = (cmd: UICommand) => void;
 
 export function useWorkshopSocket() {
   const [connected, setConnected] = useState(false);
@@ -19,6 +41,10 @@ export function useWorkshopSocket() {
   const onStatusRef = useRef<StatusHandler | null>(null);
   const onStatusClearRef = useRef<StatusClearHandler | null>(null);
   const onReconnectRef = useRef<ReconnectHandler | null>(null);
+  const onOpenDocRef = useRef<OpenDocHandler | null>(null);
+  const onDispatchUpdateRef = useRef<DispatchUpdateHandler | null>(null);
+  const onSessionCreatedRef = useRef<SessionCreatedHandler | null>(null);
+  const onUICommandRef = useRef<UICommandHandler | null>(null);
   const wasConnected = useRef(false);
 
   useEffect(() => {
@@ -68,6 +94,19 @@ export function useWorkshopSocket() {
             onStatusRef.current?.(msg.data.target, msg.data.status || '', msg.data.message || '');
           } else if (msg.type === 'pane_status_clear' && msg.data) {
             onStatusClearRef.current?.(msg.data.target);
+          } else if (msg.type === 'open_doc' && msg.data?.path) {
+            onOpenDocRef.current?.(msg.data.path);
+          } else if (msg.type === 'dispatch_updated' && msg.data?.cardId != null) {
+            const dispatchId = typeof msg.data.id === 'number' ? msg.data.id : 0;
+            onDispatchUpdateRef.current?.(msg.data.cardId, dispatchId, msg.data.status || '');
+          } else if (msg.type === 'session_created' && msg.data?.target) {
+            onSessionCreatedRef.current?.(msg.data.target, msg.data.background ?? true);
+          } else if (msg.type === 'ui_command' && msg.data?.action) {
+            onUICommandRef.current?.({
+              id: typeof msg.data.id === 'string' ? msg.data.id : undefined,
+              action: msg.data.action,
+              payload: (msg.data.payload as Record<string, unknown>) ?? {},
+            });
           }
         } catch (err) {
           console.error('[workshop] bad ws message:', err);
@@ -141,5 +180,21 @@ export function useWorkshopSocket() {
     onReconnectRef.current = handler;
   }, []);
 
-  return { connected, subscribe, unsubscribe, sendInput, sendResize, startRecording, stopRecording, onOutput, onStatus, onStatusClear, onReconnect };
+  const onOpenDoc = useCallback((handler: OpenDocHandler) => {
+    onOpenDocRef.current = handler;
+  }, []);
+
+  const onDispatchUpdate = useCallback((handler: DispatchUpdateHandler) => {
+    onDispatchUpdateRef.current = handler;
+  }, []);
+
+  const onSessionCreated = useCallback((handler: SessionCreatedHandler) => {
+    onSessionCreatedRef.current = handler;
+  }, []);
+
+  const onUICommand = useCallback((handler: UICommandHandler) => {
+    onUICommandRef.current = handler;
+  }, []);
+
+  return { connected, subscribe, unsubscribe, sendInput, sendResize, startRecording, stopRecording, onOutput, onStatus, onStatusClear, onReconnect, onOpenDoc, onDispatchUpdate, onSessionCreated, onUICommand };
 }

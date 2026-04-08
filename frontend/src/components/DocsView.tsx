@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import Markdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { get } from '../api/client';
@@ -26,7 +26,12 @@ function savePins(pins: PinnedDoc[]) {
   localStorage.setItem(PINS_KEY, JSON.stringify(pins));
 }
 
-export function DocsView() {
+interface DocsViewProps {
+  openPath?: string | null;
+  onOpenPathConsumed?: () => void;
+}
+
+export function DocsView({ openPath, onOpenPathConsumed }: DocsViewProps = {}) {
   const [pins, setPins] = useState<PinnedDoc[]>(loadPins);
   const [files, setFiles] = useState<DocFile[]>([]);
   const [searchDir, setSearchDir] = useState('~/repos');
@@ -56,6 +61,14 @@ export function DocsView() {
     }
   }, []);
 
+  // Open a doc pushed from the MCP tool / backend
+  useEffect(() => {
+    if (!openPath) return;
+    const name = openPath.split('/').pop() || openPath;
+    openDoc(openPath, name);
+    onOpenPathConsumed?.();
+  }, [openPath]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // Pin/unpin
   const togglePin = useCallback((path: string, name: string) => {
     setPins((prev) => {
@@ -69,6 +82,17 @@ export function DocsView() {
   const isPinned = (path: string) => pins.some((p) => p.path === path);
 
   const [sidebarWidth, setSidebarWidth] = useState(280);
+  const [copied, setCopied] = useState(false);
+  const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const copyToClipboard = useCallback(() => {
+    if (!activeDoc) return;
+    navigator.clipboard.writeText(activeDoc.content).then(() => {
+      setCopied(true);
+      if (copyTimerRef.current) clearTimeout(copyTimerRef.current);
+      copyTimerRef.current = setTimeout(() => setCopied(false), 1500);
+    });
+  }, [activeDoc]);
 
   return (
     <div className="docs-view">
@@ -143,6 +167,9 @@ export function DocsView() {
             <div className="docs-content-header">
               <span className="docs-content-title">{activeDoc.name}</span>
               <span className="docs-content-path">{activeDoc.path}</span>
+              <button className="docs-copy-btn" onClick={copyToClipboard}>
+                {copied ? '✓ Copied' : '⎘ Copy'}
+              </button>
               <button
                 className={`docs-pin-btn${isPinned(activeDoc.path) ? ' pinned' : ''}`}
                 onClick={() => togglePin(activeDoc.path, activeDoc.name)}

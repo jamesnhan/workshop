@@ -16,6 +16,9 @@ import { WorkspaceManager } from './components/WorkspaceManager';
 import { SettingsView } from './components/SettingsView';
 import { ResizeHandle } from './components/ResizeHandle';
 import { TicketHoverPreview } from './components/TicketHoverPreview';
+import { TicketLookupDialog } from './components/TicketLookupDialog';
+import { ToastContainer, type ToastItem, type ToastKind } from './components/Toast';
+import { ConfirmDialog, type DialogKind } from './components/ConfirmDialog';
 import { useSettings } from './hooks/useSettings';
 import { useWorkshopSocket } from './hooks/useWebSocket';
 import { useNotifications } from './hooks/useNotifications';
@@ -39,7 +42,7 @@ import { themes, getActiveThemeName, setActiveThemeName, applyTheme } from './th
 import './App.css';
 
 function App() {
-  const { connected, subscribe, unsubscribe, sendInput, sendResize, startRecording, stopRecording, onOutput, onStatus, onStatusClear, onReconnect } = useWorkshopSocket();
+  const { connected, subscribe, unsubscribe, sendInput, sendResize, startRecording, stopRecording, onOutput, onStatus, onStatusClear, onReconnect, onOpenDoc, onDispatchUpdate, onSessionCreated, onUICommand } = useWorkshopSocket();
   const [paneStatuses, setPaneStatuses] = useState<Record<string, { status: string; message: string }>>({});
   const [layout, setLayout] = useState<LayoutState>(() => {
     const saved = loadLayout();
@@ -57,6 +60,10 @@ function App() {
   const [kanbanOpen, setKanbanOpen] = useState(false);
   const [dashboardOpen, setDashboardOpen] = useState(false);
   const [docsOpen, setDocsOpen] = useState(false);
+  const [pendingDocPath, setPendingDocPath] = useState<string | null>(null);
+  const [ticketLookupOpen, setTicketLookupOpen] = useState(false);
+  const [ticketInsertTarget, setTicketInsertTarget] = useState<string | null>(null);
+  const [dispatchTick, setDispatchTick] = useState(0);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [notifBannerDismissed, setNotifBannerDismissed] = useState(false);
   const [notifSettingsOpen, setNotifSettingsOpen] = useState(false);
@@ -74,6 +81,29 @@ function App() {
   const unreadTickRef = useRef(0);
   const { notifications, unreadCount, scanOutput, markSubscribed, markAllRead, dismiss, clearAll, requestPermission, permissionState } = useNotifications();
   const [capsLockOn, setCapsLockOn] = useState(false);
+  // Toast notifications surfaced via show_toast UI command
+  const [toasts, setToasts] = useState<ToastItem[]>([]);
+  const nextToastId = useRef(1);
+  const pushToast = useCallback((message: string, kind: ToastKind = 'info') => {
+    const id = nextToastId.current++;
+    setToasts((prev) => [...prev, { id, message, kind }]);
+  }, []);
+  const dismissToast = useCallback((id: number) => {
+    setToasts((prev) => prev.filter((t) => t.id !== id));
+  }, []);
+
+  // Generic dialog state for UI prompt_user / confirm commands
+  const [uiDialog, setUIDialog] = useState<{
+    kind: DialogKind;
+    title: string;
+    message?: string;
+    initialValue?: string;
+    danger?: boolean;
+    onResolve: (value: string | undefined, cancelled: boolean) => void;
+  } | null>(null);
+
+  // Pending kanban card to open from a UI command
+  const [pendingOpenCardId, setPendingOpenCardId] = useState<number | null>(null);
   const { settings, updateSettings } = useSettings();
   const [themeName, setThemeName] = useState(getActiveThemeName);
   const theme = themes[themeName] || themes['catppuccin-mocha'];
@@ -188,6 +218,118 @@ function App() {
     });
   }, []));
 
+  onOpenDoc(useCallback((path: string) => {
+    setDocsOpen(true);
+    setKanbanOpen(false);
+    setDashboardOpen(false);
+    setSettingsOpen(false);
+    setPendingDocPath(path);
+  }, []));
+
+  onDispatchUpdate(useCallback(() => {
+    setDispatchTick((t) => t + 1);
+  }, []));
+
+  onSessionCreated(useCallback((target: string, background: boolean) => {
+    // Refresh the pane list so the new session shows up everywhere.
+    refreshPanes();
+    if (background) {
+      // Agent/MCP-initiated: add as an inactive tab, don't steal focus.
+      addBackgroundTab(target);
+    } else {
+      // User-initiated: make it the active tab in the focused cell.
+      assignPaneToCell(layoutRef.current.focusedId, target);
+    }
+  }, []));
+
+  // UI command dispatch — agents drive the frontend via the ui_command WS
+  // channel. Blocking commands (prompt_user/confirm) post their result back
+  // to /api/v1/ui/response/{id}.
+  onUICommand(useCallback((cmd) => {
+    const respond = (value: string | undefined, cancelled: boolean) => {
+      if (!cmd.id) return;
+      post(`/ui/response/${cmd.id}`, { value, cancelled }).catch(() => {});
+    };
+    switch (cmd.action) {
+      case 'show_toast': {
+        const message = String(cmd.payload.message ?? '');
+        const kind = (cmd.payload.kind as ToastKind) || 'info';
+        if (message) pushToast(message, kind);
+        break;
+      }
+      case 'switch_view': {
+        const view = String(cmd.payload.view ?? 'sessions');
+        setKanbanOpen(view === 'kanban');
+        setDashboardOpen(view === 'agents');
+        setDocsOpen(view === 'docs');
+        setSettingsOpen(view === 'settings');
+        break;
+      }
+      case 'focus_cell': {
+        const cellId = String(cmd.payload.cellId ?? '');
+        if (cellId) {
+          setLayout((prev) => ({ ...prev, focusedId: cellId }));
+        }
+        break;
+      }
+      case 'focus_pane': {
+        const target = String(cmd.payload.target ?? '');
+        const cell = layoutRef.current.cells.find((c) => c.target === target);
+        if (cell) {
+          setLayout((prev) => ({ ...prev, focusedId: cell.id }));
+          requestAnimationFrame(() => viewerRefsMap.current.get(cell.id)?.current?.focus());
+        }
+        break;
+      }
+      case 'assign_pane': {
+        const target = String(cmd.payload.target ?? '');
+        const cellId = (cmd.payload.cellId as string | undefined) ?? layoutRef.current.focusedId;
+        if (target) assignPaneToCell(cellId, target);
+        break;
+      }
+      case 'open_card': {
+        const id = Number(cmd.payload.id);
+        if (id > 0) {
+          setKanbanOpen(true);
+          setDashboardOpen(false);
+          setDocsOpen(false);
+          setSettingsOpen(false);
+          setPendingOpenCardId(id);
+        }
+        break;
+      }
+      case 'prompt_user': {
+        setUIDialog({
+          kind: 'prompt',
+          title: String(cmd.payload.title ?? 'Input requested'),
+          message: cmd.payload.message ? String(cmd.payload.message) : undefined,
+          initialValue: cmd.payload.initialValue ? String(cmd.payload.initialValue) : '',
+          onResolve: (value, cancelled) => {
+            setUIDialog(null);
+            respond(value, cancelled);
+          },
+        });
+        break;
+      }
+      case 'confirm': {
+        setUIDialog({
+          kind: 'confirm',
+          title: String(cmd.payload.title ?? 'Confirm'),
+          message: cmd.payload.message ? String(cmd.payload.message) : undefined,
+          danger: Boolean(cmd.payload.danger),
+          onResolve: (_value, cancelled) => {
+            setUIDialog(null);
+            respond(cancelled ? 'false' : 'true', false);
+          },
+        });
+        break;
+      }
+      default:
+        console.warn('[workshop] unknown ui_command action:', cmd.action);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []));
+
   // Load all panes
   const refreshPanes = useCallback(async () => {
     try {
@@ -202,6 +344,31 @@ function App() {
 
   useAutoSaveLayout(layout);
   useValidateTargets(allPanes, setLayout);
+
+  // Remap all pane targets in the layout when a session is renamed.
+  const handleSessionRenamed = useCallback((oldName: string, newName: string) => {
+    const remap = (t: string | null) =>
+      t && t.startsWith(oldName + ':') ? newName + t.slice(oldName.length) : t;
+    setLayout((prev) => ({
+      ...prev,
+      cells: prev.cells.map((c) => ({
+        ...c,
+        target: remap(c.target),
+        history: c.history.map((h) => remap(h) ?? h),
+        tabs: c.tabs.map((tab) => {
+          const nt = remap(tab.target);
+          return nt && nt !== tab.target
+            ? { ...tab, target: nt, label: tab.label === tab.target ? nt : tab.label }
+            : tab;
+        }),
+      })),
+    }));
+    // Force a repaint/refit after the target remap lands in the DOM.
+    // xterm panes need a resize tick to redraw their content for the new target.
+    requestAnimationFrame(() => {
+      viewerRefsMap.current.forEach((ref) => ref.current?.refit());
+    });
+  }, []);
 
   // Restore subscriptions on mount
   const hasRestored = useRef(false);
@@ -248,6 +415,39 @@ function App() {
     subscribePane(target);
     setSwitcherOpen(false);
   }, [subscribe, unsubscribe, allPanes]);
+
+  // Add a pane as an inactive background tab on a cell, without changing
+  // the focused cell or the currently-active tab. Used when new sessions
+  // are created elsewhere (sidebar + button, launch_agent, dispatch) so
+  // they surface in the UI without stealing focus.
+  const addBackgroundTab = useCallback((target: string, cellId?: string) => {
+    const targetCellId = cellId ?? layoutRef.current.focusedId;
+    const cell = layoutRef.current.cells.find((c) => c.id === targetCellId);
+    if (!cell) return;
+    // If the pane is already a tab somewhere, don't duplicate it.
+    if (layoutRef.current.cells.some((c) => c.tabs.some((t) => t.target === target))) {
+      return;
+    }
+    const wasEmpty = !cell.target;
+    const label = target.split(':')[0] || target;
+    setLayout((prev) => ({
+      ...prev,
+      cells: prev.cells.map((c) => {
+        if (c.id !== targetCellId) return c;
+        if (wasEmpty) {
+          return {
+            ...c,
+            target,
+            tabs: [...c.tabs, { target, label }].slice(-10),
+            history: [target],
+            historyIndex: 0,
+          };
+        }
+        return { ...c, tabs: [...c.tabs, { target, label }].slice(-10) };
+      }),
+    }));
+    if (wasEmpty) subscribePane(target);
+  }, [subscribePane]);
 
   // Switch to a tab within a cell (re-subscribes)
   const switchTab = useCallback((cellId: string, target: string) => {
@@ -409,6 +609,7 @@ function App() {
         return;
       }
 
+      if (key === 'Escape' && ticketLookupOpen) { setTicketLookupOpen(false); return; }
       if (key === 'Escape' && playerOpen) { setPlayerOpen(false); return; }
       if (key === 'Escape' && dashboardOpen) { setDashboardOpen(false); return; }
       if (key === 'Escape' && settingsOpen) { setSettingsOpen(false); return; }
@@ -425,6 +626,17 @@ function App() {
         if (!inTerminal) {
           e.preventDefault();
           setHotkeyMenuOpen((p) => !p);
+          return;
+        }
+      }
+
+      // # — ticket lookup dialog (only when not typing in a terminal)
+      if (e.key === '#' && !mod && !nav) {
+        const active = document.activeElement;
+        const inTerminal = active?.classList.contains('xterm-helper-textarea');
+        if (!inTerminal) {
+          e.preventDefault();
+          setTicketLookupOpen((p) => !p);
           return;
         }
       }
@@ -675,6 +887,7 @@ function App() {
     { id: 'kanban', label: 'Open Kanban Board', category: 'Panel', shortcut: 'Ctrl+Shift+K', action: () => setKanbanOpen(true) },
     { id: 'dashboard', label: 'Open Agent Dashboard', category: 'Panel', shortcut: 'Ctrl+Shift+D', action: () => setDashboardOpen(true) },
     { id: 'docs', label: 'Open Docs', category: 'Panel', action: () => { setDocsOpen(true); setKanbanOpen(false); setDashboardOpen(false); } },
+    { id: 'ticket-lookup', label: 'Ticket Lookup', category: 'Panel', shortcut: '#', action: () => setTicketLookupOpen(true) },
     { id: 'enable-notifs', label: `Notifications: ${permissionState}`, category: 'Settings', action: requestPermission },
     { id: 'notif-patterns', label: 'Notification Patterns', category: 'Settings', action: () => setNotifSettingsOpen(true) },
     { id: 'preview-size', label: `Preview Size: ${localStorage.getItem('workshop-preview-size') || 'medium'}`, category: 'Settings', action: () => {
@@ -731,7 +944,7 @@ function App() {
     // Session
     { id: 'new-session', label: 'Create New Session', category: 'Session', action: () => {
       const name = prompt('Session name:');
-      if (name) { import('./api/client').then(({ post }) => post('/sessions', { name }).then(() => refreshPanes())); }
+      if (name) { import('./api/client').then(({ post }) => post('/sessions', { name, background: false }).then(() => refreshPanes())); }
     }},
     { id: 'launch-agent', label: 'Launch Agent', category: 'Agent', action: () => {
       setSwitcherOpen(true);
@@ -841,6 +1054,7 @@ function App() {
         }}
         activeTargets={activeTargets}
         paneStatuses={paneStatuses}
+        onSessionRenamed={handleSessionRenamed}
         style={{ width: sidebarCollapsed ? undefined : sidebarWidth }}
       />
       {!sidebarCollapsed && (
@@ -953,6 +1167,7 @@ function App() {
             onSelect={(target) => assignPaneToCell(switcherCellId, target)}
             onClose={() => setSwitcherOpen(false)}
             onRefresh={refreshPanes}
+            ticketAutocomplete={settings.ticketAutocomplete}
           />
         )}
         {cmdPaletteOpen && (
@@ -966,6 +1181,25 @@ function App() {
         )}
         {hotkeyMenuOpen && (
           <HotkeyMenu onClose={() => setHotkeyMenuOpen(false)} />
+        )}
+        {ticketLookupOpen && (
+          <TicketLookupDialog
+            onClose={() => {
+              const target = ticketInsertTarget;
+              setTicketLookupOpen(false);
+              setTicketInsertTarget(null);
+              if (target) {
+                const cell = layout.cells.find((c) => c.target === target);
+                if (cell) {
+                  const ref = viewerRefsMap.current.get(cell.id);
+                  // Delay focus so the current keydown/keypress cycle completes before
+                  // xterm gains focus — prevents Enter/Escape leaking into the PTY
+                  requestAnimationFrame(() => ref?.current?.focus());
+                }
+              }
+            }}
+            onInsert={ticketInsertTarget ? (text) => handleInput(ticketInsertTarget, text) : undefined}
+          />
         )}
         {notifOpen && (
           <NotificationPanel
@@ -1013,6 +1247,14 @@ function App() {
             onCloseTab={closeTab}
             onTicketHover={(id, x, y) => setTicketHover(id ? { id, x, y } : null)}
             onTicketClick={(id) => { setKanbanOpen(true); /* TODO: focus the card */ void id; }}
+            onHashKey={settings.terminalHashKey ? () => {
+              const focusedCell = layout.cells.find((c) => c.id === layout.focusedId);
+              const target = focusedCell?.target;
+              if (target) {
+                setTicketInsertTarget(target);
+                setTicketLookupOpen(true);
+              }
+            } : undefined}
           />
         </div>
         {ticketHover && <TicketHoverPreview cardId={ticketHover.id} x={ticketHover.x} y={ticketHover.y} />}
@@ -1029,6 +1271,10 @@ function App() {
               if (cell) handleFocusCell(cell.id);
               else assignPaneToCell(layout.focusedId, target);
             }}
+            ticketAutocomplete={settings.ticketAutocomplete}
+            dispatchTick={dispatchTick}
+            openCardId={pendingOpenCardId}
+            onCardOpened={() => setPendingOpenCardId(null)}
           />
         )}
         {activeView === 'dashboard' && (
@@ -1043,7 +1289,7 @@ function App() {
             }}
           />
         )}
-        {activeView === 'docs' && <DocsView />}
+        {activeView === 'docs' && <DocsView openPath={pendingDocPath} onOpenPathConsumed={() => setPendingDocPath(null)} />}
         {activeView === 'settings' && (
           <SettingsView
             settings={settings}
@@ -1059,6 +1305,17 @@ function App() {
       <button className="mobile-fab" onClick={() => setCmdPaletteOpen(true)} title="Command Palette">
         ⌘
       </button>
+      <ToastContainer toasts={toasts} onDismiss={dismissToast} />
+      <ConfirmDialog
+        open={uiDialog !== null}
+        kind={uiDialog?.kind ?? 'confirm'}
+        title={uiDialog?.title ?? ''}
+        message={uiDialog?.message}
+        initialValue={uiDialog?.initialValue}
+        danger={uiDialog?.danger}
+        onConfirm={(value) => uiDialog?.onResolve(value, false)}
+        onCancel={() => uiDialog?.onResolve(undefined, true)}
+      />
     </div>
   );
 }

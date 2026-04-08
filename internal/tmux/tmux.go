@@ -43,7 +43,9 @@ type Bridge interface {
 	SendInput(target, data string) error
 	CapturePane(target string, lines int) (string, error)
 	CapturePanePlain(target string, lines int) (string, error)
+	CapturePaneVisible(target string) (string, error)
 	CapturePaneAll(target string) (string, error)
+	RunRaw(args ...string) (string, error)
 ResizePane(target string, cols, rows int) error
 	PaneTTY(target string) (string, error)
 	ListPanes(session string) ([]Pane, error)
@@ -257,6 +259,17 @@ func (b *ExecBridge) CapturePanePlain(target string, lines int) (string, error) 
 	}
 	// Convert \n to \r\n for xterm.js
 	return strings.ReplaceAll(out, "\n", "\r\n"), nil
+}
+
+// CapturePaneVisible captures only the currently visible pane content
+// (no scrollback). Useful when scrollback would contain historical text
+// that matches detection patterns but isn't the live state.
+func (b *ExecBridge) CapturePaneVisible(target string) (string, error) {
+	out, err := b.run("capture-pane", "-t", target, "-p")
+	if err != nil {
+		return "", fmt.Errorf("capture-pane-visible: %w: %s", err, out)
+	}
+	return out, nil
 }
 
 // CapturePaneAll captures the entire scrollback history as plain text.

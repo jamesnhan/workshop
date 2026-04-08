@@ -1,5 +1,7 @@
+import { useEffect, useState } from 'react';
 import type { WorkshopSettings, PreviewSize } from '../hooks/useSettings';
 import { themes } from '../themes';
+import { get } from '../api/client';
 
 interface Props {
   settings: WorkshopSettings;
@@ -11,6 +13,20 @@ interface Props {
 }
 
 export function SettingsView({ settings, onUpdate, themeName, onThemeChange, notificationPermission, onRequestNotifications }: Props) {
+  // Channel delivery mode lives on the backend (per-server-instance state),
+  // not in localStorage — fetch it once and provide a setter that PUTs.
+  const [channelMode, setChannelMode] = useState<string>('auto');
+  useEffect(() => {
+    get<{ mode: string }>('/channel-mode').then((r) => { if (r?.mode) setChannelMode(r.mode); }).catch(() => {});
+  }, []);
+  const updateChannelMode = (mode: string) => {
+    setChannelMode(mode);
+    fetch('/api/v1/channel-mode', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode }),
+    }).catch(() => {});
+  };
   return (
     <div className="settings-view">
       <div className="settings-header">Settings</div>
@@ -61,6 +77,58 @@ export function SettingsView({ settings, onUpdate, themeName, onThemeChange, not
             </span>
           </div>
         </label>
+
+        <label className="settings-toggle">
+          <input
+            type="checkbox"
+            checked={settings.terminalHashKey}
+            onChange={(e) => onUpdate({ terminalHashKey: e.target.checked })}
+          />
+          <div className="settings-toggle-info">
+            <span className="settings-toggle-label"># ticket lookup in terminal</span>
+            <span className="settings-toggle-desc">
+              Press # in a focused terminal to open the ticket lookup dialog. The selected ticket reference is typed directly into the PTY.
+            </span>
+          </div>
+        </label>
+      </div>
+
+      <div className="settings-section">
+        <div className="settings-section-title">Ticket Autocomplete</div>
+
+        <label className="settings-toggle">
+          <input
+            type="checkbox"
+            checked={settings.ticketAutocomplete}
+            onChange={(e) => onUpdate({ ticketAutocomplete: e.target.checked })}
+          />
+          <div className="settings-toggle-info">
+            <span className="settings-toggle-label"># autocomplete in text inputs</span>
+            <span className="settings-toggle-desc">
+              Show a ticket dropdown when typing # in kanban notes, card descriptions, and agent prompts.
+            </span>
+          </div>
+        </label>
+      </div>
+
+      <div className="settings-section">
+        <div className="settings-section-title">Channels (inter-agent messaging)</div>
+
+        <div className="settings-field">
+          <span className="settings-field-label">Delivery mode</span>
+          <select
+            className="settings-select"
+            value={channelMode}
+            onChange={(e) => updateChannelMode(e.target.value)}
+          >
+            <option value="auto">Auto (native if available, fall back to compat)</option>
+            <option value="compat">Compat (always type into input via send_text)</option>
+            <option value="native">Native (claude/channel notifications only)</option>
+          </select>
+        </div>
+        <div className="settings-toggle-desc" style={{ marginTop: '0.4rem', color: 'var(--text-muted)', fontSize: '0.85rem' }}>
+          Native mode requires Claude Code to be launched with <code>--dangerously-load-development-channels server:workshop</code> until the Workshop channel is approved by Anthropic. In Auto mode, panes that haven't registered a native listener fall back to the compat path automatically.
+        </div>
       </div>
 
       <div className="settings-section">

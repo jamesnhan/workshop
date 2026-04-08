@@ -9,8 +9,9 @@ import (
 )
 
 type createSessionRequest struct {
-	Name     string `json:"name"`
-	StartDir string `json:"startDir,omitempty"`
+	Name       string `json:"name"`
+	StartDir   string `json:"startDir,omitempty"`
+	Background bool   `json:"background,omitempty"`
 }
 
 type sendKeysRequest struct {
@@ -51,6 +52,16 @@ func (a *API) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		a.serverErr(w, "operation failed", err)
 		return
 	}
+	// Pre-register in the pane monitor so its next scan doesn't double-
+	// broadcast this as background. Then broadcast explicitly with the
+	// caller's chosen background flag.
+	target := req.Name + ":1.1"
+	a.status.MarkSeen(target)
+	a.status.Broadcast("session_created", map[string]any{
+		"target":     target,
+		"session":    req.Name,
+		"background": req.Background,
+	})
 	w.WriteHeader(http.StatusCreated)
 	a.jsonOK(w, map[string]string{"name": req.Name})
 }

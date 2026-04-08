@@ -1,5 +1,7 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { get, post } from '../api/client';
+import { useTicketAutocomplete } from '../hooks/useTicketAutocomplete';
+import { TicketSuggestions } from './TicketSuggestions';
 
 interface Card {
   id: number;
@@ -32,6 +34,17 @@ interface CardLogEntry {
   afterValue: string;
   source: string;
   createdAt: string;
+}
+
+interface Dispatch {
+  id: number;
+  cardId: number;
+  sessionName: string;
+  target: string;
+  provider: string;
+  status: string; // running, done, error
+  dispatchedAt: string;
+  completedAt?: string;
 }
 
 const COLUMNS = [
@@ -76,9 +89,13 @@ interface Props {
   onNavigateToPane: (target: string) => void;
   defaultProject?: string;
   focusedPath?: string;
+  ticketAutocomplete?: boolean;
+  dispatchTick?: number; // increment to signal a dispatch update (triggers refresh)
+  openCardId?: number | null; // when set, expands the matching card on next render
+  onCardOpened?: () => void; // called after openCardId has been consumed
 }
 
-export function KanbanBoard({ onNavigateToPane, defaultProject, focusedPath }: Props) {
+export function KanbanBoard({ onNavigateToPane, defaultProject, focusedPath, ticketAutocomplete = true, dispatchTick, openCardId, onCardOpened }: Props) {
   const [cards, setCards] = useState<Card[]>([]);
   const [projects, setProjects] = useState<string[]>([]);
   const [filterProject, setFilterProject] = useState(defaultProject ?? '');
@@ -101,10 +118,11 @@ export function KanbanBoard({ onNavigateToPane, defaultProject, focusedPath }: P
   const [editCard, setEditCard] = useState<Card | null>(null);
   const [notes, setNotes] = useState<CardNote[]>([]);
   const [cardLog, setCardLog] = useState<CardLogEntry[]>([]);
+  const [dispatches, setDispatches] = useState<Dispatch[]>([]);
+  const [activeDispatches, setActiveDispatches] = useState<Record<number, number>>({}); // cardId → running count
   const [showChangelog, setShowChangelog] = useState(false);
   const [projectLog, setProjectLog] = useState<CardLogEntry[]>([]);
   const [newNote, setNewNote] = useState('');
-  const noteInputRef = useRef<HTMLInputElement>(null);
   const [newCardCol, setNewCardCol] = useState<string | null>(null);
   const [newTitle, setNewTitle] = useState('');
   const [newDesc, setNewDesc] = useState('');
@@ -113,17 +131,58 @@ export function KanbanBoard({ onNavigateToPane, defaultProject, focusedPath }: P
   const [newLabels, setNewLabels] = useState('');
   const [newType, setNewType] = useState('');
   const [newPriority, setNewPriority] = useState('');
-  // Fetch notes and activity log when expanding a card
+
+  const noteInputRef = useRef<HTMLInputElement>(null);
+  const editDescRef = useRef<HTMLTextAreaElement>(null);
+  const newDescRef = useRef<HTMLTextAreaElement>(null);
+
+  const noteAC = useTicketAutocomplete({ inputRef: noteInputRef, value: newNote, onChange: setNewNote, cards, enabled: ticketAutocomplete });
+  const editDescAC = useTicketAutocomplete({
+    inputRef: editDescRef,
+    value: editCard?.description ?? '',
+    onChange: (v) => editCard && setEditCard({ ...editCard, description: v }),
+    cards,
+    enabled: ticketAutocomplete,
+  });
+  const newDescAC = useTicketAutocomplete({ inputRef: newDescRef, value: newDesc, onChange: setNewDesc, cards, enabled: ticketAutocomplete });
+  // External open: when openCardId is provided, find and expand that card
+  // once the card list is loaded.
+  useEffect(() => {
+    if (openCardId == null) return;
+    const card = cards.find((c) => c.id === openCardId);
+    if (card) {
+      setExpandedCard(card);
+      onCardOpened?.();
+    }
+  }, [openCardId, cards, onCardOpened]);
+
+  // Fetch notes, activity log, and dispatches when expanding a card
   useEffect(() => {
     if (expandedCard) {
       get<CardNote[]>(`/cards/${expandedCard.id}/notes`).then((n) => setNotes(n ?? [])).catch(() => setNotes([]));
       get<CardLogEntry[]>(`/cards/${expandedCard.id}/log`).then((l) => setCardLog(l ?? [])).catch(() => setCardLog([]));
+      get<Dispatch[]>(`/cards/${expandedCard.id}/dispatches`).then((d) => setDispatches(d ?? [])).catch(() => setDispatches([]));
       setNewNote('');
     } else {
       setNotes([]);
       setCardLog([]);
+      setDispatches([]);
     }
   }, [expandedCard]);
+
+  // Load active dispatch counts on mount and when notified
+  const refreshActiveDispatches = useCallback(() => {
+    get<Dispatch[]>('/dispatches/active').then((active) => {
+      const counts: Record<number, number> = {};
+      for (const d of active ?? []) {
+        counts[d.cardId] = (counts[d.cardId] ?? 0) + 1;
+      }
+      setActiveDispatches(counts);
+    }).catch(() => {});
+  }, []);
+
+  useEffect(() => { refreshActiveDispatches(); }, [refreshActiveDispatches]);
+
 
   // Fetch project changelog when toggled on
   useEffect(() => {
@@ -187,6 +246,16 @@ export function KanbanBoard({ onNavigateToPane, defaultProject, focusedPath }: P
   }, [filterProject, defaultProject, focusedPath, repoName, hasAutoFiltered]);
 
   useEffect(() => { refresh(); }, [refresh]);
+
+  // When a dispatch update arrives (via dispatchTick), refresh active counts + card list
+  useEffect(() => {
+    if (dispatchTick === undefined) return;
+    refreshActiveDispatches();
+    refresh();
+    if (expandedCard) {
+      get<Dispatch[]>(`/cards/${expandedCard.id}/dispatches`).then((d) => setDispatches(d ?? [])).catch(() => {});
+    }
+  }, [dispatchTick]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleCreate = async () => {
     if (!newTitle.trim() || !newCardCol) return;
@@ -260,6 +329,7 @@ export function KanbanBoard({ onNavigateToPane, defaultProject, focusedPath }: P
         provider: 'claude',
         directory: undefined,
         prompt,
+        cardId: card.id,
       });
       // Link the launched session back to the card
       await fetch(`/api/v1/cards/${card.id}`, {
@@ -372,18 +442,36 @@ export function KanbanBoard({ onNavigateToPane, defaultProject, focusedPath }: P
                   <span className="kanban-note-text">{n.text}</span>
                 </div>
               ))}
-              <div className="kanban-note-input">
+              <div className="kanban-note-input kanban-autocomplete-wrapper">
                 <input
                   ref={noteInputRef}
                   type="text"
                   placeholder="Add a note..."
                   value={newNote}
-                  onChange={(e) => setNewNote(e.target.value)}
-                  onKeyDown={(e) => { if (e.key === 'Enter') handleAddNote(); }}
+                  onChange={noteAC.handleChange}
+                  onKeyDown={(e) => { noteAC.handleKeyDown(e); if (!noteAC.showDropdown && e.key === 'Enter') handleAddNote(); }}
                 />
                 <button className="btn-create" onClick={handleAddNote} disabled={!newNote.trim()}>Add</button>
+                {noteAC.showDropdown && <TicketSuggestions suggestions={noteAC.suggestions} selectedIdx={noteAC.selectedIdx} onSelect={noteAC.accept} />}
               </div>
             </div>
+            {/* Dispatches */}
+            {dispatches.length > 0 && (
+              <div className="kanban-dispatches">
+                <h4 className="kanban-notes-title">Agents</h4>
+                {dispatches.map((d) => (
+                  <div key={d.id} className={`kanban-dispatch-item dispatch-${d.status}`}>
+                    <span className={`dispatch-status-dot dispatch-dot-${d.status}`} title={d.status} />
+                    <span className="dispatch-session"
+                      onClick={() => { onNavigateToPane(d.target); setExpandedCard(null); }}
+                      title={`Jump to ${d.target}`}
+                    >{d.sessionName}</span>
+                    <span className="dispatch-meta">{new Date(d.dispatchedAt).toLocaleString()}</span>
+                    {d.completedAt && <span className="dispatch-meta">→ {new Date(d.completedAt).toLocaleString()}</span>}
+                  </div>
+                ))}
+              </div>
+            )}
             {/* Activity log */}
             {cardLog.length > 0 && (
               <div className="kanban-log">
@@ -416,7 +504,10 @@ export function KanbanBoard({ onNavigateToPane, defaultProject, focusedPath }: P
             <h3>Edit Card</h3>
             <div className="kanban-edit-form">
               <input type="text" value={editCard.title} onChange={(e) => setEditCard({ ...editCard, title: e.target.value })} placeholder="Title" />
-              <textarea value={editCard.description} onChange={(e) => setEditCard({ ...editCard, description: e.target.value })} placeholder="Description" rows={4} />
+              <div className="kanban-autocomplete-wrapper">
+                <textarea ref={editDescRef} value={editCard.description} onChange={editDescAC.handleChange} onKeyDown={editDescAC.handleKeyDown} placeholder="Description" rows={4} />
+                {editDescAC.showDropdown && <TicketSuggestions suggestions={editDescAC.suggestions} selectedIdx={editDescAC.selectedIdx} onSelect={editDescAC.accept} />}
+              </div>
               <div className="kanban-edit-row">
                 <select value={editCard.cardType} onChange={(e) => setEditCard({ ...editCard, cardType: e.target.value })}>
                   {CARD_TYPES.map((t) => <option key={t} value={t}>{t || 'No type'}</option>)}
@@ -488,7 +579,10 @@ export function KanbanBoard({ onNavigateToPane, defaultProject, focusedPath }: P
             {!collapsedCols.has(col.id) && newCardCol === col.id && (
               <div className="kanban-card kanban-card-new">
                 <input type="text" placeholder="Title" value={newTitle} onChange={(e) => setNewTitle(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && handleCreate()} autoFocus />
-                <textarea placeholder="Description" value={newDesc} onChange={(e) => setNewDesc(e.target.value)} rows={2} />
+                <div className="kanban-autocomplete-wrapper">
+                  <textarea ref={newDescRef} placeholder="Description" value={newDesc} onChange={newDescAC.handleChange} onKeyDown={newDescAC.handleKeyDown} rows={2} />
+                  {newDescAC.showDropdown && <TicketSuggestions suggestions={newDescAC.suggestions} selectedIdx={newDescAC.selectedIdx} onSelect={newDescAC.accept} />}
+                </div>
                 <div className="kanban-edit-row">
                   <select value={newType} onChange={(e) => setNewType(e.target.value)}>
                     {CARD_TYPES.map((t) => <option key={t} value={t}>{t || 'Type'}</option>)}
@@ -555,6 +649,9 @@ export function KanbanBoard({ onNavigateToPane, defaultProject, focusedPath }: P
                   )}
                   <span className="kanban-card-id">#{card.id}</span>
                   <span className="kanban-card-title">{card.title}</span>
+                  {activeDispatches[card.id] > 0 && (
+                    <span className="kanban-agent-badge" title={`${activeDispatches[card.id]} agent(s) running`}>⚡{activeDispatches[card.id]}</span>
+                  )}
                   {completion && (
                     <span className="kanban-card-completion" title={`${completion.done} of ${completion.total} subtasks done`}>
                       {completion.done}/{completion.total}

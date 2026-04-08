@@ -155,6 +155,51 @@ func (d *DB) migrate() error {
 		)
 	`)
 
+	// Card dispatches — tracks agents launched from cards
+	d.db.Exec(`
+		CREATE TABLE IF NOT EXISTS card_dispatches (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			card_id INTEGER NOT NULL,
+			session_name TEXT NOT NULL,
+			target TEXT NOT NULL,
+			provider TEXT DEFAULT 'claude',
+			status TEXT DEFAULT 'running',
+			auto_cleanup INTEGER DEFAULT 1,
+			dispatched_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			completed_at DATETIME,
+			FOREIGN KEY (card_id) REFERENCES cards(id) ON DELETE CASCADE
+		)
+	`)
+	d.db.Exec(`CREATE INDEX IF NOT EXISTS idx_dispatches_card ON card_dispatches(card_id, dispatched_at DESC)`)
+	d.db.Exec(`CREATE INDEX IF NOT EXISTS idx_dispatches_status ON card_dispatches(status)`)
+
+	// Channel subscriptions: pane X wants messages on channel Y
+	d.db.Exec(`
+		CREATE TABLE IF NOT EXISTS channel_subscriptions (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			channel TEXT NOT NULL,
+			target TEXT NOT NULL,
+			project TEXT DEFAULT '',
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE(channel, target)
+		)
+	`)
+	d.db.Exec(`CREATE INDEX IF NOT EXISTS idx_chan_subs_channel ON channel_subscriptions(channel)`)
+	d.db.Exec(`CREATE INDEX IF NOT EXISTS idx_chan_subs_target ON channel_subscriptions(target)`)
+
+	// Channel messages: persisted history
+	d.db.Exec(`
+		CREATE TABLE IF NOT EXISTS channel_messages (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			channel TEXT NOT NULL,
+			sender TEXT DEFAULT '',
+			body TEXT NOT NULL,
+			project TEXT DEFAULT '',
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		)
+	`)
+	d.db.Exec(`CREATE INDEX IF NOT EXISTS idx_chan_msgs_channel ON channel_messages(channel, created_at DESC)`)
+
 	// Indexes for hot query paths
 	d.db.Exec(`CREATE INDEX IF NOT EXISTS idx_cards_proj_col ON cards(project, "column", position)`)
 	d.db.Exec(`CREATE INDEX IF NOT EXISTS idx_notes_card ON card_notes(card_id, created_at)`)
@@ -664,4 +709,250 @@ func (d *DB) ListConsensusRuns() ([]ConsensusRun, error) {
 		agentRows.Close()
 	}
 	return runs, nil
+}
+
+// --- Card Dispatches ---
+
+type Dispatch struct {
+	ID           int64      `json:"id"`
+	CardID       int64      `json:"cardId"`
+	SessionName  string     `json:"sessionName"`
+	Target       string     `json:"target"`
+	Provider     string     `json:"provider"`
+	Status       string     `json:"status"` // running, done, error
+	AutoCleanup  bool       `json:"autoCleanup"`
+	DispatchedAt time.Time  `json:"dispatchedAt"`
+	CompletedAt  *time.Time `json:"completedAt,omitempty"`
+}
+
+func (d *DB) CreateDispatch(cardID int64, sessionName, target, provider string, autoCleanup bool) (*Dispatch, error) {
+	cleanup := 0
+	if autoCleanup {
+		cleanup = 1
+	}
+	result, err := d.db.Exec(
+		`INSERT INTO card_dispatches (card_id, session_name, target, provider, auto_cleanup) VALUES (?, ?, ?, ?, ?)`,
+		cardID, sessionName, target, provider, cleanup,
+	)
+	if err != nil {
+		return nil, err
+	}
+	id, _ := result.LastInsertId()
+	return &Dispatch{
+		ID: id, CardID: cardID, SessionName: sessionName, Target: target,
+		Provider: provider, Status: "running", AutoCleanup: autoCleanup,
+		DispatchedAt: time.Now(),
+	}, nil
+}
+
+func (d *DB) ListDispatches(cardID int64) ([]Dispatch, error) {
+	rows, err := d.db.Query(
+		`SELECT id, card_id, session_name, target, provider, status, auto_cleanup, dispatched_at, completed_at
+		 FROM card_dispatches WHERE card_id=? ORDER BY dispatched_at DESC`, cardID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var dispatches []Dispatch
+	for rows.Next() {
+		var disp Dispatch
+		var cleanup int
+		if err := rows.Scan(&disp.ID, &disp.CardID, &disp.SessionName, &disp.Target, &disp.Provider, &disp.Status, &cleanup, &disp.DispatchedAt, &disp.CompletedAt); err != nil {
+			continue
+		}
+		disp.AutoCleanup = cleanup != 0
+		dispatches = append(dispatches, disp)
+	}
+	return dispatches, rows.Err()
+}
+
+func (d *DB) GetActiveDispatches() ([]Dispatch, error) {
+	rows, err := d.db.Query(
+		`SELECT id, card_id, session_name, target, provider, status, auto_cleanup, dispatched_at, completed_at
+		 FROM card_dispatches WHERE status='running' ORDER BY dispatched_at DESC`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var dispatches []Dispatch
+	for rows.Next() {
+		var disp Dispatch
+		var cleanup int
+		if err := rows.Scan(&disp.ID, &disp.CardID, &disp.SessionName, &disp.Target, &disp.Provider, &disp.Status, &cleanup, &disp.DispatchedAt, &disp.CompletedAt); err != nil {
+			continue
+		}
+		disp.AutoCleanup = cleanup != 0
+		dispatches = append(dispatches, disp)
+	}
+	return dispatches, rows.Err()
+}
+
+func (d *DB) CompleteDispatch(id int64, status string) error {
+	_, err := d.db.Exec(
+		`UPDATE card_dispatches SET status=?, completed_at=CURRENT_TIMESTAMP WHERE id=?`,
+		status, id,
+	)
+	return err
+}
+
+// --- Channels ---
+
+type Channel struct {
+	Name            string `json:"name"`
+	Project         string `json:"project,omitempty"`
+	SubscriberCount int    `json:"subscriberCount"`
+	MessageCount    int    `json:"messageCount"`
+}
+
+type ChannelMessageRecord struct {
+	ID        int64     `json:"id"`
+	Channel   string    `json:"channel"`
+	Sender    string    `json:"sender"`
+	Body      string    `json:"body"`
+	Project   string    `json:"project,omitempty"`
+	CreatedAt time.Time `json:"createdAt"`
+}
+
+// CreateChannelSubscription registers a pane as a subscriber. Idempotent.
+func (d *DB) CreateChannelSubscription(channel, target, project string) error {
+	_, err := d.db.Exec(
+		`INSERT OR IGNORE INTO channel_subscriptions (channel, target, project) VALUES (?, ?, ?)`,
+		channel, target, project,
+	)
+	return err
+}
+
+// DeleteChannelSubscription removes a pane from a channel.
+func (d *DB) DeleteChannelSubscription(channel, target string) error {
+	_, err := d.db.Exec(
+		`DELETE FROM channel_subscriptions WHERE channel=? AND target=?`,
+		channel, target,
+	)
+	return err
+}
+
+// ListChannelSubscribers returns the pane targets subscribed to a channel.
+func (d *DB) ListChannelSubscribers(channel string) ([]string, error) {
+	rows, err := d.db.Query(
+		`SELECT target FROM channel_subscriptions WHERE channel=? ORDER BY created_at ASC`,
+		channel,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var targets []string
+	for rows.Next() {
+		var t string
+		if err := rows.Scan(&t); err != nil {
+			continue
+		}
+		targets = append(targets, t)
+	}
+	return targets, nil
+}
+
+// ListChannels returns all active channels (those with at least one
+// subscriber or message), optionally filtered by project.
+func (d *DB) ListChannels(project string) ([]Channel, error) {
+	query := `
+		SELECT
+			COALESCE(s.channel, m.channel) AS name,
+			COALESCE(s.project, m.project, '') AS project,
+			COALESCE(s.sub_count, 0) AS sub_count,
+			COALESCE(m.msg_count, 0) AS msg_count
+		FROM
+			(SELECT channel, project, COUNT(*) AS sub_count FROM channel_subscriptions GROUP BY channel) s
+			FULL OUTER JOIN
+			(SELECT channel, project, COUNT(*) AS msg_count FROM channel_messages GROUP BY channel) m
+			ON s.channel = m.channel
+	`
+	// SQLite doesn't support FULL OUTER JOIN — use UNION of two LEFT JOINs.
+	query = `
+		SELECT channel, project, sub_count, msg_count FROM (
+			SELECT s.channel AS channel,
+				COALESCE(s.project, '') AS project,
+				s.sub_count,
+				COALESCE(m.msg_count, 0) AS msg_count
+			FROM (SELECT channel, MAX(project) AS project, COUNT(*) AS sub_count FROM channel_subscriptions GROUP BY channel) s
+			LEFT JOIN (SELECT channel, COUNT(*) AS msg_count FROM channel_messages GROUP BY channel) m ON s.channel = m.channel
+			UNION
+			SELECT m.channel AS channel,
+				COALESCE(m.project, '') AS project,
+				COALESCE(s.sub_count, 0) AS sub_count,
+				m.msg_count
+			FROM (SELECT channel, MAX(project) AS project, COUNT(*) AS msg_count FROM channel_messages GROUP BY channel) m
+			LEFT JOIN (SELECT channel, COUNT(*) AS sub_count FROM channel_subscriptions GROUP BY channel) s ON m.channel = s.channel
+		)
+	`
+	var args []any
+	if project != "" {
+		query += ` WHERE project = ? OR project = ''`
+		args = append(args, project)
+	}
+	query += ` ORDER BY channel ASC`
+	rows, err := d.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Channel
+	seen := map[string]bool{}
+	for rows.Next() {
+		var c Channel
+		if err := rows.Scan(&c.Name, &c.Project, &c.SubscriberCount, &c.MessageCount); err != nil {
+			continue
+		}
+		if seen[c.Name] {
+			continue
+		}
+		seen[c.Name] = true
+		out = append(out, c)
+	}
+	return out, nil
+}
+
+// CreateChannelMessage persists a published message.
+func (d *DB) CreateChannelMessage(channel, sender, body, project string) (*ChannelMessageRecord, error) {
+	res, err := d.db.Exec(
+		`INSERT INTO channel_messages (channel, sender, body, project) VALUES (?, ?, ?, ?)`,
+		channel, sender, body, project,
+	)
+	if err != nil {
+		return nil, err
+	}
+	id, _ := res.LastInsertId()
+	return &ChannelMessageRecord{
+		ID:        id,
+		Channel:   channel,
+		Sender:    sender,
+		Body:      body,
+		Project:   project,
+		CreatedAt: time.Now(),
+	}, nil
+}
+
+// ListChannelMessages returns the most recent messages on a channel.
+func (d *DB) ListChannelMessages(channel string, limit int) ([]ChannelMessageRecord, error) {
+	rows, err := d.db.Query(
+		`SELECT id, channel, sender, body, project, created_at
+		 FROM channel_messages WHERE channel=?
+		 ORDER BY created_at DESC LIMIT ?`,
+		channel, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ChannelMessageRecord
+	for rows.Next() {
+		var m ChannelMessageRecord
+		if err := rows.Scan(&m.ID, &m.Channel, &m.Sender, &m.Body, &m.Project, &m.CreatedAt); err != nil {
+			continue
+		}
+		out = append(out, m)
+	}
+	return out, nil
 }

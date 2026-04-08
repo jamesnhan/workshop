@@ -29,3 +29,13 @@ export async function del(path: string): Promise<void> {
   const res = await fetch(`${BASE}${path}`, { method: 'DELETE' });
   if (!res.ok) throw new Error(await parseError(res));
 }
+
+export async function patch<T>(path: string, body?: unknown): Promise<T> {
+  const res = await fetch(`${BASE}${path}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!res.ok) throw new Error(await parseError(res));
+  return res.json();
+}

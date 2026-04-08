@@ -42,10 +42,11 @@ interface Props {
   onResize: (cols: number, rows: number) => void;
   onTicketHover?: (cardId: number | null, x: number, y: number) => void;
   onTicketClick?: (cardId: number) => void;
+  onHashKey?: () => void;
 }
 
 export const PaneViewer = forwardRef<PaneViewerHandle, Props>(
-  ({ target, terminalTheme, onData, onResize, onTicketHover, onTicketClick }, ref) => {
+  ({ target, terminalTheme, onData, onResize, onTicketHover, onTicketClick, onHashKey }, ref) => {
     const containerRef = useRef<HTMLDivElement>(null);
     const termRef = useRef<Terminal | null>(null);
     const searchRef = useRef<SearchAddon | null>(null);
@@ -54,6 +55,8 @@ export const PaneViewer = forwardRef<PaneViewerHandle, Props>(
     const onResizeRef = useRef(onResize);
     const onTicketHoverRef = useRef(onTicketHover);
     const onTicketClickRef = useRef(onTicketClick);
+    const onHashKeyRef = useRef(onHashKey);
+    onHashKeyRef.current = onHashKey;
     const pendingWriteRef = useRef('');
     const writeFrameRef = useRef<number | null>(null);
     const lastSizeRef = useRef<{ cols: number; rows: number } | null>(null);
@@ -169,6 +172,17 @@ export const PaneViewer = forwardRef<PaneViewerHandle, Props>(
       term.open(containerRef.current);
       searchRef.current = search;
       fitRef.current = fit;
+
+      // Intercept bare # before xterm consumes it — opens ticket lookup dialog
+      term.attachCustomKeyEventHandler((e) => {
+        if (e.type === 'keydown' && e.key === '#' && !e.ctrlKey && !e.altKey && !e.metaKey && onHashKeyRef.current) {
+          e.preventDefault();   // stop browser from typing # into any newly-focused input
+          e.stopPropagation();
+          onHashKeyRef.current();
+          return false; // prevent xterm from sending # to PTY
+        }
+        return true;
+      });
 
       // Register link provider for ticket references like #123
       const ticketLinkProvider = term.registerLinkProvider({

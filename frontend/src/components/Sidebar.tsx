@@ -1,7 +1,8 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
-import { get, post } from '../api/client';
+import { get, post, del, patch } from '../api/client';
 import AnsiToHtml from 'ansi-to-html';
 import DOMPurify from 'dompurify';
+import { ConfirmDialog, type DialogKind } from './ConfirmDialog';
 
 interface Session {
   name: string;
@@ -38,6 +39,7 @@ interface Props {
   onSelectPane: (target: string) => void;
   activeTargets: string[];
   paneStatuses: Record<string, { status: string; message: string }>;
+  onSessionRenamed?: (oldName: string, newName: string) => void;
   style?: React.CSSProperties;
 }
 
@@ -62,7 +64,7 @@ const STATUS_COLORS: Record<string, string> = {
   red: 'var(--error)',
 };
 
-export function Sidebar({ collapsed, onToggleCollapse, onSelectPane, activeTargets, paneStatuses, style }: Props) {
+export function Sidebar({ collapsed, onToggleCollapse, onSelectPane, activeTargets, paneStatuses, onSessionRenamed, style }: Props) {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [panes, setPanes] = useState<Record<string, Pane[]>>({});
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
@@ -73,6 +75,17 @@ export function Sidebar({ collapsed, onToggleCollapse, onSelectPane, activeTarge
   const [hoverPos, setHoverPos] = useState({ x: 0, y: 0 });
   const previewSize = getPreviewSize();
   const hoverTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Themed dialog state
+  const [dialog, setDialog] = useState<{
+    kind: DialogKind;
+    title: string;
+    message?: string;
+    initialValue?: string;
+    confirmLabel?: string;
+    danger?: boolean;
+    onConfirm: (value?: string) => void;
+  } | null>(null);
 
   const refresh = useCallback(() => {
     const q = showHidden ? '?all=true' : '';
@@ -109,13 +122,91 @@ export function Sidebar({ collapsed, onToggleCollapse, onSelectPane, activeTarge
     setExpanded(next);
   };
 
-  const handleCreate = async () => {
-    const name = prompt('Session name:');
-    if (!name) return;
-    try {
-      await post('/sessions', { name });
-      refresh();
-    } catch {}
+  const handleCreate = () => {
+    setDialog({
+      kind: 'prompt',
+      title: 'New session',
+      message: 'Enter a name for the new tmux session.',
+      initialValue: '',
+      confirmLabel: 'Create',
+      onConfirm: async (name) => {
+        setDialog(null);
+        if (!name) return;
+        try {
+          // User-initiated: frontend should focus the new session when it attaches.
+          await post('/sessions', { name, background: false });
+          refresh();
+        } catch {}
+      },
+    });
+  };
+
+  const handleRenameSession = (e: React.MouseEvent, oldName: string) => {
+    e.stopPropagation();
+    setDialog({
+      kind: 'prompt',
+      title: 'Rename session',
+      message: `Rename "${oldName}" to:`,
+      initialValue: oldName,
+      confirmLabel: 'Rename',
+      onConfirm: async (newName) => {
+        setDialog(null);
+        if (!newName || newName === oldName) return;
+        try {
+          await patch(`/sessions/${oldName}`, { newName });
+          // Drop cached panes for the old name; new name will fetch on expand.
+          setPanes((prev) => {
+            const next = { ...prev };
+            delete next[oldName];
+            return next;
+          });
+          setExpanded((prev) => {
+            const next = new Set(prev);
+            if (next.has(oldName)) {
+              next.delete(oldName);
+              next.add(newName);
+            }
+            return next;
+          });
+          onSessionRenamed?.(oldName, newName);
+          refresh();
+        } catch (err) {
+          setDialog({
+            kind: 'confirm',
+            title: 'Rename failed',
+            message: err instanceof Error ? err.message : String(err),
+            confirmLabel: 'OK',
+            onConfirm: () => setDialog(null),
+          });
+        }
+      },
+    });
+  };
+
+  const handleDeleteSession = (e: React.MouseEvent, name: string) => {
+    e.stopPropagation();
+    setDialog({
+      kind: 'confirm',
+      title: 'Kill session?',
+      message: `"${name}" and all its panes will be terminated. This cannot be undone.`,
+      confirmLabel: 'Kill session',
+      danger: true,
+      onConfirm: async () => {
+        setDialog(null);
+        try {
+          await del(`/sessions/${name}`);
+          refresh();
+        } catch (err) {
+          setDialog({
+            kind: 'confirm',
+            title: 'Kill failed',
+            message: err instanceof Error ? err.message : String(err),
+            confirmLabel: 'OK',
+            onConfirm: () => setDialog(null),
+          });
+        }
+      },
+    });
   };
 
   // Hover preview: fetch capture-pane on hover
@@ -180,6 +271,22 @@ export function Sidebar({ collapsed, onToggleCollapse, onSelectPane, activeTarge
                   </span>
                 )}
                 <span className="badge">{s.windows}w{s.attached ? ' *' : ''}</span>
+                <div className="session-actions">
+                  <button
+                    className="session-action-btn"
+                    onClick={(e) => handleRenameSession(e, s.name)}
+                    title="Rename session"
+                  >
+                    ✎
+                  </button>
+                  <button
+                    className="session-action-btn danger"
+                    onClick={(e) => handleDeleteSession(e, s.name)}
+                    title="Kill session"
+                  >
+                    ✕
+                  </button>
+                </div>
               </div>
               {expanded.has(s.name) && (
                 <>
@@ -225,6 +332,18 @@ export function Sidebar({ collapsed, onToggleCollapse, onSelectPane, activeTarge
           ))}
         </ul>
       )}
+
+      <ConfirmDialog
+        open={dialog !== null}
+        kind={dialog?.kind ?? 'confirm'}
+        title={dialog?.title ?? ''}
+        message={dialog?.message}
+        initialValue={dialog?.initialValue}
+        confirmLabel={dialog?.confirmLabel}
+        danger={dialog?.danger}
+        onConfirm={(value) => dialog?.onConfirm(value)}
+        onCancel={() => setDialog(null)}
+      />
 
       {/* Hover preview card */}
       {hoverTarget && hoverPreview !== null && (

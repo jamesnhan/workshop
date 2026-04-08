@@ -7,11 +7,15 @@ export type PreviewSize = 'small' | 'medium' | 'large';
 export interface WorkshopSettings {
   capsLockNormalization: boolean;
   previewSize: PreviewSize;
+  ticketAutocomplete: boolean;
+  terminalHashKey: boolean;
 }
 
 const defaults: WorkshopSettings = {
   capsLockNormalization: true,
   previewSize: 'medium',
+  ticketAutocomplete: true,
+  terminalHashKey: true,
 };
 
 function load(): WorkshopSettings {

@@ -8,7 +8,9 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/jamesnhan/workshop/internal/tmux"
 	"github.com/mark3labs/mcp-go/mcp"
@@ -20,7 +22,17 @@ func Serve() {
 
 	s := server.NewMCPServer("workshop", "0.1.0",
 		server.WithToolCapabilities(true),
+		server.WithInstructions("Workshop is a tmux session manager and channel hub. Channel messages from other agent panes arrive as <channel source=\"workshop\" from=\"<sender>\" project=\"<project>\">body</channel>. Read them and act on them as instructions or context from the sending agent."),
+		server.WithExperimental(map[string]any{
+			"claude/channel": map[string]any{},
+		}),
 	)
+
+	// Start the channel listener loop in the background. It detects this
+	// MCP subprocess's pane target via $TMUX_PANE, registers with the
+	// central Workshop server, and emits notifications/claude/channel events
+	// to the parent Claude Code on inbound messages.
+	go runChannelListener(s)
 
 	// --- Tools ---
 
@@ -201,6 +213,93 @@ func Serve() {
 		mcp.WithString("target", mcp.Required(), mcp.Description("Pane target (e.g. 'workshop:1.1')")),
 	), clearPaneStatusHandler())
 
+	s.AddTool(mcp.NewTool("open_doc",
+		mcp.WithDescription("Open a markdown file in the Workshop Docs view. Switches the UI to the Docs tab and loads the file. Useful for surfacing agent-generated plans, summaries, or notes."),
+		mcp.WithString("path", mcp.Required(), mcp.Description("Absolute or ~-relative path to a .md/.txt/.yaml/.json/.lua/.toml file")),
+	), openDocHandler())
+
+	// --- UI control tools (drive the Workshop frontend from agents) ---
+
+	s.AddTool(mcp.NewTool("show_toast",
+		mcp.WithDescription("Show a transient toast notification in the Workshop UI. Use to surface short status messages without blocking."),
+		mcp.WithString("message", mcp.Required(), mcp.Description("Toast message text")),
+		mcp.WithString("kind", mcp.Description("Visual style: info (default), success, warning, error")),
+	), uiActionHandler("show_toast", false, []string{"message", "kind"}))
+
+	s.AddTool(mcp.NewTool("switch_view",
+		mcp.WithDescription("Switch the Workshop main view tab."),
+		mcp.WithString("view", mcp.Required(), mcp.Description("One of: sessions, kanban, docs, agents, settings")),
+	), uiActionHandler("switch_view", false, []string{"view"}))
+
+	s.AddTool(mcp.NewTool("focus_cell",
+		mcp.WithDescription("Focus a specific grid cell in the pane layout by cell ID."),
+		mcp.WithString("cellId", mcp.Required(), mcp.Description("Cell ID (e.g. 'cell-3')")),
+	), uiActionHandler("focus_cell", false, []string{"cellId"}))
+
+	s.AddTool(mcp.NewTool("focus_pane",
+		mcp.WithDescription("Focus the cell currently displaying the given pane target. No-op if the pane isn't in the layout."),
+		mcp.WithString("target", mcp.Required(), mcp.Description("Pane target (e.g. 'workshop:1.1')")),
+	), uiActionHandler("focus_pane", false, []string{"target"}))
+
+	s.AddTool(mcp.NewTool("assign_pane",
+		mcp.WithDescription("Assign a pane to a grid cell, making it the active tab. Defaults to the focused cell if cellId is omitted."),
+		mcp.WithString("target", mcp.Required(), mcp.Description("Pane target")),
+		mcp.WithString("cellId", mcp.Description("Optional cell ID. Defaults to focused cell.")),
+	), uiActionHandler("assign_pane", false, []string{"target", "cellId"}))
+
+	s.AddTool(mcp.NewTool("open_card",
+		mcp.WithDescription("Open the kanban view and expand a specific card."),
+		mcp.WithNumber("id", mcp.Required(), mcp.Description("Card ID")),
+	), uiActionHandler("open_card", false, []string{"id"}))
+
+	s.AddTool(mcp.NewTool("prompt_user",
+		mcp.WithDescription("Show a themed input dialog and wait for the user's typed response. Blocking — returns the user's input or an error if they cancelled. Use for clarifying questions during a task."),
+		mcp.WithString("title", mcp.Required(), mcp.Description("Dialog title")),
+		mcp.WithString("message", mcp.Description("Optional helper text below the title")),
+		mcp.WithString("initialValue", mcp.Description("Pre-filled input value")),
+	), uiActionHandler("prompt_user", true, []string{"title", "message", "initialValue"}))
+
+	s.AddTool(mcp.NewTool("confirm",
+		mcp.WithDescription("Show a themed yes/no confirmation dialog. Blocking — returns 'true' if confirmed, 'false' if cancelled. Use for destructive or irreversible actions that need user sign-off."),
+		mcp.WithString("title", mcp.Required(), mcp.Description("Dialog title")),
+		mcp.WithString("message", mcp.Description("Optional message body")),
+		mcp.WithBoolean("danger", mcp.Description("Show the confirm button in danger styling (red)")),
+	), uiActionHandler("confirm", true, []string{"title", "message", "danger"}))
+
+	// --- Channels (inter-pane / inter-agent messaging) ---
+
+	s.AddTool(mcp.NewTool("channel_publish",
+		mcp.WithDescription("Publish a message to a Workshop channel. All panes subscribed to the channel will receive the message. Use for inter-agent communication, broadcasting status, or coordinating multi-agent work."),
+		mcp.WithString("channel", mcp.Required(), mcp.Description("Channel name")),
+		mcp.WithString("body", mcp.Required(), mcp.Description("Message body")),
+		mcp.WithString("from", mcp.Description("Sender pane target or agent name (optional, helps the receiver know who sent it)")),
+		mcp.WithString("project", mcp.Description("Optional project tag — namespaces the channel")),
+	), channelPublishHandler())
+
+	s.AddTool(mcp.NewTool("channel_subscribe",
+		mcp.WithDescription("Subscribe a pane to a Workshop channel so it receives published messages."),
+		mcp.WithString("channel", mcp.Required(), mcp.Description("Channel name")),
+		mcp.WithString("target", mcp.Required(), mcp.Description("Pane target to subscribe (e.g. 'workshop:1.1')")),
+		mcp.WithString("project", mcp.Description("Optional project tag")),
+	), channelSubscribeHandler())
+
+	s.AddTool(mcp.NewTool("channel_unsubscribe",
+		mcp.WithDescription("Remove a pane from a Workshop channel."),
+		mcp.WithString("channel", mcp.Required(), mcp.Description("Channel name")),
+		mcp.WithString("target", mcp.Required(), mcp.Description("Pane target")),
+	), channelUnsubscribeHandler())
+
+	s.AddTool(mcp.NewTool("channel_list",
+		mcp.WithDescription("List all active Workshop channels with their subscriber and message counts."),
+		mcp.WithString("project", mcp.Description("Filter by project tag")),
+	), channelListHandler())
+
+	s.AddTool(mcp.NewTool("channel_messages",
+		mcp.WithDescription("List recent messages on a channel."),
+		mcp.WithString("channel", mcp.Required(), mcp.Description("Channel name")),
+		mcp.WithNumber("limit", mcp.Description("Max messages to return (default 50, max 500)")),
+	), channelMessagesHandler())
+
 	if err := server.ServeStdio(s); err != nil {
 		fmt.Fprintf(os.Stderr, "workshop mcp error: %v\n", err)
 		os.Exit(1)
@@ -253,8 +352,21 @@ func createSessionHandler(bridge tmux.Bridge) server.ToolHandlerFunc {
 		if name == "" {
 			return mcp.NewToolResultError("name is required"), nil
 		}
-		if err := bridge.CreateSession(name, dir); err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
+		// Route through REST so the frontend receives a session_created
+		// broadcast (background=true since MCP isn't user-initiated).
+		body := map[string]any{"name": name, "startDir": dir, "background": true}
+		raw, _ := json.Marshal(body)
+		resp, err := http.Post(workshopAPIURL()+"/api/v1/sessions", "application/json", strings.NewReader(string(raw)))
+		if err != nil {
+			if err := bridge.CreateSession(name, dir); err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			return mcp.NewToolResultText(fmt.Sprintf("Session '%s' created", name)), nil
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != 201 {
+			b, _ := io.ReadAll(resp.Body)
+			return mcp.NewToolResultError(string(b)), nil
 		}
 		return mcp.NewToolResultText(fmt.Sprintf("Session '%s' created", name)), nil
 	}
@@ -349,25 +461,49 @@ func createWindowHandler(bridge tmux.Bridge) server.ToolHandlerFunc {
 
 func launchAgentHandler(bridge tmux.Bridge) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		execBridge, ok := bridge.(*tmux.ExecBridge)
-		if !ok {
-			return mcp.NewToolResultError("agent launch not supported"), nil
+		// Route through the REST endpoint so the frontend receives the
+		// session_created broadcast. Agent launches from MCP are always
+		// background=true — the user isn't directly creating them.
+		body := map[string]any{
+			"name":                     mcp.ParseString(req, "name", ""),
+			"provider":                 mcp.ParseString(req, "provider", ""),
+			"directory":                mcp.ParseString(req, "directory", ""),
+			"command":                  mcp.ParseString(req, "command", ""),
+			"prompt":                   mcp.ParseString(req, "prompt", ""),
+			"model":                    mcp.ParseString(req, "model", ""),
+			"dangerousSkipPermissions": mcp.ParseBoolean(req, "dangerouslySkipPermissions", false),
+			"background":               true,
 		}
-		cfg := tmux.AgentConfig{
-			Name:      mcp.ParseString(req, "name", ""),
-			Provider:  mcp.ParseString(req, "provider", ""),
-			Directory: mcp.ParseString(req, "directory", ""),
-			Command:   mcp.ParseString(req, "command", ""),
-			Prompt:    mcp.ParseString(req, "prompt", ""),
-			Model:     mcp.ParseString(req, "model", ""),
-			DangerousSkipPermissions: mcp.ParseBoolean(req, "dangerouslySkipPermissions", false),
-		}
-		result, err := execBridge.LaunchAgent(cfg)
+		raw, _ := json.Marshal(body)
+		resp, err := http.Post(workshopAPIURL()+"/api/v1/agents/launch", "application/json", strings.NewReader(string(raw)))
 		if err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
+			// Fall back to direct bridge call if the web server isn't running.
+			execBridge, ok := bridge.(*tmux.ExecBridge)
+			if !ok {
+				return mcp.NewToolResultError(fmt.Sprintf("agent launch failed: %v", err)), nil
+			}
+			cfg := tmux.AgentConfig{
+				Name:      mcp.ParseString(req, "name", ""),
+				Provider:  mcp.ParseString(req, "provider", ""),
+				Directory: mcp.ParseString(req, "directory", ""),
+				Command:   mcp.ParseString(req, "command", ""),
+				Prompt:    mcp.ParseString(req, "prompt", ""),
+				Model:     mcp.ParseString(req, "model", ""),
+				DangerousSkipPermissions: mcp.ParseBoolean(req, "dangerouslySkipPermissions", false),
+			}
+			result, ferr := execBridge.LaunchAgent(cfg)
+			if ferr != nil {
+				return mcp.NewToolResultError(ferr.Error()), nil
+			}
+			data, _ := json.MarshalIndent(result, "", "  ")
+			return mcp.NewToolResultText(string(data)), nil
 		}
-		data, _ := json.MarshalIndent(result, "", "  ")
-		return mcp.NewToolResultText(string(data)), nil
+		defer resp.Body.Close()
+		result, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != 201 {
+			return mcp.NewToolResultError(string(result)), nil
+		}
+		return mcp.NewToolResultText(string(result)), nil
 	}
 }
 
@@ -1087,5 +1223,274 @@ func clearPaneStatusHandler() server.ToolHandlerFunc {
 		defer resp.Body.Close()
 
 		return mcp.NewToolResultText(fmt.Sprintf("Status cleared for %s", target)), nil
+	}
+}
+
+func channelPublishHandler() server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		body := map[string]any{
+			"channel": mcp.ParseString(req, "channel", ""),
+			"body":    mcp.ParseString(req, "body", ""),
+			"from":    mcp.ParseString(req, "from", ""),
+			"project": mcp.ParseString(req, "project", ""),
+		}
+		raw, _ := json.Marshal(body)
+		resp, err := http.Post(workshopAPIURL()+"/api/v1/channels/publish", "application/json", strings.NewReader(string(raw)))
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Failed to reach Workshop: %v", err)), nil
+		}
+		defer resp.Body.Close()
+		out, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != 200 {
+			return mcp.NewToolResultError(string(out)), nil
+		}
+		return mcp.NewToolResultText(string(out)), nil
+	}
+}
+
+func channelSubscribeHandler() server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		body := map[string]any{
+			"channel": mcp.ParseString(req, "channel", ""),
+			"target":  mcp.ParseString(req, "target", ""),
+			"project": mcp.ParseString(req, "project", ""),
+		}
+		raw, _ := json.Marshal(body)
+		resp, err := http.Post(workshopAPIURL()+"/api/v1/channels/subscribe", "application/json", strings.NewReader(string(raw)))
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Failed to reach Workshop: %v", err)), nil
+		}
+		defer resp.Body.Close()
+		out, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != 200 {
+			return mcp.NewToolResultError(string(out)), nil
+		}
+		return mcp.NewToolResultText(fmt.Sprintf("Subscribed %s to %s", body["target"], body["channel"])), nil
+	}
+}
+
+func channelUnsubscribeHandler() server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		body := map[string]any{
+			"channel": mcp.ParseString(req, "channel", ""),
+			"target":  mcp.ParseString(req, "target", ""),
+		}
+		raw, _ := json.Marshal(body)
+		resp, err := http.Post(workshopAPIURL()+"/api/v1/channels/unsubscribe", "application/json", strings.NewReader(string(raw)))
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Failed to reach Workshop: %v", err)), nil
+		}
+		defer resp.Body.Close()
+		return mcp.NewToolResultText("unsubscribed"), nil
+	}
+}
+
+func channelListHandler() server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		project := mcp.ParseString(req, "project", "")
+		u := workshopAPIURL() + "/api/v1/channels"
+		if project != "" {
+			u += "?project=" + url.QueryEscape(project)
+		}
+		resp, err := http.Get(u)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Failed to reach Workshop: %v", err)), nil
+		}
+		defer resp.Body.Close()
+		out, _ := io.ReadAll(resp.Body)
+		return mcp.NewToolResultText(string(out)), nil
+	}
+}
+
+func channelMessagesHandler() server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		channel := mcp.ParseString(req, "channel", "")
+		limit := mcp.ParseInt(req, "limit", 50)
+		if channel == "" {
+			return mcp.NewToolResultError("channel is required"), nil
+		}
+		u := fmt.Sprintf("%s/api/v1/channels/%s/messages?limit=%d", workshopAPIURL(), url.PathEscape(channel), limit)
+		resp, err := http.Get(u)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Failed to reach Workshop: %v", err)), nil
+		}
+		defer resp.Body.Close()
+		out, _ := io.ReadAll(resp.Body)
+		return mcp.NewToolResultText(string(out)), nil
+	}
+}
+
+// uiActionHandler returns a generic MCP handler that POSTs the named
+// UI command to /api/v1/ui/<action> with the requested fields. For
+// blocking actions (prompt_user, confirm) it waits for the REST
+// handler's response and returns the user's value.
+func uiActionHandler(action string, blocking bool, fields []string) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		payload := map[string]any{}
+		for _, f := range fields {
+			// Try string first; fall back to number/bool by attempting parses.
+			if v := mcp.ParseString(req, f, ""); v != "" {
+				payload[f] = v
+				continue
+			}
+			if n := mcp.ParseInt(req, f, 0); n != 0 {
+				payload[f] = n
+				continue
+			}
+			if b := mcp.ParseBoolean(req, f, false); b {
+				payload[f] = b
+				continue
+			}
+		}
+		raw, _ := json.Marshal(payload)
+		resp, err := http.Post(workshopAPIURL()+"/api/v1/ui/"+action, "application/json", strings.NewReader(string(raw)))
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Failed to reach Workshop server: %v", err)), nil
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		if blocking {
+			if resp.StatusCode == 204 {
+				return mcp.NewToolResultText("(cancelled by user)"), nil
+			}
+			if resp.StatusCode != 200 {
+				return mcp.NewToolResultError(string(body)), nil
+			}
+			// Body is {value, cancelled}
+			var r struct {
+				Value     any  `json:"value"`
+				Cancelled bool `json:"cancelled"`
+			}
+			json.Unmarshal(body, &r)
+			if r.Cancelled {
+				return mcp.NewToolResultText("(cancelled by user)"), nil
+			}
+			return mcp.NewToolResultText(fmt.Sprintf("%v", r.Value)), nil
+		}
+		if resp.StatusCode != 200 {
+			return mcp.NewToolResultError(string(body)), nil
+		}
+		return mcp.NewToolResultText(fmt.Sprintf("%s sent", action)), nil
+	}
+}
+
+// runChannelListener detects this MCP subprocess's pane target and runs a
+// long-poll loop against the central Workshop server. When a channel message
+// arrives, it emits a notifications/claude/channel notification to the
+// parent Claude Code via SendNotificationToAllClients (this MCP subprocess
+// only has one client — its parent).
+//
+// If the pane target can't be detected (e.g. not running inside tmux), the
+// listener exits silently and the subprocess falls back to send_text-only
+// delivery via the central server's compat mode.
+func runChannelListener(s *server.MCPServer) {
+	target := detectPaneTarget()
+	if target == "" {
+		return
+	}
+
+	// Connect with retries — the MCP subprocess may start before the workshop
+	// HTTP server is ready, especially during full restarts.
+	for {
+		err := streamChannelListener(s, target)
+		if err != nil {
+			// Backoff and retry; but if the parent process is going away,
+			// the MCP subprocess will be terminated anyway.
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		// Clean disconnect — reconnect immediately.
+	}
+}
+
+// detectPaneTarget reads $TMUX_PANE and resolves it to a session:window.pane target.
+func detectPaneTarget() string {
+	pane := os.Getenv("TMUX_PANE")
+	if pane == "" {
+		return ""
+	}
+	// tmux display-message can resolve a pane id (%37) to its target string.
+	cmd := exec.Command("tmux", "display-message", "-p", "-t", pane,
+		"#{session_name}:#{window_index}.#{pane_index}")
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func streamChannelListener(s *server.MCPServer, target string) error {
+	u := workshopAPIURL() + "/api/v1/channel-listen/" + url.PathEscape(target)
+	resp, err := http.Get(u)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("listen returned %d", resp.StatusCode)
+	}
+
+	dec := json.NewDecoder(resp.Body)
+	for {
+		var event map[string]any
+		if err := dec.Decode(&event); err != nil {
+			return err
+		}
+		evType, _ := event["type"].(string)
+		switch evType {
+		case "ready", "heartbeat":
+			continue
+		case "message":
+			body, _ := event["body"].(string)
+			from, _ := event["from"].(string)
+			channel, _ := event["channel"].(string)
+			project, _ := event["project"].(string)
+
+			// Build the channel notification per Claude Code's spec:
+			// https://code.claude.com/docs/en/channels-reference#notification-format
+			// content -> body of <channel> tag, meta keys -> tag attributes.
+			meta := map[string]string{}
+			if from != "" {
+				meta["from"] = sanitizeMetaValue(from)
+			}
+			if channel != "" {
+				meta["channel"] = sanitizeMetaValue(channel)
+			}
+			if project != "" {
+				meta["project"] = sanitizeMetaValue(project)
+			}
+			s.SendNotificationToAllClients("notifications/claude/channel", map[string]any{
+				"content": body,
+				"meta":    meta,
+			})
+		}
+	}
+}
+
+// sanitizeMetaValue replaces characters Claude Code's channel meta parser
+// rejects (anything besides letters/digits/underscores in the KEY would
+// be dropped, but values are more permissive — keep it simple).
+func sanitizeMetaValue(s string) string {
+	return strings.ReplaceAll(strings.ReplaceAll(s, "\n", " "), "\r", " ")
+}
+
+func openDocHandler() server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		path := mcp.ParseString(req, "path", "")
+		if path == "" {
+			return mcp.NewToolResultError("path is required"), nil
+		}
+
+		body, _ := json.Marshal(map[string]string{"path": path})
+		resp, err := http.Post(workshopAPIURL()+"/api/v1/docs/open", "application/json", strings.NewReader(string(body)))
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Failed to reach Workshop server: %v", err)), nil
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != 200 {
+			return mcp.NewToolResultError(fmt.Sprintf("Server returned %d", resp.StatusCode)), nil
+		}
+
+		return mcp.NewToolResultText(fmt.Sprintf("Opened %s in Docs view", path)), nil
 	}
 }

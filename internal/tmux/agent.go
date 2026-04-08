@@ -2,6 +2,7 @@ package tmux
 
 import (
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 )
@@ -22,6 +23,8 @@ type AgentConfig struct {
 	Prompt                   string `json:"prompt,omitempty"`    // initial prompt — typed into the agent's input field
 	Model                    string `json:"model,omitempty"`     // model flag (--model / -m)
 	DangerousSkipPermissions bool   `json:"dangerouslySkipPermissions,omitempty"`
+	CardID                   int64  `json:"cardId,omitempty"`    // kanban card this agent was dispatched from (0 = none)
+	Background               bool   `json:"background,omitempty"` // don't steal focus on the frontend when attaching
 }
 
 // AgentResult is returned after launching an agent.
@@ -121,22 +124,43 @@ func buildProviderCommand(provider, model string, skipPerms bool) string {
 // waitAndSendPrompt waits for the agent CLI to be ready, handles any
 // trust/setup prompts, then types the user's prompt.
 func (b *ExecBridge) waitAndSendPrompt(target, prompt, provider string) {
+	slog.Info("waitAndSendPrompt: starting", "target", target, "provider", provider, "promptLen", len(prompt))
 	for i := 0; i < 25; i++ {
 		time.Sleep(1 * time.Second)
 
 		output, err := b.CapturePanePlain(target, 30)
 		if err != nil {
+			slog.Warn("waitAndSendPrompt: capture failed", "iter", i, "target", target, "err", err)
 			continue
 		}
+
+		ready := isAgentReady(output, provider)
 
 		// Check ready FIRST — with --no-alt-screen, dismissed trust
 		// prompts linger in scrollback and would otherwise cause the
 		// trust handler to loop forever.
-		if isAgentReady(output, provider) {
-			// Small settle delay so the input box has a tick to focus
-			// before we start streaming keys into it.
-			time.Sleep(500 * time.Millisecond)
-			sendLongPrompt(b, target, prompt)
+		if ready {
+			// Settle delay: the TUI may have painted before its stdin
+			// reader is fully initialized. Wait long enough that keystrokes
+			// won't be dropped by the PTY before Claude reads them.
+			time.Sleep(2 * time.Second)
+
+			// Send the prompt, then verify it actually landed in the input
+			// box. If the capture still shows an empty input (❯  followed
+			// by nothing), re-send up to 3 times before giving up.
+			for sendAttempt := 0; sendAttempt < 3; sendAttempt++ {
+				slog.Info("waitAndSendPrompt: sending prompt", "target", target, "promptLen", len(prompt), "sendAttempt", sendAttempt)
+				sendLongPrompt(b, target, prompt)
+				time.Sleep(500 * time.Millisecond)
+				check, err := b.CapturePanePlain(target, 5)
+				if err == nil && !isInputEmpty(check, provider) {
+					slog.Info("waitAndSendPrompt: prompt landed in input", "sendAttempt", sendAttempt)
+					break
+				}
+				slog.Warn("waitAndSendPrompt: prompt not visible in input, retrying", "sendAttempt", sendAttempt)
+				time.Sleep(1 * time.Second)
+			}
+
 			// Retry loop: send Enter, then verify the prompt was actually
 			// submitted. Long multiline prompts can still be buffering when
 			// the first Enter fires, leaving the input box unchanged.
@@ -165,13 +189,21 @@ func (b *ExecBridge) waitAndSendPrompt(target, prompt, provider string) {
 			time.Sleep(2 * time.Second)
 		}
 	}
+	slog.Warn("waitAndSendPrompt: exhausted retries without sending prompt", "target", target)
 }
 
-// sendLongPrompt chunks a long prompt into multiple send-keys calls.
-// Tmux send-keys has practical limits on argument length and very long
-// inputs can be truncated or corrupted. Sending in chunks with brief
-// delays gives the terminal time to process each piece.
+// sendLongPrompt sends a prompt to an agent pane via tmux send-keys.
+// Newlines are replaced with spaces because Claude Code's input treats
+// literal \n as Enter (submit), which would split the prompt into multiple
+// premature submissions. The prompt is chunked to avoid tmux argument limits.
 func sendLongPrompt(b *ExecBridge, target, prompt string) {
+	// Replace newlines with spaces to prevent premature submission
+	prompt = strings.ReplaceAll(prompt, "\n", " ")
+	// Collapse consecutive spaces
+	for strings.Contains(prompt, "  ") {
+		prompt = strings.ReplaceAll(prompt, "  ", " ")
+	}
+
 	const chunkSize = 1024
 	if len(prompt) <= chunkSize {
 		b.run("send-keys", "-t", target, "-l", prompt)
@@ -184,6 +216,34 @@ func sendLongPrompt(b *ExecBridge, target, prompt string) {
 		}
 		b.run("send-keys", "-t", target, "-l", prompt[i:end])
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// IsInputEmpty is the exported wrapper for isInputEmpty.
+func IsInputEmpty(output, provider string) bool { return isInputEmpty(output, provider) }
+
+// isInputEmpty returns true if the pane shows an empty input box — i.e., the
+// agent is in the ready state but no prompt text has been typed yet.
+func isInputEmpty(output, provider string) bool {
+	switch provider {
+	case ProviderGemini:
+		return strings.Contains(output, "Type your message") && !strings.Contains(output, "Type your message\r\n❯")
+	case ProviderCodex:
+		return false // codex doesn't have a visible input echo we can check
+	default: // claude
+		// Claude's input line looks like "❯ <text>" when text is present,
+		// or "❯  " (with trailing spaces / nothing) when empty.
+		// A rough proxy: if every line containing ❯ has nothing after it.
+		for _, line := range strings.Split(output, "\n") {
+			line = strings.TrimRight(line, "\r ")
+			if idx := strings.Index(line, "❯"); idx >= 0 {
+				after := strings.TrimSpace(line[idx+len("❯"):])
+				if after != "" {
+					return false // has text
+				}
+			}
+		}
+		return true
 	}
 }
 
@@ -218,6 +278,12 @@ func handleTrustPrompt(b *ExecBridge, target, output, provider string) bool {
 	return false
 }
 
+// IsAgentReady checks if the agent CLI is showing its input prompt
+// and NOT showing a trust/setup dialog. Exported for use by the supervisor.
+func IsAgentReady(output, provider string) bool {
+	return isAgentReady(output, provider)
+}
+
 // isAgentReady checks if the agent CLI is showing its input prompt
 // and NOT showing a trust/setup dialog.
 func isAgentReady(output, provider string) bool {
@@ -237,6 +303,13 @@ func isAgentReady(output, provider string) bool {
 		// "model:" races the input box and causes prompts to be dropped.
 		return strings.Contains(output, "% left") && !strings.Contains(output, "Press enter to continue")
 	default: // claude
-		return strings.Contains(output, "❯") || strings.Contains(output, "Type")
+		// Must see the Claude Code UI chrome (separator line) alongside the
+		// input prompt — the shell prompt also contains ❯ (starship theme)
+		// which would otherwise trigger a false positive before claude starts.
+		hasChromeUI := strings.Contains(output, "───────")
+		hasPrompt := strings.Contains(output, "❯") || strings.Contains(output, "Type")
+		// Trust/permission dialogs also contain ─ borders and ❯; exclude them.
+		hasTrustDialog := strings.Contains(output, "Enter to confirm") || strings.Contains(output, "Do you trust")
+		return hasChromeUI && hasPrompt && !hasTrustDialog
 	}
 }
