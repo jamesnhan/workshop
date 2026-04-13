@@ -2,6 +2,7 @@ import { useEffect, useState, useCallback, useRef } from 'react';
 import { get, post } from '../api/client';
 import { useTicketAutocomplete } from '../hooks/useTicketAutocomplete';
 import { TicketSuggestions } from './TicketSuggestions';
+import { Linkify } from './Linkify';
 
 interface Card {
   id: number;
@@ -15,6 +16,7 @@ interface Card {
   cardType: string;
   priority: string;
   parentId: number;
+  archived: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -22,6 +24,14 @@ interface Card {
 interface CardNote {
   id: number;
   cardId: number;
+  text: string;
+  createdAt: string;
+}
+
+interface CardMessage {
+  id: number;
+  cardId: number;
+  author: string;
   text: string;
   createdAt: string;
 }
@@ -47,7 +57,10 @@ interface Dispatch {
   completedAt?: string;
 }
 
-const COLUMNS = [
+interface WorkflowColumn { id: string; label: string; }
+interface WorkflowConfig { columns: WorkflowColumn[]; transitions: Record<string, string[]>; }
+
+const DEFAULT_COLUMNS: WorkflowColumn[] = [
   { id: 'backlog', label: 'Backlog' },
   { id: 'in_progress', label: 'In Progress' },
   { id: 'review', label: 'Review' },
@@ -71,6 +84,24 @@ const priorityColors: Record<string, string> = {
   P3: 'var(--text-dim)',
 };
 
+// Checklist helpers — parse markdown checkboxes in descriptions
+function parseChecklist(desc: string): { checked: number; total: number } | null {
+  const matches = desc.match(/^- \[([ x])\]/gm);
+  if (!matches || matches.length === 0) return null;
+  const checked = matches.filter((m) => m === '- [x]').length;
+  return { checked, total: matches.length };
+}
+
+function toggleCheckbox(desc: string, index: number): string {
+  let i = 0;
+  return desc.replace(/^(- \[)([ x])(\])/gm, (match, pre, state, post) => {
+    if (i++ === index) {
+      return `${pre}${state === 'x' ? ' ' : 'x'}${post}`;
+    }
+    return match;
+  });
+}
+
 function formatLogAction(entry: { action: string; beforeValue: string; afterValue: string }): string {
   switch (entry.action) {
     case 'created': return `Created card`;
@@ -93,9 +124,11 @@ interface Props {
   dispatchTick?: number; // increment to signal a dispatch update (triggers refresh)
   openCardId?: number | null; // when set, expands the matching card on next render
   onCardOpened?: () => void; // called after openCardId has been consumed
+  sfwMode?: boolean;
+  nsfwProjects?: string[];
 }
 
-export function KanbanBoard({ onNavigateToPane, defaultProject, focusedPath, ticketAutocomplete = true, dispatchTick, openCardId, onCardOpened }: Props) {
+export function KanbanBoard({ onNavigateToPane, defaultProject, focusedPath, ticketAutocomplete = true, dispatchTick, openCardId, onCardOpened, sfwMode = false, nsfwProjects = [] }: Props) {
   const [cards, setCards] = useState<Card[]>([]);
   const [projects, setProjects] = useState<string[]>([]);
   const [filterProject, setFilterProject] = useState(defaultProject ?? '');
@@ -110,6 +143,8 @@ export function KanbanBoard({ onNavigateToPane, defaultProject, focusedPath, tic
         .catch(() => {});
     }
   }, [focusedPath]);
+  const [columns, setColumns] = useState<WorkflowColumn[]>(DEFAULT_COLUMNS);
+  const [transitions, setTransitions] = useState<Record<string, string[]>>({});
   const [collapsedCols, setCollapsedCols] = useState<Set<string>>(new Set());
   const [collapsedParents, setCollapsedParents] = useState<Set<number>>(new Set());
   const [dragCard, setDragCard] = useState<Card | null>(null);
@@ -119,6 +154,9 @@ export function KanbanBoard({ onNavigateToPane, defaultProject, focusedPath, tic
   const [notes, setNotes] = useState<CardNote[]>([]);
   const [cardLog, setCardLog] = useState<CardLogEntry[]>([]);
   const [dispatches, setDispatches] = useState<Dispatch[]>([]);
+  const [messages, setMessages] = useState<CardMessage[]>([]);
+  const [newMsgText, setNewMsgText] = useState('');
+  const [msgAuthor, setMsgAuthor] = useState(() => localStorage.getItem('workshop:msg-author') || 'James');
   const [activeDispatches, setActiveDispatches] = useState<Record<number, number>>({}); // cardId → running count
   const [showChangelog, setShowChangelog] = useState(false);
   const [projectLog, setProjectLog] = useState<CardLogEntry[]>([]);
@@ -162,7 +200,9 @@ export function KanbanBoard({ onNavigateToPane, defaultProject, focusedPath, tic
       get<CardNote[]>(`/cards/${expandedCard.id}/notes`).then((n) => setNotes(n ?? [])).catch(() => setNotes([]));
       get<CardLogEntry[]>(`/cards/${expandedCard.id}/log`).then((l) => setCardLog(l ?? [])).catch(() => setCardLog([]));
       get<Dispatch[]>(`/cards/${expandedCard.id}/dispatches`).then((d) => setDispatches(d ?? [])).catch(() => setDispatches([]));
+      get<CardMessage[]>(`/cards/${expandedCard.id}/messages`).then((m) => setMessages(m ?? [])).catch(() => setMessages([]));
       setNewNote('');
+      setNewMsgText('');
     } else {
       setNotes([]);
       setCardLog([]);
@@ -203,11 +243,24 @@ export function KanbanBoard({ onNavigateToPane, defaultProject, focusedPath, tic
     } catch {}
   };
 
+  const handleAddMessage = async () => {
+    if (!expandedCard || !newMsgText.trim()) return;
+    try {
+      localStorage.setItem('workshop:msg-author', msgAuthor);
+      await post(`/cards/${expandedCard.id}/messages`, { author: msgAuthor, text: newMsgText.trim() });
+      const updated = await get<CardMessage[]>(`/cards/${expandedCard.id}/messages`);
+      setMessages(updated ?? []);
+      setNewMsgText('');
+    } catch {}
+  };
+
   const wasDragging = useRef(false);
 
   const refresh = useCallback(() => {
-    const q = filterProject ? `?project=${encodeURIComponent(filterProject)}` : '';
-    get<Card[]>(`/cards${q}`).then(setCards).catch((err) => console.error('Failed to load cards:', err));
+    const params = new URLSearchParams();
+    if (filterProject) params.set('project', filterProject);
+    params.set('include_archived', 'true');
+    get<Card[]>(`/cards?${params}`).then(setCards).catch((err) => console.error('Failed to load cards:', err));
     get<string[]>('/projects').then((p) => {
       setProjects(p ?? []);
       // Auto-filter on first load: try session name, path basename, then substring match
@@ -246,6 +299,23 @@ export function KanbanBoard({ onNavigateToPane, defaultProject, focusedPath, tic
   }, [filterProject, defaultProject, focusedPath, repoName, hasAutoFiltered]);
 
   useEffect(() => { refresh(); }, [refresh]);
+
+  // Fetch workflow columns + transitions when the active project changes.
+  useEffect(() => {
+    const params = filterProject ? `?project=${encodeURIComponent(filterProject)}` : '';
+    get<WorkflowConfig>(`/workflows${params}`)
+      .then((wf) => {
+        if (wf?.columns?.length) setColumns(wf.columns);
+        else setColumns(DEFAULT_COLUMNS);
+        setTransitions(wf?.transitions ?? {});
+      })
+      .catch(() => { setColumns(DEFAULT_COLUMNS); setTransitions({}); });
+  }, [filterProject]);
+
+  const nsfwSet = new Set(nsfwProjects.map((p) => p.toLowerCase()));
+  const isHidden = (project: string) => sfwMode && nsfwSet.has(project.toLowerCase());
+  const visibleProjects = sfwMode ? projects.filter((p) => !isHidden(p)) : projects;
+  const visibleCards = sfwMode ? cards.filter((c) => !isHidden(c.project)) : cards;
 
   // When a dispatch update arrives (via dispatchTick), refresh active counts + card list
   useEffect(() => {
@@ -349,7 +419,11 @@ export function KanbanBoard({ onNavigateToPane, defaultProject, focusedPath, tic
     if (!dragCard) { setDragCard(null); setDropTarget(null); return; }
     const pos = position ?? 0;
     if (dragCard.column === column && dragCard.position === pos) { setDragCard(null); setDropTarget(null); return; }
-    await post(`/cards/${dragCard.id}/move`, { column, position: pos });
+    try {
+      await post(`/cards/${dragCard.id}/move`, { column, position: pos });
+    } catch (err: any) {
+      alert(err?.message || 'Move failed');
+    }
     setDragCard(null);
     setDropTarget(null);
     refresh();
@@ -363,11 +437,11 @@ export function KanbanBoard({ onNavigateToPane, defaultProject, focusedPath, tic
 
   // Only show root cards (no parent) in column lists.
   // Children render nested under their parent.
-  const columnCards = (col: string) => cards.filter((c) => c.column === col && !c.parentId);
-  const cardById = new Map(cards.map((c) => [c.id, c]));
+  const columnCards = (col: string) => visibleCards.filter((c) => c.column === col && !c.parentId);
+  const cardById = new Map(visibleCards.map((c) => [c.id, c]));
   // Build a children index: parentId → child cards
   const childrenByParent = new Map<number, Card[]>();
-  for (const c of cards) {
+  for (const c of visibleCards) {
     if (c.parentId) {
       const arr = childrenByParent.get(c.parentId) ?? [];
       arr.push(c);
@@ -388,7 +462,7 @@ export function KanbanBoard({ onNavigateToPane, defaultProject, focusedPath, tic
       <div className="kanban-header">
         <select className="theme-select" value={filterProject} onChange={(e) => setFilterProject(e.target.value)}>
           <option value="">All Projects</option>
-          {projects.map((p) => <option key={p} value={p}>{p}</option>)}
+          {visibleProjects.map((p) => <option key={p} value={p}>{p}</option>)}
         </select>
         <button
           className={`btn-toggle${showChangelog ? ' active' : ''}`}
@@ -420,7 +494,34 @@ export function KanbanBoard({ onNavigateToPane, defaultProject, focusedPath, tic
               <button className="search-close" onClick={() => setExpandedCard(null)}>x</button>
             </div>
             <h3 className="kanban-modal-title">{expandedCard.title}</h3>
-            {expandedCard.description && <p className="kanban-modal-desc">{expandedCard.description}</p>}
+            {expandedCard.description && (
+              <div className="kanban-modal-desc">
+                {expandedCard.description.split('\n').map((line, li) => {
+                  const checkMatch = line.match(/^- \[([ x])\] (.*)$/);
+                  if (checkMatch) {
+                    const isChecked = checkMatch[1] === 'x';
+                    const label = checkMatch[2];
+                    return (
+                      <label key={li} className="kanban-checklist-item">
+                        <input type="checkbox" checked={isChecked} onChange={async () => {
+                          const newDesc = toggleCheckbox(expandedCard.description, expandedCard.description.split('\n').slice(0, li + 1)
+                            .filter((l) => /^- \[[ x]\]/.test(l)).length - 1);
+                          const updated = { ...expandedCard, description: newDesc };
+                          setExpandedCard(updated);
+                          setCards((prev) => prev.map((c) => c.id === updated.id ? { ...c, description: newDesc } : c));
+                          await fetch(`/api/v1/cards/${expandedCard.id}`, {
+                            method: 'PUT', headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify(updated),
+                          });
+                        }} />
+                        <span className={isChecked ? 'checked' : ''}>{label}</span>
+                      </label>
+                    );
+                  }
+                  return <p key={li}>{line ? <Linkify>{line}</Linkify> : '\u00A0'}</p>;
+                })}
+              </div>
+            )}
             <div className="kanban-modal-meta">
               {expandedCard.project && <span className="kanban-label project">{expandedCard.project}</span>}
               {expandedCard.labels && expandedCard.labels.split(',').map((l) => (
@@ -439,7 +540,7 @@ export function KanbanBoard({ onNavigateToPane, defaultProject, focusedPath, tic
               {notes.map((n) => (
                 <div key={n.id} className="kanban-note">
                   <span className="kanban-note-date">{new Date(n.createdAt).toLocaleString()}</span>
-                  <span className="kanban-note-text">{n.text}</span>
+                  <span className="kanban-note-text"><Linkify>{n.text}</Linkify></span>
                 </div>
               ))}
               <div className="kanban-note-input kanban-autocomplete-wrapper">
@@ -453,6 +554,37 @@ export function KanbanBoard({ onNavigateToPane, defaultProject, focusedPath, tic
                 />
                 <button className="btn-create" onClick={handleAddNote} disabled={!newNote.trim()}>Add</button>
                 {noteAC.showDropdown && <TicketSuggestions suggestions={noteAC.suggestions} selectedIdx={noteAC.selectedIdx} onSelect={noteAC.accept} />}
+              </div>
+            </div>
+            {/* Messages */}
+            <div className="kanban-messages">
+              <h4 className="kanban-notes-title">Messages</h4>
+              {messages.length === 0 && <p className="muted" style={{ fontSize: '0.75rem' }}>No messages yet</p>}
+              {messages.map((m) => (
+                <div key={m.id} className="kanban-msg-item">
+                  <div className="kanban-msg-meta">
+                    <strong className="kanban-msg-author">{m.author || 'Anonymous'}</strong>
+                    <span className="kanban-msg-date">{new Date(m.createdAt).toLocaleString()}</span>
+                  </div>
+                  <div className="kanban-msg-text"><Linkify>{m.text}</Linkify></div>
+                </div>
+              ))}
+              <div className="kanban-msg-input">
+                <input
+                  type="text"
+                  className="kanban-msg-author-input"
+                  placeholder="Name"
+                  value={msgAuthor}
+                  onChange={(e) => setMsgAuthor(e.target.value)}
+                />
+                <input
+                  type="text"
+                  placeholder="Write a message..."
+                  value={newMsgText}
+                  onChange={(e) => setNewMsgText(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === 'Enter') handleAddMessage(); }}
+                />
+                <button className="btn-create" onClick={handleAddMessage} disabled={!newMsgText.trim()}>Send</button>
               </div>
             </div>
             {/* Dispatches */}
@@ -557,10 +689,14 @@ export function KanbanBoard({ onNavigateToPane, defaultProject, focusedPath, tic
       )}
 
       {!showChangelog && <div className="kanban-columns">
-        {COLUMNS.map((col) => (
+        {columns.map((col) => {
+          const allowed = dragCard && dragCard.column !== col.id
+            ? (transitions[dragCard.column] ?? []).includes(col.id)
+            : true;
+          return (
           <div
             key={col.id}
-            className={`kanban-column${dropTarget?.column === col.id ? ' drop-target' : ''}${collapsedCols.has(col.id) ? ' collapsed' : ''}`}
+            className={`kanban-column${dropTarget?.column === col.id ? (allowed ? ' drop-target' : ' drop-target invalid-drop') : ''}${collapsedCols.has(col.id) ? ' collapsed' : ''}`}
             onDragOver={(e) => { e.preventDefault(); setDropTarget({ column: col.id, position: columnCards(col.id).length }); }}
             onDragLeave={() => setDropTarget(null)}
             onDrop={() => handleDrop(col.id, dropTarget?.column === col.id ? dropTarget.position : 0)}
@@ -657,6 +793,11 @@ export function KanbanBoard({ onNavigateToPane, defaultProject, focusedPath, tic
                       {completion.done}/{completion.total}
                     </span>
                   )}
+                  {(() => { const cl = card.description ? parseChecklist(card.description) : null; return cl ? (
+                    <span className="kanban-card-checklist" title={`${cl.checked} of ${cl.total} items checked`}>
+                      {cl.checked === cl.total ? '\u2611' : '\u2610'} {cl.checked}/{cl.total}
+                    </span>
+                  ) : null; })()}
                   {card.priority && (
                     <span className="kanban-priority-sm" style={{ color: priorityColors[card.priority] }}>{card.priority}</span>
                   )}
@@ -698,7 +839,8 @@ export function KanbanBoard({ onNavigateToPane, defaultProject, focusedPath, tic
               <div className="kanban-drop-indicator" />
             )}
           </div>
-        ))}
+          );
+        })}
       </div>}
     </div>
   );

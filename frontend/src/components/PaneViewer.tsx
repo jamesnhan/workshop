@@ -10,6 +10,7 @@ export interface PaneViewerHandle {
   searchInTerminal: (text: string) => boolean;
   clearSearch: () => void;
   refit: () => void;
+  forceResize: () => void;
 }
 
 interface TerminalTheme {
@@ -42,11 +43,13 @@ interface Props {
   onResize: (cols: number, rows: number) => void;
   onTicketHover?: (cardId: number | null, x: number, y: number) => void;
   onTicketClick?: (cardId: number) => void;
+  onUrlHover?: (url: string | null, x: number, y: number) => void;
+  onCommitHover?: (sha: string | null, x: number, y: number) => void;
   onHashKey?: () => void;
 }
 
 export const PaneViewer = forwardRef<PaneViewerHandle, Props>(
-  ({ target, terminalTheme, onData, onResize, onTicketHover, onTicketClick, onHashKey }, ref) => {
+  ({ target, terminalTheme, onData, onResize, onTicketHover, onTicketClick, onUrlHover, onCommitHover, onHashKey }, ref) => {
     const containerRef = useRef<HTMLDivElement>(null);
     const termRef = useRef<Terminal | null>(null);
     const searchRef = useRef<SearchAddon | null>(null);
@@ -55,6 +58,8 @@ export const PaneViewer = forwardRef<PaneViewerHandle, Props>(
     const onResizeRef = useRef(onResize);
     const onTicketHoverRef = useRef(onTicketHover);
     const onTicketClickRef = useRef(onTicketClick);
+    const onUrlHoverRef = useRef(onUrlHover);
+    const onCommitHoverRef = useRef(onCommitHover);
     const onHashKeyRef = useRef(onHashKey);
     onHashKeyRef.current = onHashKey;
     const pendingWriteRef = useRef('');
@@ -64,6 +69,8 @@ export const PaneViewer = forwardRef<PaneViewerHandle, Props>(
     onResizeRef.current = onResize;
     onTicketHoverRef.current = onTicketHover;
     onTicketClickRef.current = onTicketClick;
+    onUrlHoverRef.current = onUrlHover;
+    onCommitHoverRef.current = onCommitHover;
 
     const notifyResizeIfChanged = () => {
       const term = termRef.current;
@@ -129,6 +136,23 @@ export const PaneViewer = forwardRef<PaneViewerHandle, Props>(
         requestAnimationFrame(() => {
           requestAnimationFrame(() => {
             runFit();
+          });
+        });
+      },
+      forceResize: () => {
+        // Fit and always push the current dims to the backend, even if they
+        // match lastSizeRef — tmux may be out of sync after focus, reconnect,
+        // or page reload, and we want to force it to reflow.
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => {
+            const term = termRef.current;
+            const fit = fitRef.current;
+            const container = containerRef.current;
+            if (!term || !fit || !container) return;
+            if (container.offsetWidth === 0 || container.offsetHeight === 0) return;
+            fit.fit();
+            lastSizeRef.current = { cols: term.cols, rows: term.rows };
+            onResizeRef.current(term.cols, term.rows);
           });
         });
       },
@@ -217,6 +241,79 @@ export const PaneViewer = forwardRef<PaneViewerHandle, Props>(
               activate: () => onTicketClickRef.current?.(id),
               hover: (e: MouseEvent) => onTicketHoverRef.current?.(id, e.clientX, e.clientY),
               leave: () => onTicketHoverRef.current?.(null, 0, 0),
+            });
+          }
+          callback(matches);
+        },
+      });
+
+      // Register link provider for URLs
+      const urlLinkProvider = term.registerLinkProvider({
+        provideLinks(bufferLineNumber, callback) {
+          const line = term.buffer.active.getLine(bufferLineNumber - 1);
+          if (!line) { callback(undefined); return; }
+          const text = line.translateToString(true);
+          type Link = {
+            range: { start: { x: number; y: number }; end: { x: number; y: number } };
+            text: string;
+            activate: () => void;
+            hover: (e: MouseEvent) => void;
+            leave: () => void;
+          };
+          const matches: Link[] = [];
+          const urlRegex = /https?:\/\/[^\s<>"{}|\\^`[\]]+/g;
+          let m: RegExpExecArray | null;
+          while ((m = urlRegex.exec(text)) !== null) {
+            const url = m[0];
+            const startCol = m.index + 1;
+            const endCol = m.index + url.length;
+            matches.push({
+              range: {
+                start: { x: startCol, y: bufferLineNumber },
+                end: { x: endCol, y: bufferLineNumber },
+              },
+              text: url,
+              activate: () => window.open(url, '_blank', 'noopener,noreferrer'),
+              hover: (e: MouseEvent) => onUrlHoverRef.current?.(url, e.clientX, e.clientY),
+              leave: () => onUrlHoverRef.current?.(null, 0, 0),
+            });
+          }
+          callback(matches);
+        },
+      });
+
+      // Register link provider for git commit SHAs
+      const commitLinkProvider = term.registerLinkProvider({
+        provideLinks(bufferLineNumber, callback) {
+          const line = term.buffer.active.getLine(bufferLineNumber - 1);
+          if (!line) { callback(undefined); return; }
+          const text = line.translateToString(true);
+          type Link = {
+            range: { start: { x: number; y: number }; end: { x: number; y: number } };
+            text: string;
+            activate: () => void;
+            hover: (e: MouseEvent) => void;
+            leave: () => void;
+          };
+          const matches: Link[] = [];
+          const shaRegex = /\b[0-9a-f]{7,40}\b/g;
+          let m: RegExpExecArray | null;
+          while ((m = shaRegex.exec(text)) !== null) {
+            const sha = m[0];
+            // Skip if it looks like a URL fragment or ticket ref (already handled)
+            if (text.charAt(m.index - 1) === '#') continue;
+            if (/https?:/.test(text.slice(Math.max(0, m.index - 10), m.index))) continue;
+            const startCol = m.index + 1;
+            const endCol = m.index + sha.length;
+            matches.push({
+              range: {
+                start: { x: startCol, y: bufferLineNumber },
+                end: { x: endCol, y: bufferLineNumber },
+              },
+              text: sha,
+              activate: () => {},
+              hover: (e: MouseEvent) => onCommitHoverRef.current?.(sha, e.clientX, e.clientY),
+              leave: () => onCommitHoverRef.current?.(null, 0, 0),
             });
           }
           callback(matches);
@@ -353,6 +450,8 @@ export const PaneViewer = forwardRef<PaneViewerHandle, Props>(
         if (writeFrameRef.current !== null) cancelAnimationFrame(writeFrameRef.current);
         observer.disconnect();
         ticketLinkProvider.dispose();
+        urlLinkProvider.dispose();
+        commitLinkProvider.dispose();
         window.removeEventListener('resize', handleWindowResize);
         container.removeEventListener('touchstart', handleTouchStart);
         container.removeEventListener('touchmove', handleTouchMove);

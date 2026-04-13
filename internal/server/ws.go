@@ -11,7 +11,9 @@ import (
 	"time"
 
 	"github.com/creack/pty"
+	"github.com/jamesnhan/workshop/internal/telemetry"
 	tmuxpkg "github.com/jamesnhan/workshop/internal/tmux"
+	"go.opentelemetry.io/otel/attribute"
 	"nhooyr.io/websocket"
 )
 
@@ -41,6 +43,8 @@ func wsHandler(logger *slog.Logger, bridge tmuxpkg.Bridge, outputBuffer *OutputB
 		defer conn.CloseNow()
 
 		logger.Info("websocket connected", "remote", r.RemoteAddr)
+		telemetry.WSConnectionsActive.Add(r.Context(), 1)
+		defer telemetry.WSConnectionsActive.Add(context.Background(), -1)
 
 		ctx, cancel := context.WithCancel(r.Context())
 		defer cancel()
@@ -63,6 +67,7 @@ func wsHandler(logger *slog.Logger, bridge tmuxpkg.Bridge, outputBuffer *OutputB
 					if err := conn.Write(ctx, websocket.MessageText, msg); err != nil {
 						return
 					}
+					telemetry.WSMessagesTotal.Add(ctx, 1, telemetry.MetricAttrs(attribute.String("direction", "out")))
 				}
 			}
 		}()
@@ -170,6 +175,7 @@ func wsHandler(logger *slog.Logger, bridge tmuxpkg.Bridge, outputBuffer *OutputB
 			if err := json.Unmarshal(raw, &msg); err != nil {
 				continue
 			}
+			telemetry.WSMessagesTotal.Add(ctx, 1, telemetry.MetricAttrs(attribute.String("direction", "in"), attribute.String("kind", msg.Type)))
 
 			switch msg.Type {
 			case "subscribe":

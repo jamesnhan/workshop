@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -12,13 +13,60 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jamesnhan/workshop/internal/telemetry"
 	"github.com/jamesnhan/workshop/internal/tmux"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 )
+
+// mcpPaneTarget caches the resolved pane target for this MCP subprocess.
+// Set once during Serve() from $TMUX_PANE.
+var mcpPaneTarget string
+
+// traced wraps a tool handler with an OTel span named "mcp.<toolName>".
+// When telemetry is disabled, the span is a no-op and the cost is zero.
+func traced(toolName string, h server.ToolHandlerFunc) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		ctx, span := telemetry.Tracer("mcp").Start(ctx, "mcp."+toolName,
+			telemetry.Attrs(
+				attribute.String("workshop.mcp.tool", toolName),
+				attribute.String("workshop.pane.target", mcpPaneTarget),
+			),
+		)
+		defer span.End()
+
+		result, err := h(ctx, req)
+		if err != nil {
+			span.SetStatus(codes.Error, err.Error())
+		} else if result != nil && result.IsError {
+			span.SetStatus(codes.Error, "tool returned error")
+		}
+		return result, err
+	}
+}
 
 func Serve() {
 	bridge := tmux.NewExecBridge("")
+
+	// Initialize OTel for the MCP subprocess (service name: workshop-mcp).
+	os.Setenv("OTEL_SERVICE_NAME", "workshop-mcp")
+	logger := telemetry.DiscardLogger()
+	otelShutdown, _ := telemetry.Init(context.Background(), logger)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = otelShutdown(ctx)
+	}()
+
+	// Resolve this subprocess's pane target for span attributes.
+	if pane := os.Getenv("TMUX_PANE"); pane != "" {
+		if out, err := exec.Command("tmux", "display-message", "-p", "-t", pane,
+			"#{session_name}:#{window_index}.#{pane_index}").CombinedOutput(); err == nil {
+			mcpPaneTarget = strings.TrimSpace(string(out))
+		}
+	}
 
 	s := server.NewMCPServer("workshop", "0.1.0",
 		server.WithToolCapabilities(true),
@@ -39,83 +87,85 @@ func Serve() {
 	s.AddTool(mcp.NewTool("list_sessions",
 		mcp.WithDescription("List all tmux sessions"),
 		mcp.WithBoolean("include_hidden", mcp.Description("Include hidden sessions (consensus-*, workshop-ctrl-*). Default: false")),
-	), listSessionsHandler(bridge))
+	), traced("list_sessions", listSessionsHandler(bridge)))
 
 	s.AddTool(mcp.NewTool("list_panes",
 		mcp.WithDescription("List all panes in a tmux session"),
 		mcp.WithString("session", mcp.Required(), mcp.Description("Session name")),
-	), listPanesHandler(bridge))
+	), traced("list_panes", listPanesHandler(bridge)))
 
 	s.AddTool(mcp.NewTool("create_session",
 		mcp.WithDescription("Create a new tmux session"),
 		mcp.WithString("name", mcp.Required(), mcp.Description("Session name")),
 		mcp.WithString("directory", mcp.Description("Starting directory")),
-	), createSessionHandler(bridge))
+	), traced("create_session", createSessionHandler(bridge)))
 
 	s.AddTool(mcp.NewTool("kill_session",
 		mcp.WithDescription("Kill a tmux session"),
 		mcp.WithString("name", mcp.Required(), mcp.Description("Session name")),
-	), killSessionHandler(bridge))
+	), traced("kill_session", killSessionHandler(bridge)))
 
 	s.AddTool(mcp.NewTool("send_keys",
 		mcp.WithDescription("Send a command to a tmux pane (appends Enter)"),
 		mcp.WithString("target", mcp.Required(), mcp.Description("Pane target (e.g. 0:1.1)")),
 		mcp.WithString("command", mcp.Required(), mcp.Description("Command to send")),
-	), sendKeysHandler(bridge))
+	), traced("send_keys", sendKeysHandler(bridge)))
 
 	s.AddTool(mcp.NewTool("send_text",
 		mcp.WithDescription("Send literal text to a tmux pane (no Enter appended)"),
 		mcp.WithString("target", mcp.Required(), mcp.Description("Pane target (e.g. 0:1.1)")),
 		mcp.WithString("text", mcp.Required(), mcp.Description("Text to send")),
-	), sendTextHandler(bridge))
+	), traced("send_text", sendTextHandler(bridge)))
 
 	s.AddTool(mcp.NewTool("capture_pane",
 		mcp.WithDescription("Capture the current visible content of a tmux pane"),
 		mcp.WithString("target", mcp.Required(), mcp.Description("Pane target (e.g. 0:1.1)")),
 		mcp.WithNumber("lines", mcp.Description("Number of scrollback lines to capture (default 50)")),
-	), capturePaneHandler(bridge))
+	), traced("capture_pane", capturePaneHandler(bridge)))
 
 	s.AddTool(mcp.NewTool("split_window",
 		mcp.WithDescription("Split a tmux window to create a new pane"),
 		mcp.WithString("target", mcp.Required(), mcp.Description("Target window/pane to split")),
 		mcp.WithBoolean("horizontal", mcp.Description("Split horizontally (default: vertical)")),
-	), splitWindowHandler(bridge))
+	), traced("split_window", splitWindowHandler(bridge)))
 
 	s.AddTool(mcp.NewTool("create_window",
 		mcp.WithDescription("Create a new window in a tmux session"),
 		mcp.WithString("session", mcp.Required(), mcp.Description("Session name")),
 		mcp.WithString("name", mcp.Description("Window name")),
-	), createWindowHandler(bridge))
+	), traced("create_window", createWindowHandler(bridge)))
 
 	s.AddTool(mcp.NewTool("launch_agent",
-		mcp.WithDescription("Launch an AI coding agent in a new tmux session. Supports Claude, Gemini, and Codex."),
+		mcp.WithDescription("Launch an AI coding agent in a new tmux session. Supports Claude, Gemini, and Codex. Use 'preset' to launch a specialist agent (reviewer, tester, security, planner, refactorer, architect) with pre-configured role prompts."),
 		mcp.WithString("name", mcp.Description("Session name (auto-generated if empty)")),
+		mcp.WithString("preset", mcp.Description("Named agent preset to use (e.g. reviewer, tester, security, planner, refactorer, architect). Loads provider, model, and system prompt from the preset. Explicit params override preset values.")),
 		mcp.WithString("provider", mcp.Description("AI provider: claude (default), gemini, codex")),
 		mcp.WithString("directory", mcp.Description("Working directory")),
 		mcp.WithString("prompt", mcp.Description("Initial prompt for the agent")),
 		mcp.WithString("model", mcp.Description("Model to use (e.g. opus, sonnet, pro, flash, gpt-5-codex)")),
 		mcp.WithString("command", mcp.Description("Full command to run (overrides provider defaults)")),
 		mcp.WithBoolean("dangerouslySkipPermissions", mcp.Description("Skip permission prompts (--yolo for gemini/codex)")),
-	), launchAgentHandler(bridge))
+	), traced("launch_agent", launchAgentHandler(bridge)))
 
 	s.AddTool(mcp.NewTool("search_output",
 		mcp.WithDescription("Search terminal output history across panes. Requires the Workshop web server to be running."),
 		mcp.WithString("query", mcp.Required(), mcp.Description("Search string (case-insensitive)")),
 		mcp.WithString("target", mcp.Description("Filter to a specific pane target (e.g. workshop:1.1)")),
 		mcp.WithNumber("limit", mcp.Description("Max results (default 50)")),
-	), searchOutputHandler())
+	), traced("search_output", searchOutputHandler()))
 
 	s.AddTool(mcp.NewTool("rename_session",
 		mcp.WithDescription("Rename a tmux session"),
 		mcp.WithString("old_name", mcp.Required(), mcp.Description("Current session name")),
 		mcp.WithString("new_name", mcp.Required(), mcp.Description("New session name")),
-	), renameSessionHandler(bridge))
+	), traced("rename_session", renameSessionHandler(bridge)))
 
 	// Kanban tools — these call the Workshop HTTP API
 	s.AddTool(mcp.NewTool("kanban_list",
-		mcp.WithDescription("List kanban cards. Requires Workshop web server running."),
+		mcp.WithDescription("List kanban cards. Requires Workshop web server running. Archived (done) cards are hidden by default."),
 		mcp.WithString("project", mcp.Description("Filter by project name")),
-	), kanbanListHandler())
+		mcp.WithBoolean("include_archived", mcp.Description("Include archived cards (default: false)")),
+	), traced("kanban_list", kanbanListHandler()))
 
 	s.AddTool(mcp.NewTool("kanban_create",
 		mcp.WithDescription("Create a kanban card"),
@@ -128,7 +178,7 @@ func Serve() {
 		mcp.WithString("card_type", mcp.Description("Card type: bug, feature, task, chore")),
 		mcp.WithString("priority", mcp.Description("Priority: P0, P1, P2, P3")),
 		mcp.WithNumber("parent_id", mcp.Description("Parent card ID for hierarchical tasks (0 = no parent)")),
-	), kanbanCreateHandler())
+	), traced("kanban_create", kanbanCreateHandler()))
 
 	s.AddTool(mcp.NewTool("kanban_edit",
 		mcp.WithDescription("Edit a kanban card. Only provided fields are updated."),
@@ -142,24 +192,50 @@ func Serve() {
 		mcp.WithString("card_type", mcp.Description("Card type: bug, feature, task, chore")),
 		mcp.WithString("priority", mcp.Description("Priority: P0, P1, P2, P3")),
 		mcp.WithNumber("parent_id", mcp.Description("Parent card ID for hierarchical tasks (0 = no parent)")),
-	), kanbanEditHandler())
+	), traced("kanban_edit", kanbanEditHandler()))
 
 	s.AddTool(mcp.NewTool("kanban_move",
 		mcp.WithDescription("Move a kanban card to a different column"),
 		mcp.WithNumber("id", mcp.Required(), mcp.Description("Card ID")),
 		mcp.WithString("column", mcp.Required(), mcp.Description("Target column: backlog, in_progress, review, done")),
-	), kanbanMoveHandler())
+	), traced("kanban_move", kanbanMoveHandler()))
 
 	s.AddTool(mcp.NewTool("kanban_add_note",
 		mcp.WithDescription("Add a note to a kanban card. Use this to log progress, decisions, or blockers as you work."),
 		mcp.WithNumber("id", mcp.Required(), mcp.Description("Card ID")),
 		mcp.WithString("text", mcp.Required(), mcp.Description("Note text (concise, no fluff)")),
-	), kanbanAddNoteHandler())
+	), traced("kanban_add_note", kanbanAddNoteHandler()))
 
 	s.AddTool(mcp.NewTool("kanban_delete",
 		mcp.WithDescription("Delete a kanban card"),
 		mcp.WithNumber("id", mcp.Required(), mcp.Description("Card ID")),
-	), kanbanDeleteHandler())
+	), traced("kanban_delete", kanbanDeleteHandler()))
+
+	// Approvals — blocking tool for agent actions that need user sign-off
+	s.AddTool(mcp.NewTool("request_approval",
+		mcp.WithDescription("Request user approval before proceeding with a significant action. BLOCKING — the tool will not return until the user approves or denies in the Workshop UI (up to 10 min timeout). Use for destructive operations, deployments, or any action that should be reviewed first."),
+		mcp.WithString("action", mcp.Required(), mcp.Description("What needs approval: deploy, delete, push, migrate, etc.")),
+		mcp.WithString("details", mcp.Required(), mcp.Description("Human-readable description of what will happen if approved")),
+		mcp.WithString("project", mcp.Description("Project name")),
+		mcp.WithString("diff", mcp.Description("Optional diff or code snippet showing the proposed change")),
+	), traced("request_approval", requestApprovalHandler()))
+
+	// Activity log
+	s.AddTool(mcp.NewTool("report_activity",
+		mcp.WithDescription("Report an agent action to the Workshop activity feed. Use to log significant actions: file writes, commands executed, decisions made, errors encountered. The activity feed gives James visibility into what all agents are doing across panes."),
+		mcp.WithString("action", mcp.Required(), mcp.Description("Action type: file_write, command, decision, error, status, deploy, test, review")),
+		mcp.WithString("summary", mcp.Required(), mcp.Description("One-line human-readable summary of what happened")),
+		mcp.WithString("project", mcp.Description("Project name")),
+		mcp.WithString("metadata", mcp.Description("Optional JSON string with structured details (file paths, exit codes, etc.)")),
+		mcp.WithNumber("parent_id", mcp.Description("Parent activity ID — use to nest this action under a parent (e.g. subagent work under the spawning agent's entry)")),
+	), traced("report_activity", reportActivityHandler()))
+
+	// Task orchestrator — drives a card through phased agent workflow
+	s.AddTool(mcp.NewTool("orchestrate_card",
+		mcp.WithDescription("Launch an autonomous orchestrator that drives a kanban card through plan→implement→test→review→PR phases. Each phase launches a specialist agent, captures output, and checkpoints with the user via approval gates. The orchestrator runs as a separate Claude agent session."),
+		mcp.WithNumber("id", mcp.Required(), mcp.Description("Kanban card ID to orchestrate")),
+		mcp.WithString("directory", mcp.Description("Working directory for all agents (defaults to current directory)")),
+	), traced("orchestrate_card", orchestrateCardHandler()))
 
 	s.AddTool(mcp.NewTool("consensus_start",
 		mcp.WithDescription("Start a consensus run — multiple agents work on the same prompt, then a coordinator synthesizes. Requires Workshop server."),
@@ -167,56 +243,56 @@ func Serve() {
 		mcp.WithString("directory", mcp.Description("Working directory for agents")),
 		mcp.WithString("agents", mcp.Description("Comma-separated agent specs. Formats: 'provider' (e.g. 'codex'), 'provider:model' (e.g. 'claude:opus'), or 'name:provider:model' (e.g. 'deep:gemini:pro'). Provider must be claude/gemini/codex. Default: 3 sonnet claude agents.")),
 		mcp.WithNumber("timeout", mcp.Description("Timeout in seconds (default 300)")),
-	), consensusStartHandler())
+	), traced("consensus_start", consensusStartHandler()))
 
 	s.AddTool(mcp.NewTool("consensus_status",
 		mcp.WithDescription("Check the status of a consensus run"),
 		mcp.WithString("id", mcp.Required(), mcp.Description("Consensus run ID")),
-	), consensusStatusHandler())
+	), traced("consensus_status", consensusStatusHandler()))
 
 	s.AddTool(mcp.NewTool("consensus_list",
 		mcp.WithDescription("List all consensus runs with their status"),
-	), consensusListHandler())
+	), traced("consensus_list", consensusListHandler()))
 
 	s.AddTool(mcp.NewTool("consensus_capture",
 		mcp.WithDescription("Capture the full output from a specific consensus agent"),
 		mcp.WithString("id", mcp.Required(), mcp.Description("Consensus run ID")),
 		mcp.WithString("agent", mcp.Required(), mcp.Description("Agent name (e.g. 'reviewer-1' or 'coordinator')")),
 		mcp.WithNumber("lines", mcp.Description("Lines to capture (default 200)")),
-	), consensusCaptureHandler())
+	), traced("consensus_capture", consensusCaptureHandler()))
 
 	s.AddTool(mcp.NewTool("consensus_review",
 		mcp.WithDescription("Collect and display all agent outputs from a consensus run for review. Shows each agent's findings side by side."),
 		mcp.WithString("id", mcp.Required(), mcp.Description("Consensus run ID")),
-	), consensusReviewHandler())
+	), traced("consensus_review", consensusReviewHandler()))
 
 	s.AddTool(mcp.NewTool("consensus_cleanup",
 		mcp.WithDescription("Kill all tmux sessions for a finished consensus run (agents + coordinator). ALWAYS call this when you're done reviewing a consensus run — the sessions linger otherwise and clutter tmux."),
 		mcp.WithString("id", mcp.Required(), mcp.Description("Consensus run ID")),
-	), consensusCleanupHandler())
+	), traced("consensus_cleanup", consensusCleanupHandler()))
 
 	s.AddTool(mcp.NewTool("run_config",
 		mcp.WithDescription("Run a Lua config script. Requires Workshop web server running."),
 		mcp.WithString("path", mcp.Description("Path to workshop.lua file")),
 		mcp.WithString("code", mcp.Description("Inline Lua code to execute")),
-	), runConfigHandler())
+	), traced("run_config", runConfigHandler()))
 
 	s.AddTool(mcp.NewTool("set_pane_status",
 		mcp.WithDescription("Set a status indicator on your pane in Workshop. Use this when you finish a task (green), need user input (yellow), or encounter an error (red)."),
 		mcp.WithString("target", mcp.Required(), mcp.Description("Pane target (e.g. 'workshop:1.1')")),
 		mcp.WithString("status", mcp.Required(), mcp.Description("Status color: green (done), yellow (needs input), red (error)")),
 		mcp.WithString("message", mcp.Description("Short status message")),
-	), setPaneStatusHandler())
+	), traced("set_pane_status", setPaneStatusHandler()))
 
 	s.AddTool(mcp.NewTool("clear_pane_status",
 		mcp.WithDescription("Clear the status indicator on a pane in Workshop."),
 		mcp.WithString("target", mcp.Required(), mcp.Description("Pane target (e.g. 'workshop:1.1')")),
-	), clearPaneStatusHandler())
+	), traced("clear_pane_status", clearPaneStatusHandler()))
 
 	s.AddTool(mcp.NewTool("open_doc",
 		mcp.WithDescription("Open a markdown file in the Workshop Docs view. Switches the UI to the Docs tab and loads the file. Useful for surfacing agent-generated plans, summaries, or notes."),
 		mcp.WithString("path", mcp.Required(), mcp.Description("Absolute or ~-relative path to a .md/.txt/.yaml/.json/.lua/.toml file")),
-	), openDocHandler())
+	), traced("open_doc", openDocHandler()))
 
 	// --- UI control tools (drive the Workshop frontend from agents) ---
 
@@ -224,47 +300,47 @@ func Serve() {
 		mcp.WithDescription("Show a transient toast notification in the Workshop UI. Use to surface short status messages without blocking."),
 		mcp.WithString("message", mcp.Required(), mcp.Description("Toast message text")),
 		mcp.WithString("kind", mcp.Description("Visual style: info (default), success, warning, error")),
-	), uiActionHandler("show_toast", false, []string{"message", "kind"}))
+	), traced("show_toast", uiActionHandler("show_toast", false, []string{"message", "kind"})))
 
 	s.AddTool(mcp.NewTool("switch_view",
 		mcp.WithDescription("Switch the Workshop main view tab."),
 		mcp.WithString("view", mcp.Required(), mcp.Description("One of: sessions, kanban, docs, agents, settings")),
-	), uiActionHandler("switch_view", false, []string{"view"}))
+	), traced("switch_view", uiActionHandler("switch_view", false, []string{"view"})))
 
 	s.AddTool(mcp.NewTool("focus_cell",
 		mcp.WithDescription("Focus a specific grid cell in the pane layout by cell ID."),
 		mcp.WithString("cellId", mcp.Required(), mcp.Description("Cell ID (e.g. 'cell-3')")),
-	), uiActionHandler("focus_cell", false, []string{"cellId"}))
+	), traced("focus_cell", uiActionHandler("focus_cell", false, []string{"cellId"})))
 
 	s.AddTool(mcp.NewTool("focus_pane",
 		mcp.WithDescription("Focus the cell currently displaying the given pane target. No-op if the pane isn't in the layout."),
 		mcp.WithString("target", mcp.Required(), mcp.Description("Pane target (e.g. 'workshop:1.1')")),
-	), uiActionHandler("focus_pane", false, []string{"target"}))
+	), traced("focus_pane", uiActionHandler("focus_pane", false, []string{"target"})))
 
 	s.AddTool(mcp.NewTool("assign_pane",
 		mcp.WithDescription("Assign a pane to a grid cell, making it the active tab. Defaults to the focused cell if cellId is omitted."),
 		mcp.WithString("target", mcp.Required(), mcp.Description("Pane target")),
 		mcp.WithString("cellId", mcp.Description("Optional cell ID. Defaults to focused cell.")),
-	), uiActionHandler("assign_pane", false, []string{"target", "cellId"}))
+	), traced("assign_pane", uiActionHandler("assign_pane", false, []string{"target", "cellId"})))
 
 	s.AddTool(mcp.NewTool("open_card",
 		mcp.WithDescription("Open the kanban view and expand a specific card."),
 		mcp.WithNumber("id", mcp.Required(), mcp.Description("Card ID")),
-	), uiActionHandler("open_card", false, []string{"id"}))
+	), traced("open_card", uiActionHandler("open_card", false, []string{"id"})))
 
 	s.AddTool(mcp.NewTool("prompt_user",
 		mcp.WithDescription("Show a themed input dialog and wait for the user's typed response. Blocking — returns the user's input or an error if they cancelled. Use for clarifying questions during a task."),
 		mcp.WithString("title", mcp.Required(), mcp.Description("Dialog title")),
 		mcp.WithString("message", mcp.Description("Optional helper text below the title")),
 		mcp.WithString("initialValue", mcp.Description("Pre-filled input value")),
-	), uiActionHandler("prompt_user", true, []string{"title", "message", "initialValue"}))
+	), traced("prompt_user", uiActionHandler("prompt_user", true, []string{"title", "message", "initialValue"})))
 
 	s.AddTool(mcp.NewTool("confirm",
 		mcp.WithDescription("Show a themed yes/no confirmation dialog. Blocking — returns 'true' if confirmed, 'false' if cancelled. Use for destructive or irreversible actions that need user sign-off."),
 		mcp.WithString("title", mcp.Required(), mcp.Description("Dialog title")),
 		mcp.WithString("message", mcp.Description("Optional message body")),
 		mcp.WithBoolean("danger", mcp.Description("Show the confirm button in danger styling (red)")),
-	), uiActionHandler("confirm", true, []string{"title", "message", "danger"}))
+	), traced("confirm", uiActionHandler("confirm", true, []string{"title", "message", "danger"})))
 
 	// --- Channels (inter-pane / inter-agent messaging) ---
 
@@ -274,31 +350,56 @@ func Serve() {
 		mcp.WithString("body", mcp.Required(), mcp.Description("Message body")),
 		mcp.WithString("from", mcp.Description("Sender pane target or agent name (optional, helps the receiver know who sent it)")),
 		mcp.WithString("project", mcp.Description("Optional project tag — namespaces the channel")),
-	), channelPublishHandler())
+	), traced("channel_publish", channelPublishHandler()))
 
 	s.AddTool(mcp.NewTool("channel_subscribe",
 		mcp.WithDescription("Subscribe a pane to a Workshop channel so it receives published messages."),
 		mcp.WithString("channel", mcp.Required(), mcp.Description("Channel name")),
 		mcp.WithString("target", mcp.Required(), mcp.Description("Pane target to subscribe (e.g. 'workshop:1.1')")),
 		mcp.WithString("project", mcp.Description("Optional project tag")),
-	), channelSubscribeHandler())
+	), traced("channel_subscribe", channelSubscribeHandler()))
 
 	s.AddTool(mcp.NewTool("channel_unsubscribe",
 		mcp.WithDescription("Remove a pane from a Workshop channel."),
 		mcp.WithString("channel", mcp.Required(), mcp.Description("Channel name")),
 		mcp.WithString("target", mcp.Required(), mcp.Description("Pane target")),
-	), channelUnsubscribeHandler())
+	), traced("channel_unsubscribe", channelUnsubscribeHandler()))
 
 	s.AddTool(mcp.NewTool("channel_list",
 		mcp.WithDescription("List all active Workshop channels with their subscriber and message counts."),
 		mcp.WithString("project", mcp.Description("Filter by project tag")),
-	), channelListHandler())
+	), traced("channel_list", channelListHandler()))
 
 	s.AddTool(mcp.NewTool("channel_messages",
 		mcp.WithDescription("List recent messages on a channel."),
 		mcp.WithString("channel", mcp.Required(), mcp.Description("Channel name")),
 		mcp.WithNumber("limit", mcp.Description("Max messages to return (default 50, max 500)")),
-	), channelMessagesHandler())
+	), traced("channel_messages", channelMessagesHandler()))
+
+	// Ollama (local LLM)
+	s.AddTool(mcp.NewTool("ollama_models",
+		mcp.WithDescription("List available local LLM models across all Ollama endpoints."),
+	), traced("ollama_models", ollamaModelsHandler()))
+
+	s.AddTool(mcp.NewTool("ollama_chat",
+		mcp.WithDescription("Chat with a local Ollama model. Returns the model's response. Use for creative generation, uncensored content, or tasks best handled by a local model."),
+		mcp.WithString("model", mcp.Required(), mcp.Description("Model name (e.g. gemma4:26b, cydonia-24b, stheno-8b)")),
+		mcp.WithString("prompt", mcp.Required(), mcp.Description("User message to send")),
+		mcp.WithString("system", mcp.Description("System prompt (optional)")),
+		mcp.WithNumber("temperature", mcp.Description("Sampling temperature (default: model default)")),
+		mcp.WithNumber("max_tokens", mcp.Description("Max tokens to generate")),
+		mcp.WithBoolean("think", mcp.Description("Enable thinking mode (default: false, recommended for Gemma 4)")),
+	), traced("ollama_chat", ollamaChatHandler()))
+
+	s.AddTool(mcp.NewTool("ollama_generate",
+		mcp.WithDescription("Single-shot text generation with a local Ollama model. Use for completions, creative writing, or raw text generation without chat format."),
+		mcp.WithString("model", mcp.Required(), mcp.Description("Model name")),
+		mcp.WithString("prompt", mcp.Required(), mcp.Description("Prompt text")),
+		mcp.WithString("system", mcp.Description("System prompt (optional)")),
+		mcp.WithNumber("temperature", mcp.Description("Sampling temperature")),
+		mcp.WithNumber("max_tokens", mcp.Description("Max tokens to generate")),
+		mcp.WithBoolean("think", mcp.Description("Enable thinking mode (default: false)")),
+	), traced("ollama_generate", ollamaGenerateHandler()))
 
 	if err := server.ServeStdio(s); err != nil {
 		fmt.Fprintf(os.Stderr, "workshop mcp error: %v\n", err)
@@ -461,16 +562,53 @@ func createWindowHandler(bridge tmux.Bridge) server.ToolHandlerFunc {
 
 func launchAgentHandler(bridge tmux.Bridge) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		// Resolve preset if provided — fetch from REST API, then let explicit params override.
+		provider := mcp.ParseString(req, "provider", "")
+		model := mcp.ParseString(req, "model", "")
+		prompt := mcp.ParseString(req, "prompt", "")
+		directory := mcp.ParseString(req, "directory", "")
+		name := mcp.ParseString(req, "name", "")
+
+		if presetName := mcp.ParseString(req, "preset", ""); presetName != "" {
+			presetResp, err := http.Get(workshopAPIURL() + "/api/v1/agent-presets")
+			if err == nil {
+				defer presetResp.Body.Close()
+				var presets []map[string]any
+				json.NewDecoder(presetResp.Body).Decode(&presets)
+				for _, p := range presets {
+					if pName, _ := p["name"].(string); pName == presetName {
+						if provider == "" { provider, _ = p["provider"].(string) }
+						if model == "" { model, _ = p["model"].(string) }
+						if directory == "" { directory, _ = p["directory"].(string) }
+						// Prepend system prompt to the user's prompt
+						if sp, _ := p["systemPrompt"].(string); sp != "" {
+							if prompt != "" {
+								prompt = sp + "\n\n" + prompt
+							} else if pp, _ := p["prompt"].(string); pp != "" {
+								prompt = sp + "\n\n" + pp
+							} else {
+								prompt = sp
+							}
+						} else if prompt == "" {
+							prompt, _ = p["prompt"].(string)
+						}
+						if name == "" { name = presetName }
+						break
+					}
+				}
+			}
+		}
+
 		// Route through the REST endpoint so the frontend receives the
 		// session_created broadcast. Agent launches from MCP are always
 		// background=true — the user isn't directly creating them.
 		body := map[string]any{
-			"name":                     mcp.ParseString(req, "name", ""),
-			"provider":                 mcp.ParseString(req, "provider", ""),
-			"directory":                mcp.ParseString(req, "directory", ""),
+			"name":                     name,
+			"provider":                 provider,
+			"directory":                directory,
 			"command":                  mcp.ParseString(req, "command", ""),
-			"prompt":                   mcp.ParseString(req, "prompt", ""),
-			"model":                    mcp.ParseString(req, "model", ""),
+			"prompt":                   prompt,
+			"model":                    model,
 			"dangerousSkipPermissions": mcp.ParseBoolean(req, "dangerouslySkipPermissions", false),
 			"background":               true,
 		}
@@ -532,9 +670,13 @@ func workshopAPIURL() string {
 func kanbanListHandler() server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		project := mcp.ParseString(req, "project", "")
+		includeArchived := mcp.ParseBoolean(req, "include_archived", false)
 		params := url.Values{}
 		if project != "" {
 			params.Set("project", project)
+		}
+		if includeArchived {
+			params.Set("include_archived", "true")
 		}
 		resp, err := http.Get(workshopAPIURL() + "/api/v1/cards?" + params.Encode())
 		if err != nil {
@@ -1492,5 +1634,351 @@ func openDocHandler() server.ToolHandlerFunc {
 		}
 
 		return mcp.NewToolResultText(fmt.Sprintf("Opened %s in Docs view", path)), nil
+	}
+}
+
+func ollamaModelsHandler() server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		resp, err := http.Get(workshopAPIURL() + "/api/v1/ollama/models")
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Failed to reach Workshop: %v", err)), nil
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != 200 {
+			return mcp.NewToolResultError(string(body)), nil
+		}
+
+		var models []map[string]any
+		json.Unmarshal(body, &models)
+		if len(models) == 0 {
+			return mcp.NewToolResultText("No models available. Check Ollama endpoints with ollama_health."), nil
+		}
+
+		var sb strings.Builder
+		for _, m := range models {
+			name, _ := m["name"].(string)
+			endpoint, _ := m["endpoint"].(string)
+			size, _ := m["size"].(float64)
+			fmt.Fprintf(&sb, "[%s] %s (%.1f GB)\n", endpoint, name, size/1e9)
+		}
+		return mcp.NewToolResultText(sb.String()), nil
+	}
+}
+
+func ollamaChatHandler() server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		model := mcp.ParseString(req, "model", "")
+		prompt := mcp.ParseString(req, "prompt", "")
+		system := mcp.ParseString(req, "system", "")
+		think := mcp.ParseBoolean(req, "think", false)
+
+		chatReq := map[string]any{
+			"model":    model,
+			"messages": []map[string]string{{"role": "user", "content": prompt}},
+			"stream":   false,
+			"think":    think,
+		}
+		if system != "" {
+			chatReq["messages"] = []map[string]string{
+				{"role": "system", "content": system},
+				{"role": "user", "content": prompt},
+			}
+		}
+		if temp := mcp.ParseFloat64(req, "temperature", -1); temp >= 0 {
+			chatReq["temperature"] = temp
+		}
+		if maxTok := mcp.ParseFloat64(req, "max_tokens", 0); maxTok > 0 {
+			chatReq["max_tokens"] = int(maxTok)
+		}
+
+		jsonBody, _ := json.Marshal(chatReq)
+		resp, err := http.Post(workshopAPIURL()+"/api/v1/ollama/chat", "application/json", strings.NewReader(string(jsonBody)))
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Failed to reach Workshop: %v", err)), nil
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != 200 {
+			return mcp.NewToolResultError(string(body)), nil
+		}
+
+		var chatResp map[string]any
+		json.Unmarshal(body, &chatResp)
+		msg, _ := chatResp["message"].(map[string]any)
+		content, _ := msg["content"].(string)
+		if content == "" {
+			return mcp.NewToolResultText("(empty response)"), nil
+		}
+
+		// Include stats if available
+		var stats string
+		var outputTokens float64
+		var promptTokens float64
+		if evalCount, ok := chatResp["eval_count"].(float64); ok && evalCount > 0 {
+			outputTokens = evalCount
+			if evalDur, ok := chatResp["eval_duration"].(float64); ok && evalDur > 0 {
+				tokPerSec := evalCount / (evalDur / 1e9)
+				stats = fmt.Sprintf("\n\n---\n_%.0f tokens, %.1f tok/s, model: %s_", evalCount, tokPerSec, model)
+			}
+		}
+		if pt, ok := chatResp["prompt_eval_count"].(float64); ok {
+			promptTokens = pt
+		}
+
+		// Record usage (fire-and-forget, don't block on failure)
+		if outputTokens > 0 || promptTokens > 0 {
+			go postUsage(model, "ollama", int64(promptTokens), int64(outputTokens))
+		}
+
+		return mcp.NewToolResultText(content + stats), nil
+	}
+}
+
+func ollamaGenerateHandler() server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		model := mcp.ParseString(req, "model", "")
+		prompt := mcp.ParseString(req, "prompt", "")
+		system := mcp.ParseString(req, "system", "")
+		think := mcp.ParseBoolean(req, "think", false)
+
+		genReq := map[string]any{
+			"model":  model,
+			"prompt": prompt,
+			"stream": false,
+			"think":  think,
+		}
+		if system != "" {
+			genReq["system"] = system
+		}
+		if temp := mcp.ParseFloat64(req, "temperature", -1); temp >= 0 {
+			genReq["temperature"] = temp
+		}
+		if maxTok := mcp.ParseFloat64(req, "max_tokens", 0); maxTok > 0 {
+			genReq["max_tokens"] = int(maxTok)
+		}
+
+		jsonBody, _ := json.Marshal(genReq)
+		resp, err := http.Post(workshopAPIURL()+"/api/v1/ollama/generate", "application/json", strings.NewReader(string(jsonBody)))
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Failed to reach Workshop: %v", err)), nil
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != 200 {
+			return mcp.NewToolResultError(string(body)), nil
+		}
+
+		var genResp map[string]any
+		json.Unmarshal(body, &genResp)
+		content, _ := genResp["response"].(string)
+		if content == "" {
+			return mcp.NewToolResultText("(empty response)"), nil
+		}
+
+		var stats string
+		var outputTokens float64
+		var promptTokens float64
+		if evalCount, ok := genResp["eval_count"].(float64); ok && evalCount > 0 {
+			outputTokens = evalCount
+			if evalDur, ok := genResp["eval_duration"].(float64); ok && evalDur > 0 {
+				tokPerSec := evalCount / (evalDur / 1e9)
+				stats = fmt.Sprintf("\n\n---\n_%.0f tokens, %.1f tok/s, model: %s_", evalCount, tokPerSec, model)
+			}
+		}
+		if pt, ok := genResp["prompt_eval_count"].(float64); ok {
+			promptTokens = pt
+		}
+
+		// Record usage (fire-and-forget, don't block on failure)
+		if outputTokens > 0 || promptTokens > 0 {
+			go postUsage(model, "ollama", int64(promptTokens), int64(outputTokens))
+		}
+
+		return mcp.NewToolResultText(content + stats), nil
+	}
+}
+
+// postUsage fires a POST to the Workshop REST API to record token usage.
+// Called as a goroutine — errors are logged but don't block the caller.
+func postUsage(model, provider string, inputTokens, outputTokens int64) {
+	payload, _ := json.Marshal(map[string]any{
+		"sessionId":    mcpPaneTarget,
+		"paneTarget":   mcpPaneTarget,
+		"provider":     provider,
+		"model":        model,
+		"inputTokens":  inputTokens,
+		"outputTokens": outputTokens,
+		"project":      "",
+	})
+	resp, err := http.Post(workshopAPIURL()+"/api/v1/usage", "application/json", strings.NewReader(string(payload)))
+	if err != nil {
+		slog.Warn("failed to record ollama usage", "err", err)
+		return
+	}
+	resp.Body.Close()
+}
+
+func orchestrateCardHandler() server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		// Prevent recursive calls — if we're already inside an orchestrator session, refuse.
+		if strings.HasPrefix(mcpPaneTarget, "orchestrate-") {
+			return mcp.NewToolResultError("You ARE the orchestrator. Do not call orchestrate_card. Use launch_agent, capture_pane, report_activity, request_approval, kanban_add_note, and kanban_move directly to drive through the phases."), nil
+		}
+
+		cardID := mcp.ParseInt(req, "id", 0)
+		if cardID == 0 {
+			return mcp.NewToolResultError("id is required"), nil
+		}
+		directory := mcp.ParseString(req, "directory", "")
+
+		// Fetch the card details
+		cardResp, err := http.Get(fmt.Sprintf("%s/api/v1/cards/%d", workshopAPIURL(), cardID))
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Failed to reach Workshop: %v", err)), nil
+		}
+		defer cardResp.Body.Close()
+		cardBody, _ := io.ReadAll(cardResp.Body)
+		if cardResp.StatusCode != 200 {
+			return mcp.NewToolResultError(fmt.Sprintf("Card #%d not found", cardID)), nil
+		}
+
+		var card map[string]any
+		json.Unmarshal(cardBody, &card)
+		title, _ := card["title"].(string)
+		description, _ := card["description"].(string)
+		project, _ := card["project"].(string)
+
+		// Fetch existing notes for context
+		notesResp, _ := http.Get(fmt.Sprintf("%s/api/v1/cards/%d/notes", workshopAPIURL(), cardID))
+		var notesText string
+		if notesResp != nil {
+			defer notesResp.Body.Close()
+			notesBody, _ := io.ReadAll(notesResp.Body)
+			var notes []map[string]any
+			json.Unmarshal(notesBody, &notes)
+			for _, n := range notes {
+				if t, ok := n["text"].(string); ok {
+					notesText += "- " + t + "\n"
+				}
+			}
+		}
+
+		// Build the orchestrator prompt — avoid the word "orchestrate" to prevent
+		// the agent from recursively calling orchestrate_card on itself.
+		prompt := fmt.Sprintf(`Drive card #%d through all workflow phases using the tools described in your system prompt.
+
+## Card Details
+**Title:** %s
+**Project:** %s
+**Description:**
+%s
+`, cardID, title, project, description)
+
+		if notesText != "" {
+			prompt += fmt.Sprintf("\n## Existing Notes\n%s", notesText)
+		}
+
+		if directory != "" {
+			prompt += fmt.Sprintf("\n## Working Directory\n%s\n", directory)
+		}
+
+		prompt += fmt.Sprintf("\nThe card ID is %d and the project is %q. Use these in all kanban_add_note, kanban_move, and report_activity calls.", cardID, project)
+
+		// Launch the orchestrator agent — needs skip-permissions since it
+		// operates autonomously (user approves via Activity tab, not CLI prompts)
+		launchBody := map[string]any{
+			"name":                       fmt.Sprintf("orchestrate-%d", cardID),
+			"preset":                     "orchestrator",
+			"prompt":                     prompt,
+			"directory":                  directory,
+			"background":                 true,
+			"dangerouslySkipPermissions": true,
+		}
+		raw, _ := json.Marshal(launchBody)
+		resp, err := http.Post(workshopAPIURL()+"/api/v1/agents/launch", "application/json", strings.NewReader(string(raw)))
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Failed to launch orchestrator: %v", err)), nil
+		}
+		defer resp.Body.Close()
+		result, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != 201 {
+			return mcp.NewToolResultError(string(result)), nil
+		}
+
+		var launched map[string]any
+		json.Unmarshal(result, &launched)
+		target, _ := launched["target"].(string)
+		sessionName, _ := launched["sessionName"].(string)
+
+		return mcp.NewToolResultText(fmt.Sprintf("Orchestrator launched for card #%d\nSession: %s\nTarget: %s\n\nThe orchestrator will drive through plan→implement→test→review→PR phases with approval checkpoints at each step. Watch the Activity tab for progress.", cardID, sessionName, target)), nil
+	}
+}
+
+func requestApprovalHandler() server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		action := mcp.ParseString(req, "action", "")
+		details := mcp.ParseString(req, "details", "")
+		if action == "" || details == "" {
+			return mcp.NewToolResultError("action and details are required"), nil
+		}
+		entry := map[string]any{
+			"paneTarget": mcpPaneTarget,
+			"agentName":  mcpPaneTarget,
+			"action":     action,
+			"details":    details,
+			"project":    mcp.ParseString(req, "project", ""),
+			"diff":       mcp.ParseString(req, "diff", ""),
+		}
+		body, _ := json.Marshal(entry)
+		resp, err := http.Post(workshopAPIURL()+"/api/v1/approvals", "application/json", strings.NewReader(string(body)))
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Failed to reach Workshop: %v", err)), nil
+		}
+		defer resp.Body.Close()
+		result, _ := io.ReadAll(resp.Body)
+
+		var res map[string]any
+		json.Unmarshal(result, &res)
+		status, _ := res["status"].(string)
+
+		if status == "approved" {
+			return mcp.NewToolResultText("Approved — proceed with: " + action), nil
+		}
+		reason := ""
+		if r, ok := res["reason"].(string); ok {
+			reason = " (" + r + ")"
+		}
+		return mcp.NewToolResultError(fmt.Sprintf("Denied%s — do not proceed with: %s", reason, action)), nil
+	}
+}
+
+func reportActivityHandler() server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		action := mcp.ParseString(req, "action", "")
+		summary := mcp.ParseString(req, "summary", "")
+		if action == "" || summary == "" {
+			return mcp.NewToolResultError("action and summary are required"), nil
+		}
+		entry := map[string]any{
+			"paneTarget": mcpPaneTarget,
+			"agentName":  mcpPaneTarget,
+			"actionType": action,
+			"summary":    summary,
+			"project":    mcp.ParseString(req, "project", ""),
+			"metadata":   mcp.ParseString(req, "metadata", "{}"),
+			"parentId":   mcp.ParseInt(req, "parent_id", 0),
+		}
+		body, _ := json.Marshal(entry)
+		resp, err := http.Post(workshopAPIURL()+"/api/v1/activity", "application/json", strings.NewReader(string(body)))
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Failed to reach Workshop: %v", err)), nil
+		}
+		defer resp.Body.Close()
+		result, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != 201 {
+			return mcp.NewToolResultError(string(result)), nil
+		}
+		return mcp.NewToolResultText("Activity recorded"), nil
 	}
 }

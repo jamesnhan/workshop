@@ -4,49 +4,49 @@
 
 Workshop has a two-repo architecture:
 
-- **yuna** (`github.com/jamesnhan/yuna`) — Personal version (unsanitized, AUTHORITATIVE)
+- **workshop** (`github.com/jamesnhan/workshop`) — Personal version (unsanitized, AUTHORITATIVE)
   - The source of truth for all features
   - MUST NOT be broken by workshop changes
   - Can contain personal kanban data, session info
 
 - **workshop** (`github.com/jamesnhan/workshop`) — Work version (sanitized)
-  - Downstream of yuna
+  - Downstream of workshop
   - NO personal data allowed
-  - Tracks yuna features but sanitized for work use
+  - Tracks workshop features but sanitized for work use
 
 ## Git Remotes
 
 ```bash
 origin → github.com/jamesnhan/workshop (personal)
-yuna   → github.com/jamesnhan/yuna (work, authoritative)
+workshop   → github.com/jamesnhan/workshop (work, authoritative)
 ```
 
 ## Sync Workflow
 
-### Pull Features from Yuna (Common)
+### Pull Features from Workshop (Common)
 
-When yuna gets new features/fixes, pull them into workshop:
+When workshop gets new features/fixes, pull them into workshop:
 
 ```bash
-git fetch yuna
-git merge yuna/main -m "Merge features from yuna"
+git fetch workshop
+git merge workshop/main -m "Merge features from workshop"
 # Sanitize any personal references (if any leaked through)
-# Fix any yuna→workshop naming conflicts
+# Fix any workshop→workshop naming conflicts
 git push origin main
 ```
 
-### Push Features to Yuna (CAREFUL - Don't Break Yuna!)
+### Push Features to Workshop (CAREFUL - Don't Break Workshop!)
 
-When workshop has a well-tested feature yuna should have:
+When workshop has a well-tested feature workshop should have:
 
 ```bash
 # RARE: Only push thoroughly tested, non-breaking features
-# REVIEW: Ensure it won't break yuna's functionality
+# REVIEW: Ensure it won't break workshop's functionality
 # REVIEW: Ensure no work-specific data in commits
-git push yuna main
+git push workshop main
 ```
 
-**Key Rule:** Yuna is authoritative and must NEVER be broken by workshop changes.
+**Key Rule:** Workshop is authoritative and must NEVER be broken by workshop changes.
 
 ## What Gets Synced
 
@@ -62,24 +62,24 @@ git push yuna main
 - Personal project references
 - Any personal information
 
-**❌ Never Push to Yuna:**
+**❌ Never Push to Workshop:**
 - Work-specific references
 - Company data
-- Anything that could break yuna
+- Anything that could break workshop
 
 ## Important Notes
 
-- **Yuna is authoritative** — Personal repo, source of truth, MUST NOT BE BROKEN
-- **Workshop is downstream** — Work repo, sanitized, pulls from yuna
+- **Workshop is authoritative** — Personal repo, source of truth, MUST NOT BE BROKEN
+- **Workshop is downstream** — Work repo, sanitized, pulls from workshop
 - **Claude handles git** — Claude Code will manage git operations 99.99% of the time
 - **Separate databases** — Each repo has independent SQLite kanban database (personal vs work tasks)
-- **Manual review** — Always review commits before pushing to yuna
-- **Never break yuna** — Workshop changes must be tested before pushing upstream
+- **Manual review** — Always review commits before pushing to workshop
+- **Never break workshop** — Workshop changes must be tested before pushing upstream
 
 ## Maintenance
 
-After pulling from yuna, always:
-1. Check for naming conflicts (yuna vs workshop)
+After pulling from workshop, always:
+1. Check for naming conflicts (workshop vs workshop)
 2. Rebuild: `make build`
 3. Test key features
 4. Push to origin: `git push origin main`

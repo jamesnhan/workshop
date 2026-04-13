@@ -12,10 +12,15 @@ import { CommandPalette, type Command } from './components/CommandPalette';
 import { KanbanBoard } from './components/KanbanBoard';
 import { AgentDashboard } from './components/AgentDashboard';
 import { DocsView } from './components/DocsView';
+import { OllamaChat } from './components/OllamaChat';
+import { DependencyGraph } from './components/DependencyGraph';
 import { WorkspaceManager } from './components/WorkspaceManager';
 import { SettingsView } from './components/SettingsView';
+import { ActivityView } from './components/ActivityView';
 import { ResizeHandle } from './components/ResizeHandle';
 import { TicketHoverPreview } from './components/TicketHoverPreview';
+import { LinkHoverPreview } from './components/LinkHoverPreview';
+import { GitCommitHoverPreview } from './components/GitCommitHoverPreview';
 import { TicketLookupDialog } from './components/TicketLookupDialog';
 import { ToastContainer, type ToastItem, type ToastKind } from './components/Toast';
 import { ConfirmDialog, type DialogKind } from './components/ConfirmDialog';
@@ -32,6 +37,7 @@ import {
   useValidateTargets,
   saveWorkspace,
   loadWorkspace,
+  isWorkspaceDirty,
   deleteWorkspace,
   renameWorkspace,
   listWorkspaces,
@@ -55,6 +61,12 @@ function App() {
   const [sidebarWidth, setSidebarWidth] = useState(260);
   const [searchPanelWidth, setSearchPanelWidth] = useState(() => Math.min(800, window.innerWidth * 0.6));
   const [ticketHover, setTicketHover] = useState<{ id: number; x: number; y: number } | null>(null);
+  const [urlHover, setUrlHover] = useState<{ url: string; x: number; y: number } | null>(null);
+  const [commitHover, setCommitHover] = useState<{ sha: string; x: number; y: number } | null>(null);
+  const [hoverPinned, setHoverPinned] = useState(false);
+  const hoverPinnedRef = useRef(false);
+  // Keep a snapshot of the last hover so `z` can pin it even after mouseLeave
+  const lastHoverRef = useRef<{ ticket?: typeof ticketHover; url?: typeof urlHover; commit?: typeof commitHover }>({});
   const [hotkeyMenuOpen, setHotkeyMenuOpen] = useState(false);
   const [cmdPaletteOpen, setCmdPaletteOpen] = useState(false);
   const [kanbanOpen, setKanbanOpen] = useState(false);
@@ -65,10 +77,16 @@ function App() {
   const [ticketInsertTarget, setTicketInsertTarget] = useState<string | null>(null);
   const [dispatchTick, setDispatchTick] = useState(0);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [graphOpen, setGraphOpen] = useState(false);
+  const [ollamaOpen, setOllamaOpen] = useState(false);
+  const [activityOpen, setActivityOpen] = useState(false);
   const [notifBannerDismissed, setNotifBannerDismissed] = useState(false);
   const [notifSettingsOpen, setNotifSettingsOpen] = useState(false);
   const [playerOpen, setPlayerOpen] = useState(false);
   const [workspaceName, setWorkspaceName] = useState<string | null>(getActiveWorkspaceName);
+  // Bumps on workspace save so dirty-state memoization re-evaluates against
+  // the fresh localStorage snapshot.
+  const [workspaceSaveTick, setWorkspaceSaveTick] = useState(0);
   const [allPanes, setAllPanes] = useState<PaneInfo[]>([]);
   // Track unread: last-output time vs last-focused time per cell
   // Initialize lastFocused to now so initial screen dump doesn't trigger unread
@@ -101,6 +119,23 @@ function App() {
     danger?: boolean;
     onResolve: (value: string | undefined, cancelled: boolean) => void;
   } | null>(null);
+
+  // Imperative confirm that resolves via the custom ConfirmDialog, so child
+  // components can avoid the native window.confirm.
+  const confirmViaDialog = useCallback((opts: { title: string; message?: string; danger?: boolean }): Promise<boolean> => {
+    return new Promise((resolve) => {
+      setUIDialog({
+        kind: 'confirm',
+        title: opts.title,
+        message: opts.message,
+        danger: opts.danger,
+        onResolve: (_v, cancelled) => {
+          setUIDialog(null);
+          resolve(!cancelled);
+        },
+      });
+    });
+  }, []);
 
   // Pending kanban card to open from a UI command
   const [pendingOpenCardId, setPendingOpenCardId] = useState<number | null>(null);
@@ -210,10 +245,10 @@ function App() {
         ref.current.write('\x1b[2J\x1b[H'); // clear screen + cursor home
       }
     }
-    // Refit all viewers after reconnect — dimensions may have changed
+    // Force-resize all viewers after reconnect so tmux reflows to current dims.
     requestAnimationFrame(() => {
       requestAnimationFrame(() => {
-        viewerRefsMap.current.forEach((ref) => ref.current?.refit());
+        viewerRefsMap.current.forEach((ref) => ref.current?.forceResize());
       });
     });
   }, []));
@@ -262,6 +297,8 @@ function App() {
         setKanbanOpen(view === 'kanban');
         setDashboardOpen(view === 'agents');
         setDocsOpen(view === 'docs');
+        setOllamaOpen(view === 'ollama');
+        setActivityOpen(view === 'activity');
         setSettingsOpen(view === 'settings');
         break;
       }
@@ -380,9 +417,9 @@ function App() {
         subscribePane(cell.target);
       }
     }
-    // Refit restored panes to their cell dimensions
+    // Force a resize for restored panes so tmux reflows to match viewport.
     setTimeout(() => {
-      viewerRefsMap.current.forEach((ref) => ref.current?.refit());
+      viewerRefsMap.current.forEach((ref) => ref.current?.forceResize());
     }, 100);
   }, [allPanes, layout.cells, subscribe]);
 
@@ -510,10 +547,13 @@ function App() {
     unreadTickRef.current++; // no-op while unread indicators disabled
   }, [paneStatuses]);
 
-  // Auto-focus terminal on cell change
+  // Auto-focus terminal on cell change and force a resize so tmux reflows
+  // in case the pane is out of sync with the current cell dimensions.
   useEffect(() => {
     requestAnimationFrame(() => {
-      viewerRefsMap.current.get(layout.focusedId)?.current?.focus();
+      const ref = viewerRefsMap.current.get(layout.focusedId);
+      ref?.current?.focus();
+      ref?.current?.forceResize();
     });
   }, [layout.focusedId]);
 
@@ -609,6 +649,38 @@ function App() {
         return;
       }
 
+      // z — pin/unpin hover preview (BG3 inspect key)
+      if (key === 'z' && !mod && !nav && !shift) {
+        if (hoverPinnedRef.current) {
+          // Delay re-enabling hover clears by a frame to prevent flicker
+          // when the mouse is still over the trigger element
+          hoverPinnedRef.current = false;
+          requestAnimationFrame(() => setHoverPinned(false));
+          return;
+        }
+        // Pin the current hover, or restore the last one if mouse already left
+        const last = lastHoverRef.current;
+        if (last.ticket || last.url || last.commit) {
+          e.preventDefault();
+          if (last.ticket) setTicketHover(last.ticket);
+          if (last.url) setUrlHover(last.url);
+          if (last.commit) setCommitHover(last.commit);
+          hoverPinnedRef.current = true;
+          setHoverPinned(true);
+          return;
+        }
+      }
+      // Escape clears pinned hover
+      if (key === 'Escape' && hoverPinnedRef.current) {
+        hoverPinnedRef.current = false;
+        setHoverPinned(false);
+        setTicketHover(null);
+        setUrlHover(null);
+        setCommitHover(null);
+        lastHoverRef.current = {};
+        return;
+      }
+
       if (key === 'Escape' && ticketLookupOpen) { setTicketLookupOpen(false); return; }
       if (key === 'Escape' && playerOpen) { setPlayerOpen(false); return; }
       if (key === 'Escape' && dashboardOpen) { setDashboardOpen(false); return; }
@@ -630,7 +702,9 @@ function App() {
         }
       }
 
-      // # — ticket lookup dialog (only when not typing in a terminal)
+      // # — ticket lookup dialog (only when not in a terminal)
+      // Inside terminals, # is handled per-pane by PaneViewer's key handler
+      // (gated to agent sessions only via agentTargets in PaneGrid)
       if (e.key === '#' && !mod && !nav) {
         const active = document.activeElement;
         const inTerminal = active?.classList.contains('xterm-helper-textarea');
@@ -804,7 +878,7 @@ function App() {
     document.addEventListener('keydown', handleGlobalKey, true);
     document.addEventListener('keydown', handleCapsLock);
     return () => { document.removeEventListener('keydown', handleGlobalKey, true); document.removeEventListener('keydown', handleCapsLock); };
-  }, [switcherOpen, openSwitcher, toggleMaximize, mergeInDirection, splitFocused, swapInDirection, subscribe, unsubscribe, closeTab, layout.cells, layout.focusedId]);
+  }, [switcherOpen, openSwitcher, toggleMaximize, mergeInDirection, splitFocused, swapInDirection, subscribe, unsubscribe, closeTab, layout.cells, layout.focusedId, hotkeyMenuOpen, notifOpen, ticketLookupOpen, playerOpen, dashboardOpen, settingsOpen, kanbanOpen, cmdPaletteOpen]);
 
   const activeTargets = layout.cells
     .map((c) => c.target)
@@ -827,7 +901,16 @@ function App() {
     setActiveWorkspaceName(name);
   }, [layout, workspaceName]);
 
-  const handleLoadWorkspace = useCallback((name: string) => {
+  const handleLoadWorkspace = useCallback(async (name: string) => {
+    if (workspaceName && workspaceName !== name && isWorkspaceDirty(workspaceName, layout)) {
+      const save = await confirmViaDialog({
+        title: `Unsaved changes in "${workspaceName}"`,
+        message: `Save changes to "${workspaceName}" before switching to "${name}"?`,
+      });
+      if (save) {
+        saveWorkspace(workspaceName, layout);
+      }
+    }
     const ws = loadWorkspace(name);
     if (!ws) return;
     // Unsubscribe all current panes
@@ -841,7 +924,7 @@ function App() {
     for (const cell of ws.cells) {
       if (cell.target) subscribePane(cell.target);
     }
-  }, [layout.cells, unsubscribe, subscribePane]);
+  }, [layout, workspaceName, confirmViaDialog, unsubscribe, subscribePane]);
 
   const handleDeleteWorkspace = useCallback((name: string) => {
     if (!confirm(`Delete workspace "${name}"?`)) return;
@@ -1027,7 +1110,7 @@ function App() {
     })),
   ];
 
-  const activeView = kanbanOpen ? 'kanban' : dashboardOpen ? 'dashboard' : docsOpen ? 'docs' : settingsOpen ? 'settings' : 'sessions';
+  const activeView = kanbanOpen ? 'kanban' : dashboardOpen ? 'dashboard' : docsOpen ? 'docs' : graphOpen ? 'graph' : ollamaOpen ? 'ollama' : activityOpen ? 'activity' : settingsOpen ? 'settings' : 'sessions';
 
   // Refocus terminal when returning to Sessions view
   useEffect(() => {
@@ -1054,7 +1137,30 @@ function App() {
         }}
         activeTargets={activeTargets}
         paneStatuses={paneStatuses}
+        maximizedTarget={layout.maximizedId ? layout.cells.find((c) => c.id === layout.maximizedId)?.target ?? null : null}
+        onFocusSession={(sessionName) => {
+          // Return true if we found a cell already showing a pane from
+          // this session and focused it. Prefer the maximized cell if it
+          // matches, then the focused cell, then any match.
+          const prefix = sessionName + ':';
+          const matches = layout.cells.filter((c) => c.target?.startsWith(prefix));
+          if (matches.length === 0) return false;
+          const preferred =
+            matches.find((c) => c.id === layout.maximizedId) ??
+            matches.find((c) => c.id === layout.focusedId) ??
+            matches[0];
+          // If a different cell is currently maximized, move the maximize
+          // to the new cell so the jump actually lands on screen instead
+          // of being hidden behind the old fullscreen.
+          if (layout.maximizedId && layout.maximizedId !== preferred.id) {
+            setLayout((prev) => ({ ...prev, maximizedId: preferred.id }));
+          }
+          handleFocusCell(preferred.id);
+          return true;
+        }}
         onSessionRenamed={handleSessionRenamed}
+        sfwMode={settings.sfwMode}
+        nsfwProjects={settings.nsfwProjects}
         style={{ width: sidebarCollapsed ? undefined : sidebarWidth }}
       />
       {!sidebarCollapsed && (
@@ -1073,31 +1179,49 @@ function App() {
           <button className="mobile-menu-btn" onClick={() => setSidebarCollapsed((p) => !p)}>☰</button>
           <button
             className={`mode-tab${activeView === 'sessions' ? ' active' : ''}`}
-            onClick={() => { setKanbanOpen(false); setDashboardOpen(false); setDocsOpen(false); setSettingsOpen(false); }}
+            onClick={() => { setKanbanOpen(false); setDashboardOpen(false); setDocsOpen(false); setSettingsOpen(false); setGraphOpen(false); setOllamaOpen(false); setActivityOpen(false); }}
           >
             Sessions
           </button>
           <button
             className={`mode-tab${activeView === 'kanban' ? ' active' : ''}`}
-            onClick={() => { setKanbanOpen(true); setDashboardOpen(false); setDocsOpen(false); setSettingsOpen(false); }}
+            onClick={() => { setKanbanOpen(true); setDashboardOpen(false); setDocsOpen(false); setSettingsOpen(false); setGraphOpen(false); setOllamaOpen(false); setActivityOpen(false); }}
           >
             Kanban
           </button>
           <button
+            className={`mode-tab${activeView === 'graph' ? ' active' : ''}`}
+            onClick={() => { setGraphOpen(true); setKanbanOpen(false); setDashboardOpen(false); setDocsOpen(false); setSettingsOpen(false); setOllamaOpen(false); setActivityOpen(false); }}
+          >
+            Graph
+          </button>
+          <button
             className={`mode-tab${activeView === 'dashboard' ? ' active' : ''}`}
-            onClick={() => { setDashboardOpen(true); setKanbanOpen(false); setDocsOpen(false); setSettingsOpen(false); }}
+            onClick={() => { setDashboardOpen(true); setKanbanOpen(false); setDocsOpen(false); setSettingsOpen(false); setGraphOpen(false); setOllamaOpen(false); setActivityOpen(false); }}
           >
             Agents
           </button>
           <button
+            className={`mode-tab${activeView === 'activity' ? ' active' : ''}`}
+            onClick={() => { setActivityOpen(true); setKanbanOpen(false); setDashboardOpen(false); setDocsOpen(false); setSettingsOpen(false); setGraphOpen(false); setOllamaOpen(false); }}
+          >
+            Activity
+          </button>
+          <button
             className={`mode-tab${activeView === 'docs' ? ' active' : ''}`}
-            onClick={() => { setDocsOpen(true); setKanbanOpen(false); setDashboardOpen(false); setSettingsOpen(false); }}
+            onClick={() => { setDocsOpen(true); setKanbanOpen(false); setDashboardOpen(false); setSettingsOpen(false); setGraphOpen(false); setOllamaOpen(false); setActivityOpen(false); }}
           >
             Docs
           </button>
           <button
+            className={`mode-tab${activeView === 'ollama' ? ' active' : ''}`}
+            onClick={() => { setOllamaOpen(true); setKanbanOpen(false); setDashboardOpen(false); setDocsOpen(false); setSettingsOpen(false); setGraphOpen(false); setActivityOpen(false); }}
+          >
+            Chat
+          </button>
+          <button
             className={`mode-tab${activeView === 'settings' ? ' active' : ''}`}
-            onClick={() => { setSettingsOpen(true); setKanbanOpen(false); setDashboardOpen(false); setDocsOpen(false); }}
+            onClick={() => { setSettingsOpen(true); setKanbanOpen(false); setDashboardOpen(false); setDocsOpen(false); setGraphOpen(false); setOllamaOpen(false); setActivityOpen(false); }}
           >
             Settings
           </button>
@@ -1113,12 +1237,13 @@ function App() {
             <>
               <WorkspaceManager
                 activeWorkspace={workspaceName}
+                dirty={(void workspaceSaveTick, isWorkspaceDirty(workspaceName, layout))}
                 onLoad={handleLoadWorkspace}
-                onSave={(name) => { saveWorkspace(name, layout); setWorkspaceName(name); setActiveWorkspaceName(name); }}
+                onSave={(name) => { saveWorkspace(name, layout); setWorkspaceName(name); setActiveWorkspaceName(name); setWorkspaceSaveTick((t) => t + 1); }}
                 onDelete={handleDeleteWorkspace}
                 onRename={handleRenameWorkspace}
               />
-              {focusedTarget && <span className="active-target">{focusedTarget}</span>}
+              {focusedTarget && !(settings.sfwMode && settings.nsfwProjects.some((p) => focusedTarget.toLowerCase().startsWith(p.toLowerCase() + ':'))) && <span className="active-target">{focusedTarget}</span>}
               <div className="grid-controls">
                 <span className="grid-size">{layout.gridRows}x{layout.gridCols}</span>
                 <button className="btn-grid" onClick={() => setLayout(addRow)} title="Add row">+R</button>
@@ -1140,25 +1265,36 @@ function App() {
           {activeView === 'docs' && (
             <span className="active-target">Documentation</span>
           )}
+          {activeView === 'ollama' && (
+            <span className="active-target">Local LLM Chat</span>
+          )}
           {activeView === 'settings' && (
             <span className="active-target">Preferences</span>
           )}
+          {activeView === 'activity' && (
+            <span className="active-target">Agent Activity</span>
+          )}
+          {activeView === 'graph' && (
+            <span className="active-target">Dependency Graph</span>
+          )}
 
-          <button className="btn-switcher" onClick={() => openSwitcher()}>Ctrl+P</button>
-          <button className="btn-switcher" onClick={() => setSearchOpen((p) => !p)}>Search</button>
-          <button className="btn-switcher" onClick={() => setHotkeyMenuOpen((p) => !p)} title="Hotkeys (?)">?</button>
-          <button className="notif-bell" onClick={() => { setNotifOpen((p) => !p); markAllRead(); }}>
-            🔔{unreadCount > 0 && <span className="notif-badge">{unreadCount}</span>}
-          </button>
-          <select
-            className="theme-select"
-            value={themeName}
-            onChange={(e) => handleSetTheme(e.target.value)}
-          >
-            {Object.entries(themes).map(([key, t]) => (
-              <option key={key} value={key}>{t.name}</option>
-            ))}
-          </select>
+          <div className="status-bar-right">
+            <button className="btn-switcher" onClick={() => openSwitcher()}>Ctrl+P</button>
+            <button className="btn-switcher" onClick={() => setSearchOpen((p) => !p)}>Search</button>
+            <button className="btn-switcher" onClick={() => setHotkeyMenuOpen((p) => !p)} title="Hotkeys (?)">?</button>
+            <button className="notif-bell" onClick={() => { setNotifOpen((p) => !p); markAllRead(); }}>
+              🔔{unreadCount > 0 && <span className="notif-badge">{unreadCount}</span>}
+            </button>
+            <select
+              className="theme-select"
+              value={themeName}
+              onChange={(e) => handleSetTheme(e.target.value)}
+            >
+              {Object.entries(themes).map(([key, t]) => (
+                <option key={key} value={key}>{t.name}</option>
+              ))}
+            </select>
+          </div>
         </div>
         {switcherOpen && (
           <PaneSwitcher
@@ -1245,8 +1381,12 @@ function App() {
             onAssignPane={openSwitcher}
             onSwitchTab={switchTab}
             onCloseTab={closeTab}
-            onTicketHover={(id, x, y) => setTicketHover(id ? { id, x, y } : null)}
+            onTicketHover={(id, x, y) => { if (!id && hoverPinnedRef.current) return; if (id) lastHoverRef.current = { ticket: { id, x, y } }; setTicketHover(id ? { id, x, y } : null); }}
+            onUrlHover={(url, x, y) => { if (!url && hoverPinnedRef.current) return; if (url) lastHoverRef.current = { url: { url, x, y } }; setUrlHover(url ? { url, x, y } : null); }}
+            onCommitHover={(sha, x, y) => { if (!sha && hoverPinnedRef.current) return; if (sha) lastHoverRef.current = { commit: { sha, x, y } }; setCommitHover(sha ? { sha, x, y } : null); }}
             onTicketClick={(id) => { setKanbanOpen(true); /* TODO: focus the card */ void id; }}
+            sfwMode={settings.sfwMode}
+            nsfwProjects={settings.nsfwProjects}
             onHashKey={settings.terminalHashKey ? () => {
               const focusedCell = layout.cells.find((c) => c.id === layout.focusedId);
               const target = focusedCell?.target;
@@ -1255,9 +1395,21 @@ function App() {
                 setTicketLookupOpen(true);
               }
             } : undefined}
+            agentTargets={new Set(
+              allPanes
+                .filter((p) => ['claude', 'gemini', 'codex'].includes(p.command) || ['claude', 'gemini', 'codex'].includes(p.windowName))
+                .map((p) => p.target)
+            )}
           />
         </div>
-        {ticketHover && <TicketHoverPreview cardId={ticketHover.id} x={ticketHover.x} y={ticketHover.y} />}
+        {ticketHover && <div className={hoverPinned ? 'hover-pinned' : ''}><TicketHoverPreview cardId={ticketHover.id} x={ticketHover.x} y={ticketHover.y} /></div>}
+        {urlHover && <div className={hoverPinned ? 'hover-pinned' : ''}><LinkHoverPreview url={urlHover.url} x={urlHover.x} y={urlHover.y} /></div>}
+        {commitHover && (() => {
+          const focusedPane = allPanes.find((p) => p.target === focusedTarget);
+          return focusedPane?.path ? (
+            <div className={hoverPinned ? 'hover-pinned' : ''}><GitCommitHoverPreview sha={commitHover.sha} repoDir={focusedPane.path} x={commitHover.x} y={commitHover.y} /></div>
+          ) : null;
+        })()}
         {activeView === 'kanban' && (
           <KanbanBoard
             defaultProject={focusedTarget?.split(':')[0]}
@@ -1272,6 +1424,8 @@ function App() {
               else assignPaneToCell(layout.focusedId, target);
             }}
             ticketAutocomplete={settings.ticketAutocomplete}
+            sfwMode={settings.sfwMode}
+            nsfwProjects={settings.nsfwProjects}
             dispatchTick={dispatchTick}
             openCardId={pendingOpenCardId}
             onCardOpened={() => setPendingOpenCardId(null)}
@@ -1287,9 +1441,20 @@ function App() {
               if (cell) handleFocusCell(cell.id);
               else assignPaneToCell(layout.focusedId, target);
             }}
+            sfwMode={settings.sfwMode}
+            nsfwProjects={settings.nsfwProjects}
           />
         )}
-        {activeView === 'docs' && <DocsView openPath={pendingDocPath} onOpenPathConsumed={() => setPendingDocPath(null)} />}
+        {activeView === 'docs' && <DocsView openPath={pendingDocPath} onOpenPathConsumed={() => setPendingDocPath(null)} onTicketClick={(id) => { setKanbanOpen(true); void id; }} onTicketHover={(id, x, y) => { if (!id && hoverPinnedRef.current) return; if (id) lastHoverRef.current = { ticket: { id, x, y } }; setTicketHover(id ? { id, x, y } : null); }} />}
+        {activeView === 'activity' && <ActivityView />}
+        {activeView === 'ollama' && <OllamaChat />}
+        {activeView === 'graph' && (
+          <DependencyGraph
+            defaultProject={focusedTarget?.split(':')[0]}
+            onOpenCard={(id) => { setPendingOpenCardId(id); setGraphOpen(false); setKanbanOpen(true); }}
+            onConfirm={confirmViaDialog}
+          />
+        )}
         {activeView === 'settings' && (
           <SettingsView
             settings={settings}

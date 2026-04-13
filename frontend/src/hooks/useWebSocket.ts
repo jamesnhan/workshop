@@ -101,6 +101,10 @@ export function useWorkshopSocket() {
             onDispatchUpdateRef.current?.(msg.data.cardId, dispatchId, msg.data.status || '');
           } else if (msg.type === 'session_created' && msg.data?.target) {
             onSessionCreatedRef.current?.(msg.data.target, msg.data.background ?? true);
+          } else if (msg.type === 'activity' && msg.data) {
+            window.dispatchEvent(new CustomEvent('workshop-ws', { detail: msg }));
+          } else if (msg.type === 'approval_request' && msg.data) {
+            window.dispatchEvent(new CustomEvent('workshop-ws', { detail: msg }));
           } else if (msg.type === 'ui_command' && msg.data?.action) {
             onUICommandRef.current?.({
               id: typeof msg.data.id === 'string' ? msg.data.id : undefined,

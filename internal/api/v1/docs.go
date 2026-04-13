@@ -147,6 +147,100 @@ func (a *API) handleOpenDoc(w http.ResponseWriter, r *http.Request) {
 	a.jsonOK(w, map[string]string{"path": realPath})
 }
 
+func (a *API) handleSearchDocs(w http.ResponseWriter, r *http.Request) {
+	dir := r.URL.Query().Get("dir")
+	q := r.URL.Query().Get("q")
+	if q == "" {
+		a.jsonError(w, "q (search query) is required", http.StatusBadRequest)
+		return
+	}
+	if dir == "" {
+		dir = "."
+	}
+	if strings.HasPrefix(dir, "~/") {
+		home, _ := os.UserHomeDir()
+		dir = filepath.Join(home, dir[2:])
+	}
+
+	realDir, status, err := confineToHome(dir)
+	if err != nil {
+		switch status {
+		case http.StatusForbidden:
+			a.jsonError(w, "path not allowed", http.StatusForbidden)
+		case http.StatusBadRequest:
+			a.jsonError(w, "invalid dir", http.StatusBadRequest)
+		default:
+			a.jsonError(w, "cannot resolve path", http.StatusInternalServerError)
+		}
+		return
+	}
+	dir = realDir
+
+	qLower := strings.ToLower(q)
+	type searchResult struct {
+		Path    string `json:"path"`
+		Name    string `json:"name"`
+		Line    int    `json:"line"`
+		Context string `json:"context"`
+	}
+	var results []searchResult
+	const maxResults = 50
+
+	filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || len(results) >= maxResults {
+			return nil
+		}
+		if info.IsDir() {
+			name := info.Name()
+			if strings.HasPrefix(name, ".") || name == "node_modules" || name == "vendor" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(strings.ToLower(path), ".md") {
+			return nil
+		}
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+		lines := strings.Split(string(content), "\n")
+		relPath, _ := filepath.Rel(dir, path)
+
+		// Check filename match
+		if strings.Contains(strings.ToLower(relPath), qLower) {
+			ctx := relPath
+			if len(lines) > 0 {
+				ctx = strings.TrimSpace(lines[0])
+				if len(ctx) > 120 {
+					ctx = ctx[:120] + "..."
+				}
+			}
+			results = append(results, searchResult{Path: path, Name: relPath, Line: 1, Context: ctx})
+		}
+
+		// Check content matches
+		for i, line := range lines {
+			if len(results) >= maxResults {
+				break
+			}
+			if strings.Contains(strings.ToLower(line), qLower) {
+				ctx := strings.TrimSpace(line)
+				if len(ctx) > 120 {
+					ctx = ctx[:120] + "..."
+				}
+				results = append(results, searchResult{Path: path, Name: relPath, Line: i + 1, Context: ctx})
+			}
+		}
+		return nil
+	})
+
+	if results == nil {
+		results = []searchResult{}
+	}
+	a.jsonOK(w, results)
+}
+
 func (a *API) handleListMarkdown(w http.ResponseWriter, r *http.Request) {
 	dir := r.URL.Query().Get("dir")
 	if dir == "" {

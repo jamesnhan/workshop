@@ -10,9 +10,13 @@ import (
 	"time"
 
 	apiv1 "github.com/jamesnhan/workshop/internal/api/v1"
+	"github.com/jamesnhan/workshop/internal/config"
 	"github.com/jamesnhan/workshop/internal/consensus"
 	"github.com/jamesnhan/workshop/internal/db"
+	"github.com/jamesnhan/workshop/internal/ollama"
+	"github.com/jamesnhan/workshop/internal/telemetry"
 	"github.com/jamesnhan/workshop/internal/tmux"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
 // channelHubAdapter bridges server.ChannelHub to apiv1.ChannelHubAPI,
@@ -120,7 +124,25 @@ func New(logger *slog.Logger, frontendFS embed.FS) (*Server, error) {
 	uiHub := NewUICommandHub(statusStore)
 	channelHub := NewChannelHub(database, logger, NewSendTextDelivery(bridge), DeliveryAuto)
 	consensusEngine := consensus.NewEngine(bridge, database, logger)
+	approvalHub := NewApprovalHub(statusStore)
 	api := apiv1.New(logger, bridge, outputBuffer, database, consensusEngine, recorder, statusStore, &uiHubAdapter{hub: uiHub}, &channelHubAdapter{hub: channelHub})
+	api.SetApprovalHub(approvalHub)
+
+	// Auto-load Ollama endpoints from config at startup
+	if cfgPath := config.FindConfig(filepath.Join(os.Getenv("HOME"), ".config", "workshop")); cfgPath != "" {
+		engine := config.NewLuaEngine(bridge, logger)
+		if err := engine.RunFile(cfgPath); err != nil {
+			logger.Warn("failed to load startup config for ollama", "path", cfgPath, "err", err)
+		} else if len(engine.Result.OllamaEndpoints) > 0 {
+			eps := make([]ollama.Endpoint, len(engine.Result.OllamaEndpoints))
+			for i, e := range engine.Result.OllamaEndpoints {
+				eps[i] = ollama.Endpoint{Name: e.Name, URL: e.URL, Default: e.Default}
+			}
+			api.SetOllama(ollama.NewClient(eps))
+			logger.Info("ollama endpoints loaded from config", "count", len(eps), "path", cfgPath)
+		}
+		engine.Close()
+	}
 
 	mux.Handle("/api/v1/", http.StripPrefix("/api/v1", api.Routes()))
 	mux.HandleFunc("GET /ws", wsHandler(logger, bridge, outputBuffer, recorder, statusStore))
@@ -132,5 +154,12 @@ func New(logger *slog.Logger, frontendFS embed.FS) (*Server, error) {
 func (s *Server) ListenAndServe(addr string) error {
 	defer s.db.Close()
 	defer s.recorder.StopAll()
-	return http.ListenAndServe(addr, s.handler)
+
+	handler := http.Handler(s.handler)
+	// Wrap with otelhttp if telemetry is enabled — adds a span per HTTP
+	// request with method, route, status, and duration attributes.
+	if telemetry.Enabled() {
+		handler = otelhttp.NewHandler(handler, "workshop-http")
+	}
+	return http.ListenAndServe(addr, handler)
 }

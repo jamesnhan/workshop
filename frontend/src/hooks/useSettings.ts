@@ -9,6 +9,8 @@ export interface WorkshopSettings {
   previewSize: PreviewSize;
   ticketAutocomplete: boolean;
   terminalHashKey: boolean;
+  sfwMode: boolean;
+  nsfwProjects: string[];
 }
 
 const defaults: WorkshopSettings = {
@@ -16,6 +18,8 @@ const defaults: WorkshopSettings = {
   previewSize: 'medium',
   ticketAutocomplete: true,
   terminalHashKey: true,
+  sfwMode: false,
+  nsfwProjects: ['goonwall', 'fansly', 'lewd-lens'],
 };
 
 function load(): WorkshopSettings {

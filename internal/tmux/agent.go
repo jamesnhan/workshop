@@ -270,6 +270,13 @@ func handleTrustPrompt(b *ExecBridge, target, output, provider string) bool {
 			return true
 		}
 	default: // claude
+		// Bypass Permissions confirmation: default is "No, exit" — arrow down to "Yes" first
+		if strings.Contains(output, "Bypass Permissions mode") && strings.Contains(output, "No, exit") {
+			b.run("send-keys", "-t", target, "Down")
+			time.Sleep(300 * time.Millisecond)
+			b.run("send-keys", "-t", target, "Enter")
+			return true
+		}
 		if strings.Contains(output, "Enter to confirm") {
 			b.run("send-keys", "-t", target, "Enter")
 			return true

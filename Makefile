@@ -1,6 +1,7 @@
-.PHONY: build dev clean frontend backend install
+.PHONY: build dev clean frontend backend install test test-unit test-integration test-race test-cover test-frontend install-hooks
 
 PREFIX ?= $(HOME)/.local
+COVERAGE_DIR := coverage
 
 build: frontend backend
 	@echo "Built: bin/workshop"
@@ -22,4 +23,39 @@ dev:
 	@echo "Run both in separate terminals, or use tmux."
 
 clean:
-	rm -rf bin/ frontend/dist frontend/node_modules
+	rm -rf bin/ frontend/dist frontend/node_modules $(COVERAGE_DIR)
+
+# --- Tests ---
+
+# Default test target: fast unit tests only (no -race, no integration).
+test: test-unit
+
+# Unit tests: everything not tagged `integration`.
+test-unit:
+	go test ./ ./internal/...
+
+# Integration tests: anything tagged `integration`. Slower, may touch tmux,
+# the filesystem, or an in-process HTTP server.
+test-integration:
+	go test -tags=integration ./ ./internal/...
+
+# Race detector over the full tree. Used in CI.
+test-race:
+	go test -race ./ ./internal/...
+
+# Coverage report. Writes to coverage/backend.out and generates HTML.
+test-cover:
+	@mkdir -p $(COVERAGE_DIR)
+	go test -coverprofile=$(COVERAGE_DIR)/backend.out ./ ./internal/...
+	go tool cover -html=$(COVERAGE_DIR)/backend.out -o $(COVERAGE_DIR)/backend.html
+	@echo "Coverage report: $(COVERAGE_DIR)/backend.html"
+
+# Frontend tests (delegates to Vitest — wired up in #477).
+test-frontend:
+	cd frontend && npm test
+
+# Install the checked-in git hooks (pre-push runs fast tests). Run once
+# after cloning. Use `git push --no-verify` to bypass in emergencies.
+install-hooks:
+	git config core.hooksPath .githooks
+	@echo "Hooks installed. Pre-push will now run 'make test-unit' and 'make test-frontend'."

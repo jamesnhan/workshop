@@ -23,7 +23,12 @@ interface Props {
   onCloseTab: (cellId: string, target: string) => void;
   onTicketHover?: (cardId: number | null, x: number, y: number) => void;
   onTicketClick?: (cardId: number) => void;
+  onUrlHover?: (url: string | null, x: number, y: number) => void;
+  onCommitHover?: (sha: string | null, x: number, y: number) => void;
   onHashKey?: () => void;
+  agentTargets?: Set<string>;  // pane targets running agent commands (claude/gemini/codex) — # only intercepted for these
+  sfwMode?: boolean;
+  nsfwProjects?: string[];
 }
 
 const STATUS_COLORS: Record<string, string> = {
@@ -40,7 +45,8 @@ const STATUS_TO_CHIBI: Record<string, ChibiState> = {
 
 export function PaneGrid({
   layout, viewerRefs, theme, unreadCells, paneStatuses, onInput, onResize,
-  onFocusCell, onAssignPane, onSwitchTab, onCloseTab, onTicketHover, onTicketClick, onHashKey,
+  onFocusCell, onAssignPane, onSwitchTab, onCloseTab, onTicketHover, onTicketClick, onUrlHover, onCommitHover, onHashKey,
+  agentTargets, sfwMode = false, nsfwProjects = [],
 }: Props) {
   const { gridRows, gridCols, cells, focusedId, maximizedId } = layout;
 
@@ -52,6 +58,9 @@ export function PaneGrid({
   };
 
   const visibleCells = maximizedId ? cells.filter((c) => c.id === maximizedId) : cells;
+  const nsfwSet = new Set(nsfwProjects.map((p) => p.toLowerCase()));
+  const isCellHidden = (target: string | null | undefined) =>
+    sfwMode && target && nsfwSet.has(target.split(':')[0].toLowerCase());
 
   return (
     <div className="pane-grid" style={gridStyle}>
@@ -60,6 +69,14 @@ export function PaneGrid({
           gridRow: `${cell.row + 1} / span ${cell.rowSpan}`,
           gridColumn: `${cell.col + 1} / span ${cell.colSpan}`,
         };
+
+        if (isCellHidden(cell.target)) {
+          return (
+            <div key={cell.id} className="pane-cell" style={cellStyle} onClick={() => onFocusCell(cell.id)}>
+              <div className="pane-empty"><p>Empty</p><p className="muted">Click or Ctrl+P</p></div>
+            </div>
+          );
+        }
 
         const cellStatus = cell.target ? paneStatuses[cell.target] : undefined;
 
@@ -124,7 +141,9 @@ export function PaneGrid({
                 onResize={(cols, rows) => onResize(cell.target!, cols, rows)}
                 onTicketHover={onTicketHover}
                 onTicketClick={onTicketClick}
-                onHashKey={cell.id === focusedId ? onHashKey : undefined}
+                onUrlHover={onUrlHover}
+                onCommitHover={onCommitHover}
+                onHashKey={cell.id === focusedId && cell.target && agentTargets?.has(cell.target) ? onHashKey : undefined}
               />
             ) : (
               <div className="pane-empty" onClick={() => onAssignPane(cell.id)}>

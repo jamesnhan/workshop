@@ -7,6 +7,7 @@ import (
 
 	"github.com/jamesnhan/workshop/internal/consensus"
 	"github.com/jamesnhan/workshop/internal/db"
+	"github.com/jamesnhan/workshop/internal/ollama"
 	"github.com/jamesnhan/workshop/internal/tmux"
 )
 
@@ -69,6 +70,12 @@ type UIResponse struct {
 	Cancelled bool `json:"cancelled,omitempty"`
 }
 
+// ApprovalHubAPI is the subset of the approval hub the REST layer needs.
+type ApprovalHubAPI interface {
+	WaitForDecision(approvalID int64, payload map[string]any, timeout time.Duration) string
+	Resolve(approvalID int64, decision string) bool
+}
+
 type API struct {
 	logger    *slog.Logger
 	tmux      tmux.Bridge
@@ -79,10 +86,22 @@ type API struct {
 	status    StatusManager
 	ui        UIHub
 	channels  ChannelHubAPI
+	ollama    *ollama.Client
+	approvals ApprovalHubAPI
 }
 
 func New(logger *slog.Logger, bridge tmux.Bridge, searcher OutputSearcher, database *db.DB, consensusEngine *consensus.Engine, recorder Recorder, status StatusManager, ui UIHub, channels ChannelHubAPI) *API {
 	return &API{logger: logger, tmux: bridge, searcher: searcher, db: database, consensus: consensusEngine, recorder: recorder, status: status, ui: ui, channels: channels}
+}
+
+// SetOllama configures the Ollama client for local model integration.
+func (a *API) SetOllama(c *ollama.Client) {
+	a.ollama = c
+}
+
+// SetApprovalHub configures the approval hub for blocking approval requests.
+func (a *API) SetApprovalHub(hub ApprovalHubAPI) {
+	a.approvals = hub
 }
 
 func (a *API) Routes() http.Handler {
@@ -114,10 +133,33 @@ func (a *API) Routes() http.Handler {
 	mux.HandleFunc("GET /projects", a.handleListProjects)
 	mux.HandleFunc("GET /cards/{id}/notes", a.handleListNotes)
 	mux.HandleFunc("POST /cards/{id}/notes", a.handleAddNote)
+	mux.HandleFunc("GET /cards/{id}/messages", a.handleListMessages)
+	mux.HandleFunc("POST /cards/{id}/messages", a.handleAddMessage)
 	mux.HandleFunc("GET /cards/{id}/log", a.handleListCardLog)
 	mux.HandleFunc("GET /cards/log", a.handleListProjectLog)
 	mux.HandleFunc("GET /cards/{id}/dispatches", a.handleListDispatches)
 	mux.HandleFunc("GET /dispatches/active", a.handleListActiveDispatches)
+	mux.HandleFunc("GET /card-dependencies", a.handleListDependencies)
+	mux.HandleFunc("POST /cards/{id}/blocks", a.handleAddDependency)
+	mux.HandleFunc("DELETE /cards/{id}/blocks/{blockerId}", a.handleRemoveDependency)
+
+	// Workflows
+	mux.HandleFunc("GET /workflows", a.handleGetWorkflow)
+	mux.HandleFunc("PUT /workflows", a.handleSetWorkflow)
+
+	// Activity log
+	mux.HandleFunc("POST /activity", a.handleRecordActivity)
+	mux.HandleFunc("GET /activity", a.handleListActivity)
+
+	// Approvals
+	mux.HandleFunc("POST /approvals", a.handleRequestApproval)
+	mux.HandleFunc("GET /approvals", a.handleListApprovals)
+	mux.HandleFunc("POST /approvals/{id}/resolve", a.handleResolveApproval)
+
+	// Agent presets
+	mux.HandleFunc("GET /agent-presets", a.handleListPresets)
+	mux.HandleFunc("PUT /agent-presets", a.handleUpsertPreset)
+	mux.HandleFunc("DELETE /agent-presets/{name}", a.handleDeletePreset)
 
 	// Recordings
 	mux.HandleFunc("GET /recordings", a.handleListRecordings)
@@ -153,11 +195,28 @@ func (a *API) Routes() http.Handler {
 
 	// Git
 	mux.HandleFunc("GET /git/info", a.handleGitInfo)
+	mux.HandleFunc("GET /git/commit", a.handleGitCommit)
 
 	// Docs
 	mux.HandleFunc("GET /docs/read", a.handleReadFile)
 	mux.HandleFunc("GET /docs/list", a.handleListMarkdown)
+	mux.HandleFunc("GET /docs/search", a.handleSearchDocs)
 	mux.HandleFunc("POST /docs/open", a.handleOpenDoc)
+
+	// Ollama (local LLM)
+	mux.HandleFunc("GET /ollama/models", a.handleOllamaModels)
+	mux.HandleFunc("GET /ollama/health", a.handleOllamaHealth)
+	mux.HandleFunc("POST /ollama/chat", a.handleOllamaChat)
+	mux.HandleFunc("POST /ollama/generate", a.handleOllamaGenerate)
+
+	// Usage tracking
+	mux.HandleFunc("POST /usage", a.handleRecordUsage)
+	mux.HandleFunc("GET /usage", a.handleListUsage)
+	mux.HandleFunc("GET /usage/aggregate", a.handleAggregateUsage)
+	mux.HandleFunc("GET /usage/daily-spend", a.handleDailySpend)
+
+	// Link preview
+	mux.HandleFunc("GET /link-preview", a.handleLinkPreview)
 
 	// Config
 	mux.HandleFunc("POST /config/load", a.handleLoadConfig)

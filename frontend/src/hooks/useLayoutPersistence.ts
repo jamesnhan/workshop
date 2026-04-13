@@ -116,6 +116,28 @@ export function listWorkspaces(): string[] {
   return names.sort();
 }
 
+// Fingerprint of the structural parts of a SavedLayout for dirty-checking.
+// Excludes focusedIdx because moving the focus cursor is transient UI state,
+// not a workspace edit.
+function layoutFingerprint(saved: SavedLayout): string {
+  const { gridRows, gridCols, cells } = saved;
+  return JSON.stringify({ gridRows, gridCols, cells });
+}
+
+// Compare the live layout against the saved snapshot for a workspace.
+// Returns true if they differ (i.e. the workspace has unsaved changes).
+export function isWorkspaceDirty(name: string | null, layout: LayoutState): boolean {
+  if (!name) return false;
+  const raw = localStorage.getItem(WORKSPACE_PREFIX + name);
+  if (!raw) return false;
+  try {
+    const saved = JSON.parse(raw) as SavedLayout;
+    return layoutFingerprint(saved) !== layoutFingerprint(layoutToSaved(layout));
+  } catch {
+    return false;
+  }
+}
+
 export function getActiveWorkspaceName(): string | null {
   try { return localStorage.getItem(ACTIVE_WORKSPACE_KEY); } catch { return null; }
 }

@@ -4,13 +4,15 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/jamesnhan/workshop/internal/db"
 )
 
 func (a *API) handleListCards(w http.ResponseWriter, r *http.Request) {
 	project := r.URL.Query().Get("project")
-	cards, err := a.db.ListCards(project)
+	includeArchived := r.URL.Query().Get("include_archived") == "true"
+	cards, err := a.db.ListCards(project, includeArchived)
 	if err != nil {
 		a.serverErr(w, "operation failed", err)
 		return
@@ -93,6 +95,10 @@ func (a *API) handleMoveCard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := a.db.MoveCard(id, req.Column, req.Position); err != nil {
+		if strings.Contains(err.Error(), "not allowed") || strings.Contains(err.Error(), "unknown source column") {
+			a.jsonError(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 		a.serverErr(w, "operation failed", err)
 		return
 	}
@@ -189,6 +195,105 @@ func (a *API) handleAddNote(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(http.StatusCreated)
 	a.jsonOK(w, note)
+}
+
+// --- Messages ---
+
+func (a *API) handleListMessages(w http.ResponseWriter, r *http.Request) {
+	idStr := r.PathValue("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		a.jsonError(w, "invalid id", http.StatusBadRequest)
+		return
+	}
+	msgs, err := a.db.ListMessages(id)
+	if err != nil {
+		a.serverErr(w, "list messages", err)
+		return
+	}
+	if msgs == nil {
+		msgs = []db.CardMessage{}
+	}
+	a.jsonOK(w, msgs)
+}
+
+func (a *API) handleAddMessage(w http.ResponseWriter, r *http.Request) {
+	idStr := r.PathValue("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		a.jsonError(w, "invalid id", http.StatusBadRequest)
+		return
+	}
+	var req struct {
+		Author string `json:"author"`
+		Text   string `json:"text"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Text == "" {
+		a.jsonError(w, "text is required", http.StatusBadRequest)
+		return
+	}
+	msg, err := a.db.AddMessage(id, req.Author, req.Text)
+	if err != nil {
+		a.serverErr(w, "add message", err)
+		return
+	}
+	w.WriteHeader(http.StatusCreated)
+	a.jsonOK(w, msg)
+}
+
+// --- Dependencies ---
+
+func (a *API) handleListDependencies(w http.ResponseWriter, r *http.Request) {
+	project := r.URL.Query().Get("project")
+	deps, err := a.db.ListDependencies(project)
+	if err != nil {
+		a.serverErr(w, "list dependencies", err)
+		return
+	}
+	if deps == nil {
+		deps = []db.CardDependency{}
+	}
+	a.jsonOK(w, deps)
+}
+
+func (a *API) handleAddDependency(w http.ResponseWriter, r *http.Request) {
+	idStr := r.PathValue("id")
+	blockedID, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		a.jsonError(w, "invalid id", http.StatusBadRequest)
+		return
+	}
+	var req struct {
+		BlockerID int64 `json:"blockerId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.BlockerID == 0 {
+		a.jsonError(w, "blockerId is required", http.StatusBadRequest)
+		return
+	}
+	if err := a.db.AddDependency(req.BlockerID, blockedID); err != nil {
+		a.jsonError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	w.WriteHeader(http.StatusCreated)
+	a.jsonOK(w, map[string]any{"blockerId": req.BlockerID, "blockedId": blockedID})
+}
+
+func (a *API) handleRemoveDependency(w http.ResponseWriter, r *http.Request) {
+	blockedID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		a.jsonError(w, "invalid id", http.StatusBadRequest)
+		return
+	}
+	blockerID, err := strconv.ParseInt(r.PathValue("blockerId"), 10, 64)
+	if err != nil {
+		a.jsonError(w, "invalid blockerId", http.StatusBadRequest)
+		return
+	}
+	if err := a.db.RemoveDependency(blockerID, blockedID); err != nil {
+		a.serverErr(w, "remove dependency", err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (a *API) handleListProjects(w http.ResponseWriter, r *http.Request) {

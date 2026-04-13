@@ -1,0 +1,82 @@
+.dep-graph {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  background: #0b1220;
+  color: #e2e8f0;
+}
+
+.dep-graph-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid #1e293b;
+  font-size: 0.85rem;
+  flex-wrap: wrap;
+}
+
+.dep-graph-toolbar select {
+  background: #0f172a;
+  color: #e2e8f0;
+  border: 1px solid #334155;
+  border-radius: 4px;
+  padding: 0.2rem 0.4rem;
+}
+
+.dep-graph-hint {
+  color: #64748b;
+  font-size: 0.75rem;
+}
+
+.dep-graph-error {
+  color: #f87171;
+  font-size: 0.8rem;
+}
+
+.dep-graph-canvas {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+}
+
+/* React Flow node body */
+.dep-node-body {
+  padding: 0.5rem 0.6rem;
+  border-left: 3px solid transparent;
+  border-radius: 6px;
+}
+
+.dep-node-title {
+  font-size: 0.8rem;
+  font-weight: 500;
+  line-height: 1.25;
+  margin-bottom: 0.3rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+.dep-node-meta {
+  display: flex;
+  gap: 0.35rem;
+  align-items: center;
+  font-size: 0.65rem;
+}
+
+.dep-node-pill {
+  padding: 0.05rem 0.35rem;
+  border-radius: 8px;
+  color: #0b1220;
+  font-weight: 600;
+  text-transform: lowercase;
+}
+
+.dep-node-priority {
+  color: #94a3b8;
+  font-weight: 600;
+}

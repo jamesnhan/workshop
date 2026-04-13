@@ -28,27 +28,27 @@ make install            # install to ~/.local/bin/workshop
 
 ## Repository Sync
 
-**IMPORTANT:** This repo (workshop) is a sanitized downstream of `github.com/jamesnhan/yuna`.
+**IMPORTANT:** This repo (workshop) is a sanitized downstream of `github.com/jamesnhan/workshop`.
 
-- **yuna** — Personal version (unsanitized, AUTHORITATIVE SOURCE, MUST NOT BREAK)
-- **workshop** — Work version (sanitized, no personal data, downstream of yuna)
+- **workshop** — Personal version (unsanitized, AUTHORITATIVE SOURCE, MUST NOT BREAK)
+- **workshop** — Work version (sanitized, no personal data, downstream of workshop)
 
 ### Sync Workflow (Claude Handles Git 99.99% of Time)
 
-**Pull features from yuna (common):**
+**Pull features from workshop (common):**
 ```bash
-git fetch yuna
-git merge yuna/main -m "Merge features from yuna"
+git fetch workshop
+git merge workshop/main -m "Merge features from workshop"
 # Sanitize any personal references
-# Fix any yuna→workshop naming
+# Fix any workshop→workshop naming
 git push origin main
 ```
 
-**Push features to yuna (NEVER BREAK YUNA!):**
+**Push features to workshop (NEVER BREAK WORKSHOP!):**
 ```bash
 # RARE: Only push well-tested, non-breaking features
-# REVIEW: Ensure it won't break yuna
-git push yuna main
+# REVIEW: Ensure it won't break workshop
+git push workshop main
 ```
 
 **What gets synced:**
@@ -57,6 +57,6 @@ git push yuna main
 - ❌ Personal session names/data
 - ❌ Personal project references
 
-**Key principle:** Features should be in parity, but yuna is authoritative and must never be broken by workshop changes.
+**Key principle:** Features should be in parity, but workshop is authoritative and must never be broken by workshop changes.
 
 See SYNC.md for complete workflow documentation.

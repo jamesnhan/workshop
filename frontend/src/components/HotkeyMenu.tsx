@@ -41,8 +41,9 @@ const sections = [
       [`${mod} + Shift + F`, 'Search pane output'],
       [`${mod} + Shift + K`, 'Kanban board'],
       [`${mod} + Shift + D`, 'Agent dashboard'],
+      ['z', 'Pin / unpin hover preview (for screenshots)'],
       ['?', 'This hotkey menu'],
-      ['Escape', 'Close any panel'],
+      ['Escape', 'Close any panel or unpin hover'],
     ],
   },
   {

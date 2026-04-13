@@ -34,17 +34,20 @@ func (a *API) handleGitInfo(w http.ResponseWriter, r *http.Request) {
 
 	info := GitInfo{}
 
-	// Branch
+	// Branch — if not a git repo, return empty info (not 404)
 	out, err := runGit(dir, "rev-parse", "--abbrev-ref", "HEAD")
 	if err != nil {
-		a.jsonError(w, "not a git repo", http.StatusNotFound)
+		a.jsonOK(w, nil)
 		return
 	}
 	info.Branch = out
 
-	// Repo name from remote URL (e.g. git@github.com:user/workshop.git → workshop)
-	remoteURL, _ := runGit(dir, "remote", "get-url", "origin")
-	if remoteURL != "" {
+	// Repo name from remote URL (e.g. git@github.com:user/workshop.git → workshop).
+	// Ignore the output entirely if git returned an error — CombinedOutput
+	// mixes in stderr, so on missing remote we'd otherwise try to parse
+	// "No such remote 'origin'" as a URL.
+	remoteURL, remoteErr := runGit(dir, "remote", "get-url", "origin")
+	if remoteErr == nil && remoteURL != "" {
 		name := remoteURL
 		// Strip .git suffix
 		name = strings.TrimSuffix(name, ".git")

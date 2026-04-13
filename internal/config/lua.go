@@ -21,12 +21,19 @@ type LuaEngine struct {
 
 // ConfigResult holds the config values set by Lua scripts.
 type ConfigResult struct {
-	Theme      string            `json:"theme,omitempty"`
-	GridRows   int               `json:"gridRows,omitempty"`
-	GridCols   int               `json:"gridCols,omitempty"`
-	Sessions   []SessionConfig   `json:"sessions,omitempty"`
-	Agents     []AgentPreset     `json:"agents,omitempty"`
-	OnStartup  []string          `json:"onStartup,omitempty"` // commands to run on startup
+	Theme            string             `json:"theme,omitempty"`
+	GridRows         int                `json:"gridRows,omitempty"`
+	GridCols         int                `json:"gridCols,omitempty"`
+	Sessions         []SessionConfig    `json:"sessions,omitempty"`
+	Agents           []AgentPreset      `json:"agents,omitempty"`
+	OnStartup        []string           `json:"onStartup,omitempty"` // commands to run on startup
+	OllamaEndpoints  []OllamaEndpoint   `json:"ollamaEndpoints,omitempty"`
+}
+
+type OllamaEndpoint struct {
+	Name    string `json:"name"`
+	URL     string `json:"url"`
+	Default bool   `json:"default,omitempty"`
 }
 
 type SessionConfig struct {
@@ -36,11 +43,13 @@ type SessionConfig struct {
 }
 
 type AgentPreset struct {
-	Name      string `json:"name"`
-	Provider  string `json:"provider,omitempty"` // claude, gemini, codex
-	Model     string `json:"model,omitempty"`
-	Prompt    string `json:"prompt,omitempty"`
-	Directory string `json:"directory,omitempty"`
+	Name         string `json:"name"`
+	Description  string `json:"description,omitempty"`  // human-readable purpose
+	Provider     string `json:"provider,omitempty"`     // claude, gemini, codex
+	Model        string `json:"model,omitempty"`
+	Prompt       string `json:"prompt,omitempty"`       // initial prompt typed into the agent
+	SystemPrompt string `json:"systemPrompt,omitempty"` // role/persona instructions prepended to the prompt
+	Directory    string `json:"directory,omitempty"`
 }
 
 func NewLuaEngine(bridge tmux.Bridge, logger *slog.Logger) *LuaEngine {
@@ -125,12 +134,16 @@ func (e *LuaEngine) registerAPI() {
 			switch key.String() {
 			case "name":
 				preset.Name = val.String()
+			case "description":
+				preset.Description = val.String()
 			case "provider":
 				preset.Provider = val.String()
 			case "model":
 				preset.Model = val.String()
 			case "prompt":
 				preset.Prompt = val.String()
+			case "system_prompt":
+				preset.SystemPrompt = val.String()
 			case "directory":
 				preset.Directory = val.String()
 			}
@@ -139,6 +152,34 @@ func (e *LuaEngine) registerAPI() {
 			preset.Name = fmt.Sprintf("agent-%d", len(e.Result.Agents)+1)
 		}
 		e.Result.Agents = append(e.Result.Agents, preset)
+		return 0
+	}))
+
+	// workshop.ollama(config_table)
+	// workshop.ollama({ name = "4090", url = "http://127.0.0.1:11434", default = true })
+	mod.RawSetString("ollama", e.L.NewFunction(func(L *lua.LState) int {
+		tbl := L.CheckTable(1)
+		ep := OllamaEndpoint{}
+		tbl.ForEach(func(key, val lua.LValue) {
+			switch key.String() {
+			case "name":
+				ep.Name = val.String()
+			case "url":
+				ep.URL = val.String()
+			case "default":
+				if bv, ok := val.(lua.LBool); ok {
+					ep.Default = bool(bv)
+				}
+			}
+		})
+		if ep.URL == "" {
+			L.ArgError(1, "url is required")
+			return 0
+		}
+		if ep.Name == "" {
+			ep.Name = fmt.Sprintf("ollama-%d", len(e.Result.OllamaEndpoints)+1)
+		}
+		e.Result.OllamaEndpoints = append(e.Result.OllamaEndpoints, ep)
 		return 0
 	}))
 

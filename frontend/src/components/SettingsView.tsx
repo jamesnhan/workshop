@@ -132,6 +132,38 @@ export function SettingsView({ settings, onUpdate, themeName, onThemeChange, not
       </div>
 
       <div className="settings-section">
+        <div className="settings-section-title">SFW Mode</div>
+
+        <label className="settings-toggle">
+          <input
+            type="checkbox"
+            checked={settings.sfwMode}
+            onChange={(e) => onUpdate({ sfwMode: e.target.checked })}
+          />
+          <div className="settings-toggle-info">
+            <span className="settings-toggle-label">Hide NSFW projects</span>
+            <span className="settings-toggle-desc">
+              Hide marked projects from the kanban board, project dropdowns, and card lists. Great for screenshots and demos.
+            </span>
+          </div>
+        </label>
+
+        <div className="settings-field" style={{ marginTop: '0.5rem' }}>
+          <span className="settings-field-label">Hidden projects</span>
+          <span className="settings-toggle-desc" style={{ marginBottom: '0.4rem' }}>
+            Comma-separated list of project names to hide when SFW mode is on.
+          </span>
+          <input
+            type="text"
+            className="settings-select"
+            value={settings.nsfwProjects.join(', ')}
+            onChange={(e) => onUpdate({ nsfwProjects: e.target.value.split(',').map((s) => s.trim()).filter(Boolean) })}
+            placeholder="goonwall, fansly, lewd-lens"
+          />
+        </div>
+      </div>
+
+      <div className="settings-section">
         <div className="settings-section-title">Notifications</div>
 
         <div className="settings-field">

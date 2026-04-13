@@ -1,6 +1,7 @@
 package consensus
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -8,7 +9,10 @@ import (
 	"time"
 
 	"github.com/jamesnhan/workshop/internal/db"
+	"github.com/jamesnhan/workshop/internal/telemetry"
 	"github.com/jamesnhan/workshop/internal/tmux"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 )
 
 // AgentSpec defines one agent in a consensus run.
@@ -67,10 +71,20 @@ func NewEngine(bridge tmux.Bridge, database *db.DB, logger *slog.Logger) *Engine
 
 // StartRun kicks off a consensus run in the background.
 func (e *Engine) StartRun(req ConsensusRequest) (*ConsensusResult, error) {
+	_, span := telemetry.Tracer("consensus").Start(context.Background(), "consensus.StartRun",
+		telemetry.Attrs(
+			attribute.Int("workshop.consensus.agent_count", len(req.Agents)),
+			attribute.Int("workshop.consensus.timeout", req.Timeout),
+		),
+	)
+	defer span.End()
+
 	if len(req.Agents) == 0 {
+		span.SetStatus(codes.Error, "no agents")
 		return nil, fmt.Errorf("at least one agent is required")
 	}
 	if req.Prompt == "" {
+		span.SetStatus(codes.Error, "no prompt")
 		return nil, fmt.Errorf("prompt is required")
 	}
 	if req.Timeout <= 0 {
@@ -83,6 +97,11 @@ func (e *Engine) StartRun(req ConsensusRequest) (*ConsensusResult, error) {
 		Prompt: req.Prompt,
 		Status: "running",
 	}
+
+	span.SetAttributes(attribute.String("workshop.consensus.run_id", id))
+	telemetry.ConsensusRunsTotal.Add(context.Background(), 1,
+		telemetry.MetricAttrs(attribute.String("status", "started")),
+	)
 
 	e.mu.Lock()
 	e.runs[id] = result
@@ -161,8 +180,17 @@ func (e *Engine) runConsensus(id string, req ConsensusRequest) {
 			Prompt:    req.Prompt,
 		}
 
+		telemetry.AgentLaunchesTotal.Add(context.Background(), 1,
+			telemetry.MetricAttrs(
+				attribute.String("provider", provider),
+				attribute.String("model", spec.Model),
+			),
+		)
+		telemetry.ConsensusAgentsActive.Add(context.Background(), 1)
+
 		result, err := e.bridge.LaunchAgent(cfg)
 		if err != nil {
+			telemetry.ConsensusAgentsActive.Add(context.Background(), -1)
 			e.logger.Warn("consensus: agent launch failed", "name", spec.Name, "err", err)
 			outputs = append(outputs, AgentOutput{
 				Name:     spec.Name,

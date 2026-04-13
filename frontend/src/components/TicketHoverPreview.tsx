@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { get } from '../api/client';
+import { HoverPreview } from './HoverPreview';
 
 interface Card {
   id: number;
@@ -39,6 +40,13 @@ const columnLabels: Record<string, string> = {
   done: 'Done',
 };
 
+const columnColors: Record<string, string> = {
+  backlog: 'var(--text-muted)',
+  in_progress: 'var(--accent)',
+  review: '#f59e0b',
+  done: 'var(--success)',
+};
+
 // Cache so we don't refetch on every hover
 const cardCache = new Map<number, Card | null>();
 
@@ -65,26 +73,22 @@ export function TicketHoverPreview({ cardId, x, y }: Props) {
 
   if (card === undefined) {
     return (
-      <div className="ticket-hover-preview" style={{ top: y + 20, left: x }}>
+      <HoverPreview x={x} y={y} className="ticket-hover-preview">
         <div className="ticket-hover-loading">Loading #{cardId}…</div>
-      </div>
+      </HoverPreview>
     );
   }
 
   if (card === null) {
     return (
-      <div className="ticket-hover-preview" style={{ top: y + 20, left: x }}>
+      <HoverPreview x={x} y={y} className="ticket-hover-preview">
         <div className="ticket-hover-empty">#{cardId} not found</div>
-      </div>
+      </HoverPreview>
     );
   }
 
-  // Constrain so it doesn't go off-screen
-  const top = Math.min(y + 20, window.innerHeight - 280);
-  const left = Math.min(x, window.innerWidth - 360);
-
   return (
-    <div className="ticket-hover-preview" style={{ top, left }}>
+    <HoverPreview x={x} y={y} className="ticket-hover-preview">
       <div className="ticket-hover-header">
         <span className="ticket-hover-id">#{card.id}</span>
         {card.cardType && (
@@ -97,7 +101,10 @@ export function TicketHoverPreview({ cardId, x, y }: Props) {
             {card.priority}
           </span>
         )}
-        <span className="ticket-hover-status">{columnLabels[card.column] || card.column}</span>
+        <span className="ticket-hover-status" style={{
+          background: `color-mix(in srgb, ${columnColors[card.column] || 'var(--text-muted)'} 20%, transparent)`,
+          color: columnColors[card.column] || 'var(--text-muted)',
+        }}>{columnLabels[card.column] || card.column}</span>
       </div>
       <div className="ticket-hover-title">{card.title}</div>
       {card.description && (
@@ -110,6 +117,6 @@ export function TicketHoverPreview({ cardId, x, y }: Props) {
           <span className="ticket-hover-project">{card.project}</span>
         </div>
       )}
-    </div>
+    </HoverPreview>
   );
 }

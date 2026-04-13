@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	"github.com/jamesnhan/workshop/internal/config"
+	"github.com/jamesnhan/workshop/internal/ollama"
 )
 
 func (a *API) handleLoadConfig(w http.ResponseWriter, r *http.Request) {
@@ -33,6 +34,16 @@ func (a *API) handleLoadConfig(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		a.jsonError(w, "config error", http.StatusBadRequest)
 		return
+	}
+
+	// Wire up Ollama endpoints if configured
+	if len(engine.Result.OllamaEndpoints) > 0 {
+		eps := make([]ollama.Endpoint, len(engine.Result.OllamaEndpoints))
+		for i, e := range engine.Result.OllamaEndpoints {
+			eps[i] = ollama.Endpoint{Name: e.Name, URL: e.URL, Default: e.Default}
+		}
+		a.ollama = ollama.NewClient(eps)
+		a.logger.Info("ollama endpoints configured", "count", len(eps))
 	}
 
 	a.jsonOK(w, engine.Result)

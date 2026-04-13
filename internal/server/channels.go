@@ -1,12 +1,16 @@
 package server
 
 import (
+	"context"
 	"log/slog"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/jamesnhan/workshop/internal/db"
+	"github.com/jamesnhan/workshop/internal/telemetry"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 )
 
 // ChannelHub is a pubsub broker for inter-pane (inter-agent) messaging.
@@ -139,9 +143,20 @@ func (h *ChannelHub) SetDelivery(d Delivery, mode DeliveryMode) {
 // channel. Returns the stored message (with ID + timestamp) and the list
 // of target panes that were notified.
 func (h *ChannelHub) Publish(channel, from, body, project string) (*db.ChannelMessageRecord, []string, error) {
+	_, span := telemetry.Tracer("channels").Start(context.Background(), "channel.publish",
+		telemetry.Attrs(
+			attribute.String("workshop.channel.name", channel),
+			attribute.String("workshop.channel.project", project),
+			attribute.String("workshop.channel.from", from),
+			attribute.Int("workshop.channel.body_len", len(body)),
+		),
+	)
+	defer span.End()
+
 	channel = strings.TrimSpace(channel)
 	body = strings.TrimSpace(body)
 	if channel == "" || body == "" {
+		span.SetStatus(codes.Error, "empty channel or body")
 		return nil, nil, ErrEmptyChannelOrBody
 	}
 
@@ -211,10 +226,29 @@ func (h *ChannelHub) Publish(channel, from, body, project string) (*db.ChannelMe
 
 		if err := compat.Deliver(target, msg); err != nil {
 			h.logger.Warn("channel delivery failed", "target", target, "channel", channel, "err", err)
+			telemetry.ChannelDeliveryFailuresTotal.Add(context.Background(), 1,
+				telemetry.MetricAttrs(
+					attribute.String("channel", channel),
+					attribute.String("mode", "compat"),
+				),
+			)
 			continue
 		}
 		delivered = append(delivered, target)
 	}
+	span.SetAttributes(
+		attribute.Int("workshop.channel.subscribers", len(subs)),
+		attribute.Int("workshop.channel.delivered", len(delivered)),
+	)
+
+	// Metrics
+	telemetry.ChannelPublishesTotal.Add(context.Background(), 1,
+		telemetry.MetricAttrs(
+			attribute.String("channel", channel),
+			attribute.String("project", project),
+			attribute.String("mode", string(mode)),
+		),
+	)
 	return stored, delivered, nil
 }
 
@@ -226,12 +260,24 @@ func (h *ChannelHub) Subscribe(channel, target, project string) error {
 	if channel == "" || target == "" {
 		return ErrEmptyChannelOrTarget
 	}
-	return h.db.CreateChannelSubscription(channel, target, project)
+	if err := h.db.CreateChannelSubscription(channel, target, project); err != nil {
+		return err
+	}
+	telemetry.ChannelSubscribersGauge.Add(context.Background(), 1,
+		telemetry.MetricAttrs(attribute.String("channel", channel)),
+	)
+	return nil
 }
 
 // Unsubscribe removes a pane from a channel.
 func (h *ChannelHub) Unsubscribe(channel, target string) error {
-	return h.db.DeleteChannelSubscription(channel, target)
+	if err := h.db.DeleteChannelSubscription(channel, target); err != nil {
+		return err
+	}
+	telemetry.ChannelSubscribersGauge.Add(context.Background(), -1,
+		telemetry.MetricAttrs(attribute.String("channel", channel)),
+	)
+	return nil
 }
 
 // ListChannels returns all channels that currently have at least one

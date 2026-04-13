@@ -3,6 +3,7 @@ import { get, post, del, patch } from '../api/client';
 import AnsiToHtml from 'ansi-to-html';
 import DOMPurify from 'dompurify';
 import { ConfirmDialog, type DialogKind } from './ConfirmDialog';
+import { GitInfoHoverPreview } from './GitInfoHoverPreview';
 
 interface Session {
   name: string;
@@ -33,6 +34,12 @@ interface GitInfo {
   recentLogs: string[];
 }
 
+interface GitHoverState {
+  sessionName: string;
+  x: number;
+  y: number;
+}
+
 interface Props {
   collapsed: boolean;
   onToggleCollapse: () => void;
@@ -40,8 +47,22 @@ interface Props {
   activeTargets: string[];
   paneStatuses: Record<string, { status: string; message: string }>;
   onSessionRenamed?: (oldName: string, newName: string) => void;
+  /** Target of the currently fullscreened (maximized) pane, if any. */
+  maximizedTarget?: string | null;
+  /**
+   * If any cell in the parent layout is already showing a pane from
+   * `sessionName`, focus that cell and return true. Otherwise return
+   * false so the sidebar falls back to its default behavior (expand
+   * the row / open the collapsed sidebar).
+   */
+  onFocusSession?: (sessionName: string) => boolean;
   style?: React.CSSProperties;
+  sfwMode?: boolean;
+  nsfwProjects?: string[];
 }
+
+// Severity rank for aggregating a session's worst pane status.
+const STATUS_RANK: Record<string, number> = { green: 1, yellow: 2, red: 3 };
 
 const ansiConverter = new AnsiToHtml({
   fg: '#cdd6f4',
@@ -64,12 +85,13 @@ const STATUS_COLORS: Record<string, string> = {
   red: 'var(--error)',
 };
 
-export function Sidebar({ collapsed, onToggleCollapse, onSelectPane, activeTargets, paneStatuses, onSessionRenamed, style }: Props) {
+export function Sidebar({ collapsed, onToggleCollapse, onSelectPane, activeTargets, paneStatuses, onSessionRenamed, maximizedTarget, onFocusSession, style, sfwMode = false, nsfwProjects = [] }: Props) {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [panes, setPanes] = useState<Record<string, Pane[]>>({});
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [showHidden, setShowHidden] = useState(false);
   const [gitInfo, setGitInfo] = useState<Record<string, GitInfo>>({});
+  const [gitHover, setGitHover] = useState<GitHoverState | null>(null);
   const [hoverTarget, setHoverTarget] = useState<string | null>(null);
   const [hoverPreview, setHoverPreview] = useState<string | null>(null);
   const [hoverPos, setHoverPos] = useState({ x: 0, y: 0 });
@@ -87,6 +109,10 @@ export function Sidebar({ collapsed, onToggleCollapse, onSelectPane, activeTarge
     onConfirm: (value?: string) => void;
   } | null>(null);
 
+  const nsfwSet = new Set(nsfwProjects.map((p) => p.toLowerCase()));
+  const isNsfw = (name: string) => sfwMode && nsfwSet.has(name.toLowerCase());
+  const visibleSessions = sfwMode ? sessions.filter((s) => !isNsfw(s.name)) : sessions;
+
   const refresh = useCallback(() => {
     const q = showHidden ? '?all=true' : '';
     get<Session[]>(`/sessions${q}`)
@@ -94,11 +120,51 @@ export function Sidebar({ collapsed, onToggleCollapse, onSelectPane, activeTarge
       .catch(() => {});
   }, [showHidden]);
 
+  // Ensure we have pane info (for the cwd) for every known session, then
+  // re-fetch git info. This powers the badges without requiring the user
+  // to expand each session first, and keeps ahead/behind/dirty counts
+  // live instead of snapshotted at expand time.
+  const refreshGitInfo = useCallback((sessionList: Session[]) => {
+    for (const s of sessionList) {
+      const loadAndFetch = async () => {
+        let paneList = panesRef.current[s.name];
+        if (!paneList) {
+          try {
+            paneList = (await get<Pane[]>(`/sessions/${s.name}/panes`)) ?? [];
+            setPanes((prev) => ({ ...prev, [s.name]: paneList! }));
+          } catch {
+            return;
+          }
+        }
+        const path = paneList[0]?.path;
+        if (!path) return;
+        try {
+          const info = await get<GitInfo>(`/git/info?dir=${encodeURIComponent(path)}`);
+          if (info) setGitInfo((prev) => ({ ...prev, [s.name]: info }));
+        } catch { /* not a git repo */ }
+      };
+      void loadAndFetch();
+    }
+  }, []);
+
+  // panesRef mirrors `panes` so refreshGitInfo can read the latest value
+  // inside the interval without re-binding the callback on every change.
+  const panesRef = useRef<Record<string, Pane[]>>({});
+  useEffect(() => { panesRef.current = panes; }, [panes]);
+
   useEffect(() => {
     refresh();
     const interval = setInterval(refresh, 5000);
     return () => clearInterval(interval);
   }, [refresh]);
+
+  // Whenever the session list changes (or the 5s tick fires via sessions
+  // state), fan out git info fetches.
+  useEffect(() => {
+    refreshGitInfo(sessions);
+    const interval = setInterval(() => refreshGitInfo(sessions), 5000);
+    return () => clearInterval(interval);
+  }, [sessions, refreshGitInfo]);
 
   const toggleSession = async (name: string) => {
     const next = new Set(expanded);
@@ -230,10 +296,65 @@ export function Sidebar({ collapsed, onToggleCollapse, onSelectPane, activeTarge
     setHoverPreview(null);
   };
 
+  // Compute the worst pane status color across a session's panes. Returns
+  // one of "red" | "yellow" | "green" | null.
+  const worstStatusFor = (sessionName: string): string | null => {
+    const list = panes[sessionName];
+    if (!list) return null;
+    let best = 0;
+    let kind: string | null = null;
+    for (const p of list) {
+      const ps = paneStatuses[p.target];
+      if (!ps) continue;
+      const rank = STATUS_RANK[ps.status] ?? 0;
+      if (rank > best) {
+        best = rank;
+        kind = ps.status;
+      }
+    }
+    return kind;
+  };
+
+  // Does this session contain the currently-fullscreened pane?
+  const ownsMaximized = (sessionName: string): boolean => {
+    if (!maximizedTarget) return false;
+    const list = panes[sessionName];
+    return !!list?.some((p) => p.target === maximizedTarget);
+  };
+
   if (collapsed) {
+    // Render a narrow status-glyph strip (#503) instead of a blank sidebar.
     return (
       <aside className="sidebar collapsed">
         <button className="sidebar-toggle" onClick={onToggleCollapse} title="Expand sidebar">›</button>
+        <div className="sidebar-collapsed-strip">
+          {visibleSessions.map((s) => {
+            const status = worstStatusFor(s.name);
+            const owns = ownsMaximized(s.name);
+            const initial = s.name.charAt(0).toUpperCase();
+            const title = status
+              ? `${s.name} — ${status}`
+              : s.name;
+            return (
+              <button
+                key={s.name}
+                className={`sidebar-glyph${status ? ' has-status' : ''}${owns ? ' owns-maximized' : ''}`}
+                style={status ? { color: STATUS_COLORS[status], borderColor: STATUS_COLORS[status] } : undefined}
+                title={title}
+                onClick={() => {
+                  // Collapsed glyph click: jump to the session if it's
+                  // already visible in some cell, otherwise expand the
+                  // sidebar so the user can pick a pane.
+                  if (onFocusSession?.(s.name)) return;
+                  onToggleCollapse();
+                }}
+              >
+                {initial}
+                {status && <span className="sidebar-glyph-dot" style={{ background: STATUS_COLORS[status] }} />}
+              </button>
+            );
+          })}
+        </div>
       </aside>
     );
   }
@@ -253,17 +374,44 @@ export function Sidebar({ collapsed, onToggleCollapse, onSelectPane, activeTarge
         </button>
         <button className="btn-small" onClick={handleCreate}>+</button>
       </div>
-      {sessions.length === 0 ? (
+      {visibleSessions.length === 0 ? (
         <p className="muted">No tmux sessions</p>
       ) : (
         <ul>
-          {sessions.map((s) => (
-            <li key={s.name} className={`session-item${s.hidden ? ' hidden-session' : ''}`}>
-              <div className="session-row" onClick={() => toggleSession(s.name)}>
-                <span className="expand-icon">{expanded.has(s.name) ? '▼' : '▶'}</span>
+          {visibleSessions.map((s) => {
+            // Session-level hot status: only highlight when a DIFFERENT
+            // pane is fullscreened (#502). The user can't see the hot
+            // pane directly, so we surface it in the sidebar.
+            const hot = maximizedTarget && !ownsMaximized(s.name)
+              ? worstStatusFor(s.name)
+              : null;
+            return (
+            <li
+              key={s.name}
+              className={`session-item${s.hidden ? ' hidden-session' : ''}${hot ? ` has-hot-status hot-${hot}` : ''}`}
+            >
+              <div className="session-row" onClick={() => {
+                // Clicking the row (but NOT the chevron) jumps to the
+                // session if it's already shown in some cell. Falls back
+                // to toggling expansion if not.
+                if (onFocusSession?.(s.name)) return;
+                toggleSession(s.name);
+              }}>
+                <span
+                  className="expand-icon"
+                  onClick={(e) => { e.stopPropagation(); toggleSession(s.name); }}
+                  title={expanded.has(s.name) ? 'Collapse' : 'Expand'}
+                >
+                  {expanded.has(s.name) ? '▼' : '▶'}
+                </span>
                 <span className="session-name">{s.hidden ? `⚙ ${s.name}` : s.name}</span>
                 {gitInfo[s.name] && (
-                  <span className={`git-badge${gitInfo[s.name].dirty ? ' dirty' : ''}`}>
+                  <span
+                    className={`git-badge${gitInfo[s.name].dirty ? ' dirty' : ''}`}
+                    onMouseEnter={(e) => setGitHover({ sessionName: s.name, x: e.clientX, y: e.clientY })}
+                    onMouseMove={(e) => setGitHover((prev) => prev && prev.sessionName === s.name ? { ...prev, x: e.clientX, y: e.clientY } : prev)}
+                    onMouseLeave={() => setGitHover((prev) => (prev?.sessionName === s.name ? null : prev))}
+                  >
                     {gitInfo[s.name].branch}
                     {gitInfo[s.name].changed > 0 && ` ~${gitInfo[s.name].changed}`}
                     {gitInfo[s.name].ahead > 0 && ` ↑${gitInfo[s.name].ahead}`}
@@ -329,8 +477,13 @@ export function Sidebar({ collapsed, onToggleCollapse, onSelectPane, activeTarge
                 </>
               )}
             </li>
-          ))}
+            );
+          })}
         </ul>
+      )}
+
+      {gitHover && gitInfo[gitHover.sessionName] && (
+        <GitInfoHoverPreview info={gitInfo[gitHover.sessionName]} x={gitHover.x} y={gitHover.y} />
       )}
 
       <ConfirmDialog

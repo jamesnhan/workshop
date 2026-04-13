@@ -1,6 +1,6 @@
 # Update Workshop
 
-Sync workshop with latest changes from yuna (authoritative source).
+Sync workshop with latest changes from workshop (authoritative source).
 
 ## Workflow
 
@@ -56,15 +56,15 @@ Execute the following steps to update workshop:
 ## Important Notes
 
 - **origin** is github.com/jamesnhan/workshop (this repo, work/sanitized)
-- **yuna** is github.com/jamesnhan/yuna (personal, authoritative source)
-- Yuna pushes updates to workshop's origin, not to the yuna remote
-- This updates workshop with yuna's latest features
+- **workshop** is github.com/jamesnhan/workshop (personal, authoritative source)
+- Workshop pushes updates to workshop's origin, not to the workshop remote
+- This updates workshop with workshop's latest features
 - Always show changes before resetting (safety check)
 - Workshop MCP servers are not restarted (they stay running)
 
 ## When to Use
 
 Use this skill when:
-- Yuna has pushed updates to workshop
-- You need to sync the latest features from yuna
-- After yuna says "I pushed to origin, run update-workshop"
+- Workshop has pushed updates to workshop
+- You need to sync the latest features from workshop
+- After workshop says "I pushed to origin, run update-workshop"

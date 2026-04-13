@@ -45,6 +45,8 @@ interface AgentInfo {
 
 interface Props {
   onNavigateToPane: (target: string) => void;
+  sfwMode?: boolean;
+  nsfwProjects?: string[];
 }
 
 const ansiConverter = new AnsiToHtml({ fg: '#cdd6f4', bg: 'transparent' });
@@ -59,7 +61,7 @@ function statusColor(status: string): string {
   }
 }
 
-export function AgentDashboard({ onNavigateToPane }: Props) {
+export function AgentDashboard({ onNavigateToPane, sfwMode = false, nsfwProjects = [] }: Props) {
   const [agents, setAgents] = useState<AgentInfo[]>([]);
   const [loading, setLoading] = useState(true);
 
@@ -216,10 +218,12 @@ export function AgentDashboard({ onNavigateToPane }: Props) {
     return () => clearInterval(interval);
   }, [refresh]);
 
-  const needsInput = agents.filter((a) => a.status === 'needs_input');
-  const working = agents.filter((a) => a.status === 'working');
-  const idle = agents.filter((a) => a.status === 'idle');
-  const done = agents.filter((a) => a.status === 'done');
+  const nsfwSet = new Set(nsfwProjects.map((p) => p.toLowerCase()));
+  const visibleAgents = sfwMode ? agents.filter((a) => !nsfwSet.has(a.name.toLowerCase())) : agents;
+  const needsInput = visibleAgents.filter((a) => a.status === 'needs_input');
+  const working = visibleAgents.filter((a) => a.status === 'working');
+  const idle = visibleAgents.filter((a) => a.status === 'idle');
+  const done = visibleAgents.filter((a) => a.status === 'done');
 
   return (
     <div className="dashboard-overlay">

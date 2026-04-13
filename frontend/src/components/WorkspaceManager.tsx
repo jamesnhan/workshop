@@ -7,6 +7,7 @@ import {
 
 interface Props {
   activeWorkspace: string | null;
+  dirty?: boolean;
   onLoad: (name: string) => void;
   onSave: (name: string) => void;
   onDelete: (name: string) => void;
@@ -32,7 +33,7 @@ function getWorkspaceInfo(name: string): WorkspaceInfo | null {
   }
 }
 
-export function WorkspaceManager({ activeWorkspace, onLoad, onSave, onDelete, onRename }: Props) {
+export function WorkspaceManager({ activeWorkspace, dirty, onLoad, onSave, onDelete, onRename }: Props) {
   const [open, setOpen] = useState(false);
   const [editingName, setEditingName] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
@@ -91,17 +92,28 @@ export function WorkspaceManager({ activeWorkspace, onLoad, onSave, onDelete, on
   return (
     <div className="workspace-manager" ref={popoverRef}>
       <button
-        className={`workspace-trigger ${activeWorkspace ? 'has-workspace' : ''}`}
+        className={`workspace-trigger ${activeWorkspace ? 'has-workspace' : ''}${dirty ? ' dirty' : ''}`}
         onClick={() => setOpen(!open)}
-        title="Manage workspaces"
+        title={dirty ? `${activeWorkspace} — unsaved changes` : 'Manage workspaces'}
       >
-        {activeWorkspace || 'No workspace'}
+        {activeWorkspace || 'No workspace'}{dirty && <span className="workspace-dirty-dot" title="Unsaved changes">●</span>}
         <span className="workspace-trigger-arrow">{open ? '▴' : '▾'}</span>
       </button>
 
       {open && (
         <div className="workspace-popover">
-          <div className="workspace-popover-header">Workspaces</div>
+          <div className="workspace-popover-header">
+            Workspaces
+            {dirty && activeWorkspace && (
+              <button
+                className="workspace-save-current-btn"
+                onClick={() => { onSave(activeWorkspace); }}
+                title={`Save changes to ${activeWorkspace}`}
+              >
+                Save "{activeWorkspace}"
+              </button>
+            )}
+          </div>
 
           {workspaces.length === 0 && (
             <div className="workspace-empty">No saved workspaces yet</div>
