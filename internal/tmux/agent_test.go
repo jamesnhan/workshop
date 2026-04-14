@@ -1,9 +1,13 @@
 package tmux
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
+	"github.com/jamesnhan/workshop/internal/testhelpers"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // --- buildProviderCommand ---
@@ -49,6 +53,37 @@ func TestBuildProviderCommand_unknownFallsBackToClaude(t *testing.T) {
 	// Empty / unknown provider defaults to claude in the switch.
 	assert.Equal(t, "claude", buildProviderCommand("", "", false))
 	assert.Equal(t, "claude --model opus", buildProviderCommand("unknown", "opus", false))
+}
+
+// --- ValidateModelName ---
+
+func TestValidateModelName_valid(t *testing.T) {
+	valid := []string{
+		"gemma4:26b",
+		"huihui_ai/gemma-4-abliterated:31b",
+		"hf.co/TrevorJS/gemma-4-26B-A4B-it-uncensored-GGUF",
+		"claude-opus-4-6",
+		"gpt-5.4",
+		"",
+	}
+	for _, m := range valid {
+		assert.NoError(t, ValidateModelName(m), "should be valid: %q", m)
+	}
+}
+
+func TestValidateModelName_rejectsInjection(t *testing.T) {
+	invalid := []string{
+		"gemma4; rm -rf /",
+		"model$(whoami)",
+		"model`id`",
+		"model|cat /etc/passwd",
+		"model && echo pwned",
+		"model\nnewline",
+		"model name with spaces",
+	}
+	for _, m := range invalid {
+		assert.Error(t, ValidateModelName(m), "should be invalid: %q", m)
+	}
 }
 
 // --- isInputEmpty ---
@@ -146,4 +181,47 @@ func TestHandleTrustPrompt_noPromptReturnsFalse(t *testing.T) {
 	b, _ := bridgeWith()
 	handled := handleTrustPrompt(b, "a:1.1", "nothing to see here", ProviderClaude)
 	assert.False(t, handled)
+}
+
+// --- createWorktree ---
+
+func TestCreateWorktree_createsWorktreeAndBranch(t *testing.T) {
+	repo := testhelpers.NewGitRepo(t)
+	repo.WriteFile("README.md", "hello")
+	repo.Commit("initial")
+
+	wtDir, branch, err := createWorktree(repo.Dir, "orchestrate-42")
+	require.NoError(t, err)
+
+	assert.Equal(t, "card-orchestrate-42", branch)
+	assert.Equal(t, filepath.Join(repo.Dir, ".worktrees", "orchestrate-42"), wtDir)
+
+	// Worktree directory exists
+	info, err := os.Stat(wtDir)
+	require.NoError(t, err)
+	assert.True(t, info.IsDir())
+
+	// Files from main are present in worktree
+	_, err = os.Stat(filepath.Join(wtDir, "README.md"))
+	assert.NoError(t, err)
+}
+
+func TestCreateWorktree_failsOutsideGitRepo(t *testing.T) {
+	dir := t.TempDir() // not a git repo
+	_, _, err := createWorktree(dir, "test")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "not a git repo")
+}
+
+func TestCreateWorktree_failsOnDuplicateBranch(t *testing.T) {
+	repo := testhelpers.NewGitRepo(t)
+	repo.WriteFile("README.md", "hello")
+	repo.Commit("initial")
+
+	_, _, err := createWorktree(repo.Dir, "dup")
+	require.NoError(t, err)
+
+	// Second call with same name should fail (branch already exists)
+	_, _, err = createWorktree(repo.Dir, "dup")
+	assert.Error(t, err)
 }

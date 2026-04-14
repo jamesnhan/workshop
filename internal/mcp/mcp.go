@@ -165,6 +165,8 @@ func Serve() {
 		mcp.WithDescription("List kanban cards. Requires Workshop web server running. Archived (done) cards are hidden by default."),
 		mcp.WithString("project", mcp.Description("Filter by project name")),
 		mcp.WithBoolean("include_archived", mcp.Description("Include archived cards (default: false)")),
+		mcp.WithNumber("limit", mcp.Description("Max cards to return (default 50). Use 0 for all cards.")),
+		mcp.WithNumber("offset", mcp.Description("Number of cards to skip (default 0). Use with limit for pagination.")),
 	), traced("kanban_list", kanbanListHandler()))
 
 	s.AddTool(mcp.NewTool("kanban_create",
@@ -235,6 +237,7 @@ func Serve() {
 		mcp.WithDescription("Launch an autonomous orchestrator that drives a kanban card through plan→implement→test→review→PR phases. Each phase launches a specialist agent, captures output, and checkpoints with the user via approval gates. The orchestrator runs as a separate Claude agent session."),
 		mcp.WithNumber("id", mcp.Required(), mcp.Description("Kanban card ID to orchestrate")),
 		mcp.WithString("directory", mcp.Description("Working directory for all agents (defaults to current directory)")),
+		mcp.WithString("isolation", mcp.Description("Set to 'worktree' to auto-create a git worktree so all work happens on an isolated branch. The worktree is kept after completion for you to merge/cherry-pick.")),
 	), traced("orchestrate_card", orchestrateCardHandler()))
 
 	s.AddTool(mcp.NewTool("consensus_start",
@@ -671,12 +674,19 @@ func kanbanListHandler() server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		project := mcp.ParseString(req, "project", "")
 		includeArchived := mcp.ParseBoolean(req, "include_archived", false)
+		limit := mcp.ParseInt(req, "limit", 50)
+		offset := mcp.ParseInt(req, "offset", 0)
+
 		params := url.Values{}
 		if project != "" {
 			params.Set("project", project)
 		}
 		if includeArchived {
 			params.Set("include_archived", "true")
+		}
+		params.Set("limit", fmt.Sprintf("%d", limit))
+		if offset > 0 {
+			params.Set("offset", fmt.Sprintf("%d", offset))
 		}
 		resp, err := http.Get(workshopAPIURL() + "/api/v1/cards?" + params.Encode())
 		if err != nil {
@@ -688,14 +698,25 @@ func kanbanListHandler() server.ToolHandlerFunc {
 			return mcp.NewToolResultError(string(body)), nil
 		}
 
-		var cards []map[string]any
-		json.Unmarshal(body, &cards)
-		if len(cards) == 0 {
+		var page struct {
+			Cards  []map[string]any `json:"cards"`
+			Total  int              `json:"total"`
+			Limit  int              `json:"limit"`
+			Offset int              `json:"offset"`
+		}
+		json.Unmarshal(body, &page)
+		if len(page.Cards) == 0 {
 			return mcp.NewToolResultText("No cards found."), nil
 		}
 
 		var sb strings.Builder
-		for _, c := range cards {
+		end := page.Offset + len(page.Cards)
+		fmt.Fprintf(&sb, "Showing %d–%d of %d cards", page.Offset+1, end, page.Total)
+		if page.Total > end {
+			fmt.Fprintf(&sb, " (next: offset=%d)", end)
+		}
+		sb.WriteString("\n\n")
+		for _, c := range page.Cards {
 			fmt.Fprintf(&sb, "[%s] #%.0f %s", c["column"], c["id"], c["title"])
 			if p, ok := c["project"].(string); ok && p != "" {
 				fmt.Fprintf(&sb, " (%s)", p)
@@ -1707,6 +1728,10 @@ func ollamaChatHandler() server.ToolHandlerFunc {
 		json.Unmarshal(body, &chatResp)
 		msg, _ := chatResp["message"].(map[string]any)
 		content, _ := msg["content"].(string)
+		thinking, _ := msg["thinking"].(string)
+		if content == "" && thinking != "" {
+			content = thinking
+		}
 		if content == "" {
 			return mcp.NewToolResultText("(empty response)"), nil
 		}
@@ -1831,6 +1856,7 @@ func orchestrateCardHandler() server.ToolHandlerFunc {
 			return mcp.NewToolResultError("id is required"), nil
 		}
 		directory := mcp.ParseString(req, "directory", "")
+		isolation := mcp.ParseString(req, "isolation", "")
 
 		// Fetch the card details
 		cardResp, err := http.Get(fmt.Sprintf("%s/api/v1/cards/%d", workshopAPIURL(), cardID))
@@ -1892,6 +1918,7 @@ func orchestrateCardHandler() server.ToolHandlerFunc {
 			"preset":                     "orchestrator",
 			"prompt":                     prompt,
 			"directory":                  directory,
+			"isolation":                  isolation,
 			"background":                 true,
 			"dangerouslySkipPermissions": true,
 		}
@@ -1911,7 +1938,13 @@ func orchestrateCardHandler() server.ToolHandlerFunc {
 		target, _ := launched["target"].(string)
 		sessionName, _ := launched["sessionName"].(string)
 
-		return mcp.NewToolResultText(fmt.Sprintf("Orchestrator launched for card #%d\nSession: %s\nTarget: %s\n\nThe orchestrator will drive through plan→implement→test→review→PR phases with approval checkpoints at each step. Watch the Activity tab for progress.", cardID, sessionName, target)), nil
+		msg := fmt.Sprintf("Orchestrator launched for card #%d\nSession: %s\nTarget: %s", cardID, sessionName, target)
+		if wt, ok := launched["worktreeDir"].(string); ok && wt != "" {
+			br, _ := launched["branch"].(string)
+			msg += fmt.Sprintf("\nWorktree: %s\nBranch: %s", wt, br)
+		}
+		msg += "\n\nThe orchestrator will drive through plan→implement→test→review→PR phases with approval checkpoints at each step. Watch the Activity tab for progress."
+		return mcp.NewToolResultText(msg), nil
 	}
 }
 

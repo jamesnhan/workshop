@@ -1,4 +1,4 @@
-.PHONY: build dev clean frontend backend install test test-unit test-integration test-race test-cover test-frontend install-hooks
+.PHONY: build dev clean frontend backend install deploy-local test test-unit test-integration test-race test-cover test-frontend install-hooks
 
 PREFIX ?= $(HOME)/.local
 COVERAGE_DIR := coverage
@@ -16,6 +16,19 @@ install: build
 	install -d $(PREFIX)/bin
 	install -m 755 bin/workshop $(PREFIX)/bin/workshop
 	@echo "Installed: $(PREFIX)/bin/workshop"
+
+# --- Deploy ---
+
+# Local agent: build, install, restart service.
+# Linux uses systemd, macOS uses launchctl.
+deploy-local: install
+ifeq ($(shell uname),Darwin)
+	launchctl kickstart -k gui/$$(id -u)/com.jamesnhan.workshop 2>/dev/null || true
+	@echo "Local agent deployed. (launchctl restart attempted — start manually if no launchd plist installed)"
+else
+	systemctl --user restart workshop.service
+	@echo "Local agent deployed and restarted."
+endif
 
 dev:
 	@echo "Start Go backend:  go run ."

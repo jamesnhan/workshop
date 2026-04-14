@@ -12,7 +12,22 @@ import (
 func (a *API) handleListCards(w http.ResponseWriter, r *http.Request) {
 	project := r.URL.Query().Get("project")
 	includeArchived := r.URL.Query().Get("include_archived") == "true"
-	cards, err := a.db.ListCards(project, includeArchived)
+
+	limitStr := r.URL.Query().Get("limit")
+	offsetStr := r.URL.Query().Get("offset")
+	paginated := limitStr != ""
+
+	limit, offset := 0, 0
+	if paginated {
+		if n, err := strconv.Atoi(limitStr); err == nil && n > 0 {
+			limit = n
+		}
+		if n, err := strconv.Atoi(offsetStr); err == nil && n >= 0 {
+			offset = n
+		}
+	}
+
+	cards, total, err := a.db.ListCardsPaged(project, limit, offset, includeArchived)
 	if err != nil {
 		a.serverErr(w, "operation failed", err)
 		return
@@ -20,7 +35,17 @@ func (a *API) handleListCards(w http.ResponseWriter, r *http.Request) {
 	if cards == nil {
 		cards = []db.Card{}
 	}
-	a.jsonOK(w, cards)
+
+	if paginated {
+		a.jsonOK(w, map[string]any{
+			"cards":  cards,
+			"total":  total,
+			"limit":  limit,
+			"offset": offset,
+		})
+	} else {
+		a.jsonOK(w, cards)
+	}
 }
 
 func (a *API) handleGetCard(w http.ResponseWriter, r *http.Request) {

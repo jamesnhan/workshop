@@ -3,9 +3,16 @@ package tmux
 import (
 	"fmt"
 	"log/slog"
+	"os/exec"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 )
+
+// validModelName matches safe model identifiers: alphanumeric, colons, dots,
+// slashes, hyphens, underscores, at-signs. Rejects shell metacharacters.
+var validModelName = regexp.MustCompile(`^[a-zA-Z0-9.:/_@-]+$`)
 
 // Provider constants for supported AI CLI tools.
 const (
@@ -22,6 +29,7 @@ type AgentConfig struct {
 	Command                  string `json:"command,omitempty"`   // full command to run (overrides provider defaults)
 	Prompt                   string `json:"prompt,omitempty"`    // initial prompt — typed into the agent's input field
 	Model                    string `json:"model,omitempty"`     // model flag (--model / -m)
+	Isolation                string `json:"isolation,omitempty"` // "worktree" = auto-create git worktree for isolated work
 	DangerousSkipPermissions bool   `json:"dangerouslySkipPermissions,omitempty"`
 	CardID                   int64  `json:"cardId,omitempty"`    // kanban card this agent was dispatched from (0 = none)
 	Background               bool   `json:"background,omitempty"` // don't steal focus on the frontend when attaching
@@ -29,15 +37,22 @@ type AgentConfig struct {
 
 // AgentResult is returned after launching an agent.
 type AgentResult struct {
-	SessionName string `json:"sessionName"`
-	Target      string `json:"target"`
-	Pane        Pane   `json:"pane"`
+	SessionName  string `json:"sessionName"`
+	Target       string `json:"target"`
+	Pane         Pane   `json:"pane"`
+	WorktreeDir  string `json:"worktreeDir,omitempty"`  // populated when isolation=worktree
+	Branch       string `json:"branch,omitempty"`       // worktree branch name
 }
 
 // LaunchAgent creates a new tmux session and runs the agent command in it.
 func (b *ExecBridge) LaunchAgent(cfg AgentConfig) (*AgentResult, error) {
 	if cfg.Name == "" {
 		cfg.Name = fmt.Sprintf("agent-%d", time.Now().UnixMilli())
+	}
+
+	// Validate model name to prevent command injection via shell metacharacters.
+	if err := ValidateModelName(cfg.Model); err != nil {
+		return nil, err
 	}
 
 	provider := cfg.Provider
@@ -53,6 +68,20 @@ func (b *ExecBridge) LaunchAgent(cfg AgentConfig) (*AgentResult, error) {
 	dir := cfg.Directory
 	if dir == "" {
 		dir = "~"
+	}
+
+	// Worktree isolation: create a git worktree so all work happens on an
+	// isolated branch. The worktree is left after completion for the user
+	// to merge/cherry-pick at their discretion.
+	var worktreeDir, branch string
+	if cfg.Isolation == "worktree" {
+		var err error
+		worktreeDir, branch, err = createWorktree(dir, cfg.Name)
+		if err != nil {
+			return nil, fmt.Errorf("create worktree: %w", err)
+		}
+		dir = worktreeDir
+		slog.Info("worktree created", "dir", worktreeDir, "branch", branch, "agent", cfg.Name)
 	}
 
 	if err := b.CreateSession(cfg.Name, dir); err != nil {
@@ -81,7 +110,39 @@ func (b *ExecBridge) LaunchAgent(cfg AgentConfig) (*AgentResult, error) {
 		SessionName: cfg.Name,
 		Target:      panes[0].Target,
 		Pane:        panes[0],
+		WorktreeDir: worktreeDir,
+		Branch:      branch,
 	}, nil
+}
+
+// createWorktree creates a git worktree for isolated agent work. It resolves
+// the git root from the given directory, creates a .worktrees/<name> directory
+// with a new branch named card-<name>.
+func createWorktree(dir, name string) (worktreeDir, branch string, err error) {
+	// Resolve git root
+	gitRoot, err := exec.Command("git", "-C", dir, "rev-parse", "--show-toplevel").Output()
+	if err != nil {
+		return "", "", fmt.Errorf("not a git repo (from %s): %w", dir, err)
+	}
+	root := strings.TrimSpace(string(gitRoot))
+
+	branch = "card-" + name
+	worktreeDir = filepath.Join(root, ".worktrees", name)
+
+	out, err := exec.Command("git", "-C", root, "worktree", "add", worktreeDir, "-b", branch).CombinedOutput()
+	if err != nil {
+		return "", "", fmt.Errorf("git worktree add failed: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+	return worktreeDir, branch, nil
+}
+
+// ValidateModelName checks that a model name contains only safe characters.
+// Returns an error if the name contains shell metacharacters.
+func ValidateModelName(model string) error {
+	if model != "" && !validModelName.MatchString(model) {
+		return fmt.Errorf("invalid model name %q — only alphanumeric, colons, dots, slashes, hyphens, underscores, and @ are allowed", model)
+	}
+	return nil
 }
 
 // buildProviderCommand constructs the CLI command for a given provider.

@@ -223,6 +223,8 @@ func (d *DB) migrate() error {
 	`)
 	d.db.Exec(`CREATE INDEX IF NOT EXISTS idx_dispatches_card ON card_dispatches(card_id, dispatched_at DESC)`)
 	d.db.Exec(`CREATE INDEX IF NOT EXISTS idx_dispatches_status ON card_dispatches(status)`)
+	d.db.Exec(`ALTER TABLE card_dispatches ADD COLUMN worktree_dir TEXT DEFAULT ''`)
+	d.db.Exec(`ALTER TABLE card_dispatches ADD COLUMN branch TEXT DEFAULT ''`)
 
 	// Channel subscriptions: pane X wants messages on channel Y
 	d.db.Exec(`
@@ -386,6 +388,31 @@ func (d *DB) migrate() error {
 	d.db.Exec(`CREATE INDEX IF NOT EXISTS idx_usage_session ON agent_usage(session_id)`)
 	d.db.Exec(`CREATE INDEX IF NOT EXISTS idx_usage_card ON agent_usage(card_id)`)
 
+	// Ollama persistent conversations
+	d.db.Exec(`
+		CREATE TABLE IF NOT EXISTS ollama_conversations (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			title TEXT NOT NULL DEFAULT 'New Chat',
+			model TEXT NOT NULL DEFAULT '',
+			system_prompt TEXT NOT NULL DEFAULT '',
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		)
+	`)
+	d.db.Exec(`
+		CREATE TABLE IF NOT EXISTS ollama_messages (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			conversation_id INTEGER NOT NULL REFERENCES ollama_conversations(id) ON DELETE CASCADE,
+			role TEXT NOT NULL,
+			content TEXT NOT NULL,
+			model TEXT NOT NULL DEFAULT '',
+			stats TEXT NOT NULL DEFAULT '',
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		)
+	`)
+	d.db.Exec(`CREATE INDEX IF NOT EXISTS idx_ollama_conv_updated ON ollama_conversations(updated_at DESC)`)
+	d.db.Exec(`CREATE INDEX IF NOT EXISTS idx_ollama_msgs_conv ON ollama_messages(conversation_id, created_at)`)
+
 	return nil
 }
 
@@ -496,7 +523,14 @@ func (d *DB) ListDependencies(project string) ([]CardDependency, error) {
 // --- Card CRUD ---
 
 func (d *DB) ListCards(project string, includeArchived ...bool) ([]Card, error) {
-	query := `SELECT id, title, description, "column", project, position, pane_target, labels, card_type, priority, parent_id, archived, created_at, updated_at FROM cards`
+	cards, _, err := d.ListCardsPaged(project, 0, 0, includeArchived...)
+	return cards, err
+}
+
+// ListCardsPaged returns cards with pagination. When limit <= 0, all cards are
+// returned (same as ListCards). The second return value is the total count of
+// matching cards (ignoring limit/offset), useful for pagination metadata.
+func (d *DB) ListCardsPaged(project string, limit, offset int, includeArchived ...bool) ([]Card, int, error) {
 	args := []any{}
 	var where []string
 	if project != "" {
@@ -506,14 +540,31 @@ func (d *DB) ListCards(project string, includeArchived ...bool) ([]Card, error) 
 	if len(includeArchived) == 0 || !includeArchived[0] {
 		where = append(where, `archived = 0`)
 	}
+	whereClause := ""
 	if len(where) > 0 {
-		query += ` WHERE ` + strings.Join(where, ` AND `)
+		whereClause = ` WHERE ` + strings.Join(where, ` AND `)
 	}
-	query += ` ORDER BY "column", position, id`
 
-	rows, err := d.db.Query(query, args...)
+	// Count total matching cards.
+	var total int
+	if err := d.db.QueryRow(`SELECT COUNT(*) FROM cards`+whereClause, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+
+	query := `SELECT id, title, description, "column", project, position, pane_target, labels, card_type, priority, parent_id, archived, created_at, updated_at FROM cards` + whereClause + ` ORDER BY "column", position, id`
+	queryArgs := append([]any{}, args...)
+	if limit > 0 {
+		query += ` LIMIT ?`
+		queryArgs = append(queryArgs, limit)
+		if offset > 0 {
+			query += ` OFFSET ?`
+			queryArgs = append(queryArgs, offset)
+		}
+	}
+
+	rows, err := d.db.Query(query, queryArgs...)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer rows.Close()
 
@@ -521,11 +572,11 @@ func (d *DB) ListCards(project string, includeArchived ...bool) ([]Card, error) 
 	for rows.Next() {
 		var c Card
 		if err := rows.Scan(&c.ID, &c.Title, &c.Description, &c.Column, &c.Project, &c.Position, &c.PaneTarget, &c.Labels, &c.CardType, &c.Priority, &c.ParentID, &c.Archived, &c.CreatedAt, &c.UpdatedAt); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		cards = append(cards, c)
 	}
-	return cards, rows.Err()
+	return cards, total, rows.Err()
 }
 
 func (d *DB) GetCard(id int64) (*Card, error) {
@@ -1146,18 +1197,20 @@ type Dispatch struct {
 	Provider     string     `json:"provider"`
 	Status       string     `json:"status"` // running, done, error
 	AutoCleanup  bool       `json:"autoCleanup"`
+	WorktreeDir  string     `json:"worktreeDir,omitempty"`
+	Branch       string     `json:"branch,omitempty"`
 	DispatchedAt time.Time  `json:"dispatchedAt"`
 	CompletedAt  *time.Time `json:"completedAt,omitempty"`
 }
 
-func (d *DB) CreateDispatch(cardID int64, sessionName, target, provider string, autoCleanup bool) (*Dispatch, error) {
+func (d *DB) CreateDispatch(cardID int64, sessionName, target, provider string, autoCleanup bool, worktreeDir, branch string) (*Dispatch, error) {
 	cleanup := 0
 	if autoCleanup {
 		cleanup = 1
 	}
 	result, err := d.db.Exec(
-		`INSERT INTO card_dispatches (card_id, session_name, target, provider, auto_cleanup) VALUES (?, ?, ?, ?, ?)`,
-		cardID, sessionName, target, provider, cleanup,
+		`INSERT INTO card_dispatches (card_id, session_name, target, provider, auto_cleanup, worktree_dir, branch) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		cardID, sessionName, target, provider, cleanup, worktreeDir, branch,
 	)
 	if err != nil {
 		return nil, err
@@ -1166,13 +1219,14 @@ func (d *DB) CreateDispatch(cardID int64, sessionName, target, provider string, 
 	return &Dispatch{
 		ID: id, CardID: cardID, SessionName: sessionName, Target: target,
 		Provider: provider, Status: "running", AutoCleanup: autoCleanup,
+		WorktreeDir: worktreeDir, Branch: branch,
 		DispatchedAt: time.Now(),
 	}, nil
 }
 
 func (d *DB) ListDispatches(cardID int64) ([]Dispatch, error) {
 	rows, err := d.db.Query(
-		`SELECT id, card_id, session_name, target, provider, status, auto_cleanup, dispatched_at, completed_at
+		`SELECT id, card_id, session_name, target, provider, status, auto_cleanup, worktree_dir, branch, dispatched_at, completed_at
 		 FROM card_dispatches WHERE card_id=? ORDER BY dispatched_at DESC`, cardID,
 	)
 	if err != nil {
@@ -1183,7 +1237,7 @@ func (d *DB) ListDispatches(cardID int64) ([]Dispatch, error) {
 	for rows.Next() {
 		var disp Dispatch
 		var cleanup int
-		if err := rows.Scan(&disp.ID, &disp.CardID, &disp.SessionName, &disp.Target, &disp.Provider, &disp.Status, &cleanup, &disp.DispatchedAt, &disp.CompletedAt); err != nil {
+		if err := rows.Scan(&disp.ID, &disp.CardID, &disp.SessionName, &disp.Target, &disp.Provider, &disp.Status, &cleanup, &disp.WorktreeDir, &disp.Branch, &disp.DispatchedAt, &disp.CompletedAt); err != nil {
 			continue
 		}
 		disp.AutoCleanup = cleanup != 0
@@ -1194,7 +1248,7 @@ func (d *DB) ListDispatches(cardID int64) ([]Dispatch, error) {
 
 func (d *DB) GetActiveDispatches() ([]Dispatch, error) {
 	rows, err := d.db.Query(
-		`SELECT id, card_id, session_name, target, provider, status, auto_cleanup, dispatched_at, completed_at
+		`SELECT id, card_id, session_name, target, provider, status, auto_cleanup, worktree_dir, branch, dispatched_at, completed_at
 		 FROM card_dispatches WHERE status='running' ORDER BY dispatched_at DESC`,
 	)
 	if err != nil {
@@ -1205,7 +1259,7 @@ func (d *DB) GetActiveDispatches() ([]Dispatch, error) {
 	for rows.Next() {
 		var disp Dispatch
 		var cleanup int
-		if err := rows.Scan(&disp.ID, &disp.CardID, &disp.SessionName, &disp.Target, &disp.Provider, &disp.Status, &cleanup, &disp.DispatchedAt, &disp.CompletedAt); err != nil {
+		if err := rows.Scan(&disp.ID, &disp.CardID, &disp.SessionName, &disp.Target, &disp.Provider, &disp.Status, &cleanup, &disp.WorktreeDir, &disp.Branch, &disp.DispatchedAt, &disp.CompletedAt); err != nil {
 			continue
 		}
 		disp.AutoCleanup = cleanup != 0
@@ -1819,7 +1873,7 @@ func (d *DB) seedOrchestrator() {
 		Description: "Task orchestrator — drives a card through plan→implement→test→review→PR phases automatically",
 		Provider:    "claude",
 		Model:       "opus",
-		SystemPrompt: `You are a task orchestrator for the Workshop project management system. You drive a kanban card through structured phases, launching specialist agents and coordinating their work.
+		SystemPrompt: `You are a task orchestrator for the Yuna project management system. You drive a kanban card through structured phases, launching specialist agents and coordinating their work.
 
 ## Your workflow
 
@@ -1856,6 +1910,9 @@ You will be given a card ID and its description. Execute these phases in order:
 - Add a final note summarizing all phases
 - Call report_activity(action="status", summary="Orchestration complete for card #<id>")
 
+## Worktree isolation
+If you are running in a git worktree (the working directory will be under .worktrees/), all commits automatically land on the worktree branch — NOT main. This is intentional. Do NOT switch branches or attempt to merge to main. The user will merge/cherry-pick when ready. Pass the same working directory to all subagents you launch so they also work in the worktree.
+
 ## Rules
 - NEVER call orchestrate_card — you ARE the orchestrator. Use the individual tools directly: launch_agent, capture_pane, report_activity, request_approval, kanban_add_note, kanban_move
 - Use report_activity with parent_id to nest all phase activities under a root entry
@@ -1863,6 +1920,119 @@ You will be given a card ID and its description. Execute these phases in order:
 - If any phase fails or is denied, stop gracefully — add a note explaining why
 - Always clean up agent sessions when done (they auto-cleanup via dispatch tracking)
 - Pass context forward: each phase's prompt should include relevant output from previous phases
+- When launching subagents, always pass directory=<your working directory> so they work in the same location (especially important for worktree isolation)
 - When launching subagents, wait for them by polling capture_pane every 30 seconds until the agent shows an idle prompt`,
 	})
+}
+
+// --- Ollama conversations ---
+
+type OllamaConversation struct {
+	ID           int64  `json:"id"`
+	Title        string `json:"title"`
+	Model        string `json:"model"`
+	SystemPrompt string `json:"systemPrompt"`
+	CreatedAt    string `json:"createdAt"`
+	UpdatedAt    string `json:"updatedAt"`
+}
+
+type OllamaMessage struct {
+	ID             int64  `json:"id"`
+	ConversationID int64  `json:"conversationId"`
+	Role           string `json:"role"`
+	Content        string `json:"content"`
+	Model          string `json:"model"`
+	Stats          string `json:"stats"`
+	CreatedAt      string `json:"createdAt"`
+}
+
+func (d *DB) ListOllamaConversations() ([]OllamaConversation, error) {
+	rows, err := d.db.Query(`SELECT id, title, model, system_prompt, created_at, updated_at FROM ollama_conversations ORDER BY updated_at DESC LIMIT 100`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var convs []OllamaConversation
+	for rows.Next() {
+		var c OllamaConversation
+		if err := rows.Scan(&c.ID, &c.Title, &c.Model, &c.SystemPrompt, &c.CreatedAt, &c.UpdatedAt); err != nil {
+			return nil, err
+		}
+		convs = append(convs, c)
+	}
+	return convs, rows.Err()
+}
+
+func (d *DB) GetOllamaConversation(id int64) (*OllamaConversation, error) {
+	var c OllamaConversation
+	err := d.db.QueryRow(
+		`SELECT id, title, model, system_prompt, created_at, updated_at FROM ollama_conversations WHERE id=?`, id,
+	).Scan(&c.ID, &c.Title, &c.Model, &c.SystemPrompt, &c.CreatedAt, &c.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &c, nil
+}
+
+func (d *DB) CreateOllamaConversation(conv *OllamaConversation) error {
+	result, err := d.db.Exec(
+		`INSERT INTO ollama_conversations (title, model, system_prompt) VALUES (?, ?, ?)`,
+		conv.Title, conv.Model, conv.SystemPrompt,
+	)
+	if err != nil {
+		return err
+	}
+	conv.ID, _ = result.LastInsertId()
+	// Populate timestamps for the response
+	row := d.db.QueryRow(`SELECT created_at, updated_at FROM ollama_conversations WHERE id=?`, conv.ID)
+	row.Scan(&conv.CreatedAt, &conv.UpdatedAt)
+	return nil
+}
+
+func (d *DB) UpdateOllamaConversation(conv *OllamaConversation) error {
+	_, err := d.db.Exec(
+		`UPDATE ollama_conversations SET title=?, model=?, system_prompt=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`,
+		conv.Title, conv.Model, conv.SystemPrompt, conv.ID,
+	)
+	return err
+}
+
+func (d *DB) DeleteOllamaConversation(id int64) error {
+	_, err := d.db.Exec(`DELETE FROM ollama_conversations WHERE id=?`, id)
+	return err
+}
+
+func (d *DB) ListOllamaMessages(conversationID int64) ([]OllamaMessage, error) {
+	rows, err := d.db.Query(
+		`SELECT id, conversation_id, role, content, model, stats, created_at FROM ollama_messages WHERE conversation_id=? ORDER BY created_at ASC`, conversationID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var msgs []OllamaMessage
+	for rows.Next() {
+		var m OllamaMessage
+		if err := rows.Scan(&m.ID, &m.ConversationID, &m.Role, &m.Content, &m.Model, &m.Stats, &m.CreatedAt); err != nil {
+			return nil, err
+		}
+		msgs = append(msgs, m)
+	}
+	return msgs, rows.Err()
+}
+
+func (d *DB) CreateOllamaMessage(msg *OllamaMessage) error {
+	result, err := d.db.Exec(
+		`INSERT INTO ollama_messages (conversation_id, role, content, model, stats) VALUES (?, ?, ?, ?, ?)`,
+		msg.ConversationID, msg.Role, msg.Content, msg.Model, msg.Stats,
+	)
+	if err != nil {
+		return err
+	}
+	msg.ID, _ = result.LastInsertId()
+	// Populate created_at for the response
+	d.db.QueryRow(`SELECT created_at FROM ollama_messages WHERE id=?`, msg.ID).Scan(&msg.CreatedAt)
+	// Touch the parent conversation's updated_at
+	d.db.Exec(`UPDATE ollama_conversations SET updated_at=CURRENT_TIMESTAMP WHERE id=?`, msg.ConversationID)
+	return nil
 }

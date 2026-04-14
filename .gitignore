@@ -2,3 +2,7 @@ bin/
 workshop
 frontend/dist/
 frontend/node_modules/
+coverage/
+frontend/coverage/
+.claude/settings.local.json
+.worktrees/

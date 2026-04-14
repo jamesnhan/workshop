@@ -8,7 +8,6 @@ import (
 	"io"
 	"net/http"
 	"sync"
-	"time"
 )
 
 // Endpoint represents a single Ollama server.
@@ -28,19 +27,21 @@ type Model struct {
 
 // ChatMessage is a single message in a chat conversation.
 type ChatMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role     string `json:"role"`
+	Content  string `json:"content"`
+	Thinking string `json:"thinking,omitempty"`
 }
 
 // ChatRequest is the input for a chat completion.
 type ChatRequest struct {
-	Model       string        `json:"model"`
-	Messages    []ChatMessage `json:"messages"`
-	Temperature *float64      `json:"temperature,omitempty"`
-	MaxTokens   int           `json:"max_tokens,omitempty"`
-	Think       *bool         `json:"think,omitempty"`
-	Stream      bool          `json:"stream"`
-	System      string        `json:"system,omitempty"`
+	Model       string            `json:"model"`
+	Messages    []ChatMessage     `json:"messages"`
+	Temperature *float64          `json:"temperature,omitempty"`
+	MaxTokens   int               `json:"max_tokens,omitempty"`
+	Think       *bool             `json:"think,omitempty"`
+	Stream      bool              `json:"stream"`
+	System      string            `json:"system,omitempty"`
+	Options     map[string]any    `json:"options,omitempty"`
 }
 
 // ChatResponse is a single chunk from a streaming chat response.
@@ -91,9 +92,7 @@ type Client struct {
 func NewClient(endpoints []Endpoint) *Client {
 	return &Client{
 		endpoints: endpoints,
-		http: &http.Client{
-			Timeout: 5 * time.Minute, // long timeout for generation
-		},
+		http: &http.Client{}, // no timeout — streaming responses can run indefinitely; cancellation via context
 		modelMap: make(map[string]*Endpoint),
 	}
 }
@@ -246,23 +245,32 @@ func (c *Client) Chat(ctx context.Context, req ChatRequest, onChunk func(ChatRes
 		return err
 	}
 
-	// Build Ollama-native request
+	// Build Ollama-native request.
+	// Prepend system message if provided — Ollama /api/chat expects it
+	// as a message with role "system", not a top-level field.
+	messages := req.Messages
+	if req.System != "" {
+		messages = append([]ChatMessage{{Role: "system", Content: req.System}}, messages...)
+	}
 	body := map[string]any{
 		"model":    req.Model,
-		"messages": req.Messages,
+		"messages": messages,
 		"stream":   req.Stream,
 	}
+	// Build options: start with caller-provided options, then overlay our defaults.
+	opts := map[string]any{}
+	for k, v := range req.Options {
+		opts[k] = v
+	}
 	if req.Temperature != nil {
-		body["options"] = map[string]any{"temperature": *req.Temperature}
+		opts["temperature"] = *req.Temperature
 	}
+	numPredict := -1 // unlimited by default
 	if req.MaxTokens > 0 {
-		opts, _ := body["options"].(map[string]any)
-		if opts == nil {
-			opts = map[string]any{}
-		}
-		opts["num_predict"] = req.MaxTokens
-		body["options"] = opts
+		numPredict = req.MaxTokens
 	}
+	opts["num_predict"] = numPredict
+	body["options"] = opts
 	if req.Think != nil {
 		body["think"] = *req.Think
 	}
@@ -319,12 +327,16 @@ func (c *Client) Generate(ctx context.Context, req GenerateRequest, onChunk func
 	if req.Temperature != nil {
 		body["options"] = map[string]any{"temperature": *req.Temperature}
 	}
-	if req.MaxTokens > 0 {
+	{
+		numPredict := -1 // unlimited by default
+		if req.MaxTokens > 0 {
+			numPredict = req.MaxTokens
+		}
 		opts, _ := body["options"].(map[string]any)
 		if opts == nil {
 			opts = map[string]any{}
 		}
-		opts["num_predict"] = req.MaxTokens
+		opts["num_predict"] = numPredict
 		body["options"] = opts
 	}
 	if req.Think != nil {

@@ -18,6 +18,12 @@ func (a *API) handleLaunchAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Validate model name before launching to prevent command injection.
+	if err := tmux.ValidateModelName(cfg.Model); err != nil {
+		a.jsonError(w, err.Error(), http.StatusUnprocessableEntity)
+		return
+	}
+
 	result, err := a.tmux.LaunchAgent(cfg)
 	if err != nil {
 		a.serverErr(w, "agent launch failed", err)
@@ -30,7 +36,7 @@ func (a *API) handleLaunchAgent(w http.ResponseWriter, r *http.Request) {
 		if provider == "" {
 			provider = "claude"
 		}
-		disp, err := a.db.CreateDispatch(cfg.CardID, result.SessionName, result.Target, provider, true)
+		disp, err := a.db.CreateDispatch(cfg.CardID, result.SessionName, result.Target, provider, true, result.WorktreeDir, result.Branch)
 		if err != nil {
 			a.logger.Warn("failed to record dispatch", "err", err)
 		} else {
@@ -140,6 +146,9 @@ func (a *API) completeDispatch(disp db.Dispatch, status, note string) {
 
 	if note != "" {
 		a.db.AddNote(disp.CardID, fmt.Sprintf("[agent] %s", note))
+	}
+	if disp.Branch != "" {
+		a.db.AddNote(disp.CardID, fmt.Sprintf("[agent] Work on branch `%s` — merge/cherry-pick when ready. Worktree: %s", disp.Branch, disp.WorktreeDir))
 	}
 
 	// Move card to review when done (unless already done)

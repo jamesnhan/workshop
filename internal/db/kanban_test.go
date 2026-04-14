@@ -129,6 +129,50 @@ func TestListCards_excludesArchivedByDefault(t *testing.T) {
 	assert.Len(t, all, 3)
 }
 
+func TestListCardsPaged_limitAndOffset(t *testing.T) {
+	d := testhelpers.TempDB(t)
+	seed(t, d, "p", "backlog", 10)
+
+	// First page
+	cards, total, err := d.ListCardsPaged("p", 3, 0)
+	require.NoError(t, err)
+	assert.Equal(t, 10, total)
+	assert.Len(t, cards, 3)
+
+	// Second page
+	cards2, total2, err := d.ListCardsPaged("p", 3, 3)
+	require.NoError(t, err)
+	assert.Equal(t, 10, total2)
+	assert.Len(t, cards2, 3)
+	assert.NotEqual(t, cards[0].ID, cards2[0].ID, "pages should not overlap")
+
+	// Past end
+	cards3, total3, err := d.ListCardsPaged("p", 5, 9)
+	require.NoError(t, err)
+	assert.Equal(t, 10, total3)
+	assert.Len(t, cards3, 1)
+
+	// No limit returns all
+	all, totalAll, err := d.ListCardsPaged("p", 0, 0)
+	require.NoError(t, err)
+	assert.Equal(t, 10, totalAll)
+	assert.Len(t, all, 10)
+}
+
+func TestListCardsPaged_projectFilter(t *testing.T) {
+	d := testhelpers.TempDB(t)
+	seed(t, d, "alpha", "backlog", 5)
+	seed(t, d, "beta", "backlog", 3)
+
+	cards, total, err := d.ListCardsPaged("alpha", 2, 0)
+	require.NoError(t, err)
+	assert.Equal(t, 5, total)
+	assert.Len(t, cards, 2)
+	for _, c := range cards {
+		assert.Equal(t, "alpha", c.Project)
+	}
+}
+
 func TestMoveCard_archivesOnDoneUnarchivesOnRestore(t *testing.T) {
 	d := testhelpers.TempDB(t)
 	ids := seed(t, d, "p", "backlog", 1)
