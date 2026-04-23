@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import type { WorkshopSettings, PreviewSize } from '../hooks/useSettings';
 import { themes } from '../themes';
-import { get } from '../api/client';
+import { get, authHeaders } from '../api/client';
 
 interface Props {
   settings: WorkshopSettings;
@@ -23,7 +23,7 @@ export function SettingsView({ settings, onUpdate, themeName, onThemeChange, not
     setChannelMode(mode);
     fetch('/api/v1/channel-mode', {
       method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
+      headers: authHeaders(),
       body: JSON.stringify({ mode }),
     }).catch(() => {});
   };

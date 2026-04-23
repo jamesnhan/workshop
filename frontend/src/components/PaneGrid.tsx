@@ -1,6 +1,7 @@
-import { type RefObject } from 'react';
+import { type RefObject, useState, useLayoutEffect } from 'react';
 import { PaneViewer, type PaneViewerHandle } from './PaneViewer';
 import { ChibiAvatar, variantFromName, type ChibiState } from './ChibiAvatar';
+import { recordBreadcrumb } from '../lib/telemetry';
 import type { LayoutState } from '../types';
 import type { Theme } from '../themes';
 
@@ -21,6 +22,7 @@ interface Props {
   onAssignPane: (cellId: string) => void;
   onSwitchTab: (cellId: string, target: string) => void;
   onCloseTab: (cellId: string, target: string) => void;
+  onReorderTab?: (cellId: string, fromIndex: number, toIndex: number) => void;
   onTicketHover?: (cardId: number | null, x: number, y: number) => void;
   onTicketClick?: (cardId: number) => void;
   onUrlHover?: (url: string | null, x: number, y: number) => void;
@@ -45,10 +47,21 @@ const STATUS_TO_CHIBI: Record<string, ChibiState> = {
 
 export function PaneGrid({
   layout, viewerRefs, theme, unreadCells, paneStatuses, onInput, onResize,
-  onFocusCell, onAssignPane, onSwitchTab, onCloseTab, onTicketHover, onTicketClick, onUrlHover, onCommitHover, onHashKey,
+  onFocusCell, onAssignPane, onSwitchTab, onCloseTab, onReorderTab, onTicketHover, onTicketClick, onUrlHover, onCommitHover, onHashKey,
   agentTargets, sfwMode = false, nsfwProjects = [],
 }: Props) {
   const { gridRows, gridCols, cells, focusedId, maximizedId } = layout;
+  const [dragTab, setDragTab] = useState<{ cellId: string; fromIndex: number } | null>(null);
+  const [dragOverIndex, setDragOverIndex] = useState<number | null>(null);
+
+  const focusedTarget = cells.find((c) => c.id === focusedId)?.target ?? null;
+  useLayoutEffect(() => {
+    recordBreadcrumb('commit:PaneGrid', {
+      cells: cells.length,
+      focused: focusedTarget ?? 'none',
+      maximized: maximizedId ?? 'none',
+    });
+  });
 
   const gridStyle = maximizedId ? {
     gridTemplate: '1fr / 1fr',
@@ -102,18 +115,74 @@ export function PaneGrid({
 
             {/* Tab bar */}
             {cell.tabs.length > 1 && (
-              <div className="pane-tabs">
-                {cell.tabs.map((tab) => {
+              <div
+                className="pane-tabs"
+                onDragOver={(e) => {
+                  // Fallback: dragging over empty space past the last tab.
+                  // Tab-level handlers stop propagation so this only runs when
+                  // the cursor is NOT over a specific tab.
+                  if (!dragTab || dragTab.cellId !== cell.id) return;
+                  e.preventDefault();
+                  if (dragOverIndex !== cell.tabs.length) setDragOverIndex(cell.tabs.length);
+                }}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  if (dragTab && dragTab.cellId === cell.id && dragOverIndex !== null) {
+                    const toIdx = dragOverIndex > dragTab.fromIndex ? dragOverIndex - 1 : dragOverIndex;
+                    if (toIdx !== dragTab.fromIndex) {
+                      onReorderTab?.(cell.id, dragTab.fromIndex, toIdx);
+                    }
+                  }
+                  setDragTab(null);
+                  setDragOverIndex(null);
+                }}
+              >
+                {cell.tabs.map((tab, tabIdx) => {
                   const tabStatus = paneStatuses[tab.target];
+                  const isDragging = dragTab?.cellId === cell.id && dragTab.fromIndex === tabIdx;
+                  // dragOverIndex is an INSERT position (0..tabs.length). Show a
+                  // left-side indicator when it matches this tab's index, and a
+                  // right-side indicator when it matches this tab's index + 1.
+                  const dropBefore = dragTab?.cellId === cell.id && dragOverIndex === tabIdx;
+                  const dropAfter = dragTab?.cellId === cell.id && dragOverIndex === tabIdx + 1;
                   return (
                     <div
                       key={tab.target}
-                      className={`pane-tab${tab.target === cell.target ? ' active' : ''}${tabStatus ? ` tab-status-${tabStatus.status}` : ''}`}
+                      className={`pane-tab${tab.target === cell.target ? ' active' : ''}${tabStatus ? ` tab-status-${tabStatus.status}` : ''}${isDragging ? ' dragging' : ''}${dropBefore ? ' drop-before' : ''}${dropAfter ? ' drop-after' : ''}`}
                       onClick={(e) => { e.stopPropagation(); onSwitchTab(cell.id, tab.target); }}
                       onAuxClick={(e) => {
                         if (e.button === 1) { e.stopPropagation(); onCloseTab(cell.id, tab.target); }
                       }}
                       title={tabStatus?.message || tabStatus?.status || tab.label}
+                      draggable={!!onReorderTab}
+                      onDragStart={(e) => {
+                        e.stopPropagation();
+                        setDragTab({ cellId: cell.id, fromIndex: tabIdx });
+                      }}
+                      onDragOver={(e) => {
+                        if (!dragTab || dragTab.cellId !== cell.id) return;
+                        e.preventDefault();
+                        e.stopPropagation();
+                        const rect = e.currentTarget.getBoundingClientRect();
+                        const after = e.clientX > rect.left + rect.width / 2;
+                        const insertIdx = after ? tabIdx + 1 : tabIdx;
+                        if (dragOverIndex !== insertIdx) setDragOverIndex(insertIdx);
+                      }}
+                      onDrop={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        if (dragTab && dragTab.cellId === cell.id && dragOverIndex !== null) {
+                          // Convert insert-position to post-splice index: if dropping
+                          // past the source, subtract 1 to compensate for the removal.
+                          let toIdx = dragOverIndex > dragTab.fromIndex ? dragOverIndex - 1 : dragOverIndex;
+                          if (toIdx !== dragTab.fromIndex) {
+                            onReorderTab?.(cell.id, dragTab.fromIndex, toIdx);
+                          }
+                        }
+                        setDragTab(null);
+                        setDragOverIndex(null);
+                      }}
+                      onDragEnd={() => { setDragTab(null); setDragOverIndex(null); }}
                     >
                       {tabStatus && (
                         <span className="pane-tab-status-dot" style={{ background: STATUS_COLORS[tabStatus.status] }} />

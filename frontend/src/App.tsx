@@ -1,4 +1,6 @@
-import { useState, useCallback, useRef, useEffect, createRef } from 'react';
+import { useState, useCallback, useRef, useEffect, useLayoutEffect, createRef } from 'react';
+import { recordBreadcrumb } from './lib/telemetry';
+import { AuthGate } from './components/AuthGate';
 import { Sidebar } from './components/Sidebar';
 import { PaneGrid } from './components/PaneGrid';
 import { type PaneViewerHandle } from './components/PaneViewer';
@@ -17,19 +19,24 @@ import { DependencyGraph } from './components/DependencyGraph';
 import { WorkspaceManager } from './components/WorkspaceManager';
 import { SettingsView } from './components/SettingsView';
 import { ActivityView } from './components/ActivityView';
+import { UsageBars } from './components/UsageBars';
+import { isHoverPinned, setHoverPinned as setGlobalHoverPinned } from './hooks/useHoverPin';
 import { ResizeHandle } from './components/ResizeHandle';
 import { TicketHoverPreview } from './components/TicketHoverPreview';
 import { LinkHoverPreview } from './components/LinkHoverPreview';
 import { GitCommitHoverPreview } from './components/GitCommitHoverPreview';
 import { TicketLookupDialog } from './components/TicketLookupDialog';
+import { MobileToolbar } from './components/MobileToolbar';
 import { ToastContainer, type ToastItem, type ToastKind } from './components/Toast';
 import { ConfirmDialog, type DialogKind } from './components/ConfirmDialog';
 import { useSettings } from './hooks/useSettings';
 import { useWorkshopSocket } from './hooks/useWebSocket';
 import { useNotifications } from './hooks/useNotifications';
-import { get, post } from './api/client';
-import type { LayoutState, PaneInfo } from './types';
-import { createGrid, navigateGrid, addRow, addCol, removeRow, removeCol, mergeCells, splitCell, swapCellContents } from './types';
+import { useLockupWatchdog } from './hooks/useLockupWatchdog';
+import { useVersionCheck } from './hooks/useVersionCheck';
+import { get, post, authHeaders } from './api/client';
+import type { LayoutState, PaneInfo, SessionInfo } from './types';
+import { createGrid, navigateGrid, addRow, addCol, removeRow, removeCol, mergeCells, splitCell, swapCellContents, reorderTab } from './types';
 import {
   loadLayout,
   restoreLayout,
@@ -47,8 +54,25 @@ import {
 import { themes, getActiveThemeName, setActiveThemeName, applyTheme } from './themes';
 import './App.css';
 
+// Run a heavy operation against each item one frame at a time, instead of
+// all at once. Prevents main-thread saturation when touching N terminals
+// simultaneously (e.g. on WebSocket reconnect or wake-from-sleep, where
+// force-resizing all viewers + processing backlog output in one tick has
+// caused complete browser tab freezes — #934).
+function rafStagger<T>(items: T[], op: (item: T) => void): void {
+  if (items.length === 0) return;
+  let i = 0;
+  const step = () => {
+    if (i >= items.length) return;
+    try { op(items[i]); } catch {}
+    i++;
+    if (i < items.length) requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
+}
+
 function App() {
-  const { connected, subscribe, unsubscribe, sendInput, sendResize, startRecording, stopRecording, onOutput, onStatus, onStatusClear, onReconnect, onOpenDoc, onDispatchUpdate, onSessionCreated, onUICommand } = useWorkshopSocket();
+  const { connected, subscribe, unsubscribe, sendInput, sendResize, startRecording, stopRecording, onOutput, onStatus, onStatusClear, onReconnect, onOpenDoc, onSessionCreated, onUICommand } = useWorkshopSocket();
   const [paneStatuses, setPaneStatuses] = useState<Record<string, { status: string; message: string }>>({});
   const [layout, setLayout] = useState<LayoutState>(() => {
     const saved = loadLayout();
@@ -65,21 +89,20 @@ function App() {
   const [commitHover, setCommitHover] = useState<{ sha: string; x: number; y: number } | null>(null);
   const [hoverPinned, setHoverPinned] = useState(false);
   const hoverPinnedRef = useRef(false);
-  // Keep a snapshot of the last hover so `z` can pin it even after mouseLeave
-  const lastHoverRef = useRef<{ ticket?: typeof ticketHover; url?: typeof urlHover; commit?: typeof commitHover }>({});
   const [hotkeyMenuOpen, setHotkeyMenuOpen] = useState(false);
   const [cmdPaletteOpen, setCmdPaletteOpen] = useState(false);
-  const [kanbanOpen, setKanbanOpen] = useState(false);
-  const [dashboardOpen, setDashboardOpen] = useState(false);
-  const [docsOpen, setDocsOpen] = useState(false);
+  type ViewName = 'sessions' | 'kanban' | 'dashboard' | 'docs' | 'graph' | 'ollama' | 'activity' | 'settings';
+  const [activeView, setActiveView] = useState<ViewName>('sessions');
   const [pendingDocPath, setPendingDocPath] = useState<string | null>(null);
   const [ticketLookupOpen, setTicketLookupOpen] = useState(false);
   const [ticketInsertTarget, setTicketInsertTarget] = useState<string | null>(null);
-  const [dispatchTick, setDispatchTick] = useState(0);
-  const [settingsOpen, setSettingsOpen] = useState(false);
-  const [graphOpen, setGraphOpen] = useState(false);
-  const [ollamaOpen, setOllamaOpen] = useState(false);
-  const [activityOpen, setActivityOpen] = useState(false);
+  const [splitView, setSplitView] = useState(() => {
+    try { return localStorage.getItem('workshop-split-view') === 'true'; } catch { return false; }
+  });
+  const [splitRatio, setSplitRatio] = useState(() => {
+    try { return parseFloat(localStorage.getItem('workshop-split-ratio') || '') || 0.4; } catch { return 0.4; }
+  });
+  const splitContainerRef = useRef<HTMLDivElement>(null);
   const [notifBannerDismissed, setNotifBannerDismissed] = useState(false);
   const [notifSettingsOpen, setNotifSettingsOpen] = useState(false);
   const [playerOpen, setPlayerOpen] = useState(false);
@@ -145,6 +168,15 @@ function App() {
 
   useEffect(() => { applyTheme(theme); }, [theme]);
   useEffect(() => { requestPermission(); }, [requestPermission]);
+  useEffect(() => { try { localStorage.setItem('workshop-split-view', String(splitView)); } catch {} }, [splitView]);
+  useEffect(() => { try { localStorage.setItem('workshop-split-ratio', String(splitRatio)); } catch {} }, [splitRatio]);
+
+  // Render-commit breadcrumb — root App re-renders drive the whole tree.
+  // Records view + cell count so we can see what state the app was in on
+  // its last render before a freeze.
+  useLayoutEffect(() => {
+    recordBreadcrumb('commit:App', { view: activeView, cells: layout.cells.length });
+  });
 
   // Wrap subscribe to also mark the pane for notification grace period
   const subscribePane = useCallback((target: string) => {
@@ -237,32 +269,33 @@ function App() {
     });
   }, []));
 
-  // On WebSocket reconnect, clear all terminal state to avoid garbled rendering
+  // On WebSocket reconnect, clear all terminal state to avoid garbled rendering.
+  // Stagger the writes one viewer per frame — issuing N xterm writes synchronously
+  // contributed to post-wake freezes (#934). forceResize is handled by the
+  // `connected` effect below; we don't duplicate it here.
   onReconnect(useCallback(() => {
-    for (const [, ref] of viewerRefsMap.current) {
-      if (ref.current) {
-        // Clear terminal and let fresh PTY output repopulate
-        ref.current.write('\x1b[2J\x1b[H'); // clear screen + cursor home
-      }
-    }
-    // Force-resize all viewers after reconnect so tmux reflows to current dims.
-    requestAnimationFrame(() => {
-      requestAnimationFrame(() => {
-        viewerRefsMap.current.forEach((ref) => ref.current?.forceResize());
-      });
+    const refs = Array.from(viewerRefsMap.current.values());
+    rafStagger(refs, (ref) => {
+      ref.current?.write('\x1b[2J\x1b[H'); // clear screen + cursor home
     });
   }, []));
 
-  onOpenDoc(useCallback((path: string) => {
-    setDocsOpen(true);
-    setKanbanOpen(false);
-    setDashboardOpen(false);
-    setSettingsOpen(false);
-    setPendingDocPath(path);
-  }, []));
+  // When WebSocket connects (first time or reconnect), force-resize all
+  // terminals so the server knows each client's dimensions. On first load,
+  // runFit fires before the WS is open, so the resize message is dropped.
+  // Stagger across frames to avoid layout storms on wake-from-sleep (#934).
+  useEffect(() => {
+    if (!connected) return;
+    const timer = setTimeout(() => {
+      const refs = Array.from(viewerRefsMap.current.values());
+      rafStagger(refs, (ref) => { ref.current?.forceResize(true); });
+    }, 500);
+    return () => clearTimeout(timer);
+  }, [connected]);
 
-  onDispatchUpdate(useCallback(() => {
-    setDispatchTick((t) => t + 1);
+  onOpenDoc(useCallback((path: string) => {
+    setActiveView('docs');
+    setPendingDocPath(path);
   }, []));
 
   onSessionCreated(useCallback((target: string, background: boolean) => {
@@ -273,7 +306,13 @@ function App() {
       addBackgroundTab(target);
     } else {
       // User-initiated: make it the active tab in the focused cell.
+      // Switch to sessions view first — PaneGrid is display:none on
+      // other views, and browsers can't focus elements in hidden containers.
+      setActiveView('sessions');
       assignPaneToCell(layoutRef.current.focusedId, target);
+      // Bump focusTick to trigger the auto-focus effect (focusedId
+      // doesn't change since the same cell gets a new target).
+      setTimeout(() => setFocusTick((t) => t + 1), 300);
     }
   }, []));
 
@@ -294,12 +333,7 @@ function App() {
       }
       case 'switch_view': {
         const view = String(cmd.payload.view ?? 'sessions');
-        setKanbanOpen(view === 'kanban');
-        setDashboardOpen(view === 'agents');
-        setDocsOpen(view === 'docs');
-        setOllamaOpen(view === 'ollama');
-        setActivityOpen(view === 'activity');
-        setSettingsOpen(view === 'settings');
+        setActiveView(view === 'agents' ? 'dashboard' : view as ViewName);
         break;
       }
       case 'focus_cell': {
@@ -327,10 +361,7 @@ function App() {
       case 'open_card': {
         const id = Number(cmd.payload.id);
         if (id > 0) {
-          setKanbanOpen(true);
-          setDashboardOpen(false);
-          setDocsOpen(false);
-          setSettingsOpen(false);
+          setActiveView('kanban');
           setPendingOpenCardId(id);
         }
         break;
@@ -377,10 +408,29 @@ function App() {
     }
   }, []);
 
-  useEffect(() => { refreshPanes(); }, [refreshPanes]);
+  // Batch init: fetch sessions, panes, and projects in a single round-trip.
+  // Cuts page-load time dramatically over K8s/HTTPS where each request pays
+  // TLS + proxy latency. Components still refresh independently after the
+  // initial load.
+  const [initSessions, setInitSessions] = useState<SessionInfo[] | null>(null);
+  useEffect(() => {
+    get<{ sessions: SessionInfo[]; panes: PaneInfo[]; projects: string[] }>('/init')
+      .then((data) => {
+        if (data) {
+          setAllPanes(data.panes ?? []);
+          setInitSessions(data.sessions ?? []);
+        }
+      })
+      .catch(() => {
+        // Fallback: fetch panes individually if init endpoint not available
+        refreshPanes();
+      });
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   useAutoSaveLayout(layout);
   useValidateTargets(allPanes, setLayout);
+  useLockupWatchdog(layout, connected);
+  const { updateAvailable: versionUpdateAvailable, latest: latestVersion } = useVersionCheck();
 
   // Remap all pane targets in the layout when a session is renamed.
   const handleSessionRenamed = useCallback((oldName: string, newName: string) => {
@@ -402,12 +452,11 @@ function App() {
     }));
     // Force a repaint/refit after the target remap lands in the DOM.
     // xterm panes need a resize tick to redraw their content for the new target.
-    requestAnimationFrame(() => {
-      viewerRefsMap.current.forEach((ref) => ref.current?.refit());
-    });
+    const refs = Array.from(viewerRefsMap.current.values());
+    rafStagger(refs, (ref) => { ref.current?.refit(); });
   }, []);
 
-  // Restore subscriptions on mount
+  // Restore subscriptions on mount and fix stale tab labels
   const hasRestored = useRef(false);
   useEffect(() => {
     if (hasRestored.current || allPanes.length === 0) return;
@@ -417,16 +466,31 @@ function App() {
         subscribePane(cell.target);
       }
     }
+    // Fix tab labels — old labels may be "claude" or "1.1" from before
+    // the session-name fix. Normalize all labels to session name.
+    setLayout((prev) => ({
+      ...prev,
+      cells: prev.cells.map((c) => ({
+        ...c,
+        tabs: c.tabs.map((tab) => ({
+          ...tab,
+          label: tab.target.split(':')[0] || tab.label,
+        })),
+      })),
+    }));
     // Force a resize for restored panes so tmux reflows to match viewport.
+    // force=true: first-mount path, no cached dims to gate against.
     setTimeout(() => {
-      viewerRefsMap.current.forEach((ref) => ref.current?.forceResize());
+      const refs = Array.from(viewerRefsMap.current.values());
+      rafStagger(refs, (ref) => { ref.current?.forceResize(true); });
     }, 100);
   }, [allPanes, layout.cells, subscribe]);
 
   // Assign pane to cell by ID, adding it to the cell's tab history
   const assignPaneToCell = useCallback((cellId: string, target: string) => {
-    const info = allPanes.find((p) => p.target === target);
-    const label = info?.windowName || target.split(':').pop() || target;
+    // Use session name as tab label. windowName is often "claude"/"gemini"/"codex"
+    // (set by agent launcher) which isn't useful for distinguishing tabs.
+    const label = target.split(':')[0] || target;
 
     setLayout((prev) => {
       const newCells = prev.cells.map((c) => {
@@ -455,8 +519,8 @@ function App() {
 
   // Add a pane as an inactive background tab on a cell, without changing
   // the focused cell or the currently-active tab. Used when new sessions
-  // are created elsewhere (sidebar + button, launch_agent, dispatch) so
-  // they surface in the UI without stealing focus.
+  // are created elsewhere (sidebar + button, /agents/launch REST, external
+  // tmux) so they surface in the UI without stealing focus.
   const addBackgroundTab = useCallback((target: string, cellId?: string) => {
     const targetCellId = cellId ?? layoutRef.current.focusedId;
     const cell = layoutRef.current.cells.find((c) => c.id === targetCellId);
@@ -522,6 +586,13 @@ function App() {
     });
   }, [subscribe, unsubscribe]);
 
+  const reorderTabInCell = useCallback((cellId: string, fromIndex: number, toIndex: number) => {
+    setLayout((prev) => ({
+      ...prev,
+      cells: prev.cells.map((c) => c.id === cellId ? reorderTab(c, fromIndex, toIndex) : c),
+    }));
+  }, []);
+
   const handleInput = useCallback((target: string, data: string) => {
     sendInput(target, data);
   }, [sendInput]);
@@ -538,7 +609,7 @@ function App() {
     setLayout((prev) => {
       const cell = prev.cells.find((c) => c.id === cellId);
       if (cell?.target && paneStatuses[cell.target]) {
-        fetch('/api/v1/panes/status', { method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ target: cell.target }) });
+        fetch('/api/v1/panes/status', { method: 'DELETE', headers: authHeaders(), body: JSON.stringify({ target: cell.target }) });
         setPaneStatuses((ps) => { const next = { ...ps }; delete next[cell.target!]; return next; });
       }
       return { ...prev, focusedId: cellId };
@@ -547,15 +618,21 @@ function App() {
     unreadTickRef.current++; // no-op while unread indicators disabled
   }, [paneStatuses]);
 
-  // Auto-focus terminal on cell change and force a resize so tmux reflows
-  // in case the pane is out of sync with the current cell dimensions.
+  // focusTick is bumped to force the auto-focus effect to re-run even when
+  // focusedId hasn't changed (e.g. new session assigned to the same cell).
+  const [focusTick, setFocusTick] = useState(0);
+
+  // Auto-focus terminal on cell change. focus() internally calls
+  // notifyResizeIfChanged() so tmux gets notified only when this client's
+  // dims truly changed — no forceResize() here, the container size hasn't
+  // changed on a focus-switch and an unconditional push was the core of the
+  // #934 amplification loop.
   useEffect(() => {
     requestAnimationFrame(() => {
       const ref = viewerRefsMap.current.get(layout.focusedId);
       ref?.current?.focus();
-      ref?.current?.forceResize();
     });
-  }, [layout.focusedId]);
+  }, [layout.focusedId, focusTick]);
 
   // Switcher target cell
   const [switcherCellId, setSwitcherCellId] = useState('');
@@ -597,9 +674,8 @@ function App() {
     });
     // Refit all viewers after the swap settles in the DOM
     requestAnimationFrame(() => {
-      requestAnimationFrame(() => {
-        viewerRefsMap.current.forEach((ref) => ref.current?.refit());
-      });
+      const refs = Array.from(viewerRefsMap.current.values());
+      rafStagger(refs, (ref) => { ref.current?.refit(); });
     });
   }, []);
 
@@ -612,7 +688,7 @@ function App() {
       const focusedCell = layoutRef.current.cells.find((c) => c.id === layoutRef.current.focusedId);
       const target = focusedCell?.target;
       if (target && paneStatusesRef.current[target]) {
-        fetch('/api/v1/panes/status', { method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ target }) });
+        fetch('/api/v1/panes/status', { method: 'DELETE', headers: authHeaders(), body: JSON.stringify({ target }) });
         setPaneStatuses((ps) => { const next = { ...ps }; delete next[target]; return next; });
       }
     };
@@ -649,83 +725,135 @@ function App() {
         return;
       }
 
-      // z — pin/unpin hover preview (BG3 inspect key)
+      // z — pin/unpin ALL hover previews globally (BG3 inspect key)
       if (key === 'z' && !mod && !nav && !shift) {
-        if (hoverPinnedRef.current) {
-          // Delay re-enabling hover clears by a frame to prevent flicker
-          // when the mouse is still over the trigger element
+        if (isHoverPinned()) {
+          // Unpin — clear all App.tsx hovers immediately
           hoverPinnedRef.current = false;
-          requestAnimationFrame(() => setHoverPinned(false));
+          setGlobalHoverPinned(false);
+          setHoverPinned(false);
+          setTicketHover(null);
+          setUrlHover(null);
+          setCommitHover(null);
           return;
         }
-        // Pin the current hover, or restore the last one if mouse already left
-        const last = lastHoverRef.current;
-        if (last.ticket || last.url || last.commit) {
-          e.preventDefault();
-          if (last.ticket) setTicketHover(last.ticket);
-          if (last.url) setUrlHover(last.url);
-          if (last.commit) setCommitHover(last.commit);
-          hoverPinnedRef.current = true;
-          setHoverPinned(true);
-          return;
-        }
+        // Pin whatever is currently on screen
+        e.preventDefault();
+        hoverPinnedRef.current = true;
+        setGlobalHoverPinned(true);
+        setHoverPinned(true);
+        return;
       }
-      // Escape clears pinned hover
-      if (key === 'Escape' && hoverPinnedRef.current) {
+      // Escape clears all pinned hovers
+      if (key === 'Escape' && isHoverPinned()) {
         hoverPinnedRef.current = false;
+        setGlobalHoverPinned(false);
         setHoverPinned(false);
         setTicketHover(null);
         setUrlHover(null);
         setCommitHover(null);
-        lastHoverRef.current = {};
         return;
       }
 
-      if (key === 'Escape' && ticketLookupOpen) { setTicketLookupOpen(false); return; }
+      if (key === 'Escape' && ticketLookupOpen) {
+        e.preventDefault();
+        e.stopPropagation();
+        const target = ticketInsertTarget;
+        // Insert a literal # if we came from a terminal (user pressed # to open,
+        // Esc to cancel — they wanted to type #, not select a ticket).
+        if (target) {
+          handleInput(target, '#');
+        }
+        setTicketLookupOpen(false);
+        setTicketInsertTarget(null);
+        // Restore terminal focus after React unmounts the dialog.
+        if (target) {
+          const cell = layout.cells.find((c) => c.target === target);
+          if (cell) {
+            setTimeout(() => {
+              viewerRefsMap.current.get(cell.id)?.current?.focus();
+            }, 100);
+          }
+        }
+        return;
+      }
       if (key === 'Escape' && playerOpen) { setPlayerOpen(false); return; }
-      if (key === 'Escape' && dashboardOpen) { setDashboardOpen(false); return; }
-      if (key === 'Escape' && settingsOpen) { setSettingsOpen(false); return; }
-      if (key === 'Escape' && kanbanOpen) { setKanbanOpen(false); return; }
+      if (key === 'Escape' && activeView !== 'sessions') { setActiveView('sessions'); return; }
       if (key === 'Escape' && cmdPaletteOpen) { setCmdPaletteOpen(false); return; }
       if (key === 'Escape' && switcherOpen) { setSwitcherOpen(false); return; }
       if (key === 'Escape' && hotkeyMenuOpen) { setHotkeyMenuOpen(false); return; }
       if (key === 'Escape' && notifOpen) { setNotifOpen(false); return; }
 
-      // ? — hotkey menu (only when not typing in a terminal)
-      if (e.key === '?' && !mod && !nav) {
-        const active = document.activeElement;
-        const inTerminal = active?.classList.contains('xterm-helper-textarea');
-        if (!inTerminal) {
-          e.preventDefault();
-          setHotkeyMenuOpen((p) => !p);
-          return;
-        }
+      // Detect whether the user is typing in a real text input (not a terminal).
+      // Terminal panes use a hidden textarea (xterm-helper-textarea) for input,
+      // but we still want some hotkeys (like #) to fire inside terminals.
+      const active = document.activeElement;
+      const inTerminal = active?.classList.contains('xterm-helper-textarea');
+      const inTextInput = !inTerminal && (
+        active instanceof HTMLInputElement
+        || active instanceof HTMLTextAreaElement
+        || active?.hasAttribute('contenteditable')
+      );
+
+      // ` — toggle split view (kanban + terminal), only when not typing
+      if (e.key === '`' && !mod && !nav && !inTerminal && !inTextInput) {
+        e.preventDefault();
+        setSplitView((prev) => {
+          if (!prev) setActiveView('kanban');
+          return !prev;
+        });
+        return;
       }
 
-      // # — ticket lookup dialog (only when not in a terminal)
-      // Inside terminals, # is handled per-pane by PaneViewer's key handler
-      // (gated to agent sessions only via agentTargets in PaneGrid)
-      if (e.key === '#' && !mod && !nav) {
-        const active = document.activeElement;
-        const inTerminal = active?.classList.contains('xterm-helper-textarea');
-        if (!inTerminal) {
-          e.preventDefault();
-          setTicketLookupOpen((p) => !p);
+      // ? — hotkey menu (only when not typing in any input or terminal)
+      if (e.key === '?' && !mod && !nav && !inTerminal && !inTextInput) {
+        e.preventDefault();
+        setHotkeyMenuOpen((p) => !p);
+        return;
+      }
+
+      // # — ticket lookup dialog
+      // In agent terminals: handled by PaneViewer's xterm key handler → onHashKey
+      //   (sets ticketInsertTarget so dialog inserts into PTY)
+      // In non-agent terminals: xterm handler passes through, global handler
+      //   opens dialog in clipboard mode (no ticketInsertTarget)
+      // In text inputs: skip — let the user type a literal #
+      if (e.key === '#' && !mod && !nav && !inTextInput) {
+        // Don't intercept if xterm's onHashKey will handle it (agent sessions).
+        // Check: if we're in a terminal and the focused cell has onHashKey wired,
+        // let xterm handle it. Otherwise open clipboard-mode dialog.
+        if (inTerminal) {
+          // Let the event propagate to xterm's attachCustomKeyEventHandler.
+          // If it's an agent session, xterm will call onHashKey and return false.
+          // If not, xterm returns true and # types normally in the PTY.
           return;
         }
+        e.preventDefault();
+        setTicketLookupOpen((p) => !p);
+        return;
       }
 
       // Mod+Shift+D — agent dashboard
       if (mod && shift && key === 'd') {
         e.preventDefault(); e.stopPropagation();
-        setDashboardOpen((p) => !p);
+        setActiveView((p) => p === 'dashboard' ? 'sessions' : 'dashboard');
         return;
       }
 
       // Mod+Shift+K — kanban board
       if (mod && shift && key === 'k') {
         e.preventDefault(); e.stopPropagation();
-        setKanbanOpen((p) => !p);
+        setActiveView((p) => p === 'kanban' ? 'sessions' : 'kanban');
+        return;
+      }
+
+      // Mod+Shift+L — toggle split view (kanban + terminal)
+      if (mod && shift && key === 'l') {
+        e.preventDefault(); e.stopPropagation();
+        setSplitView((prev) => {
+          if (!prev) setActiveView('kanban');
+          return !prev;
+        });
         return;
       }
 
@@ -828,6 +956,33 @@ function App() {
         return;
       }
 
+      // Nav+Shift+[ — move current tab left (no wrap)
+      // e.code is used because e.key becomes '{' when Shift is held on US layouts
+      if (nav && !mod && shift && e.code === 'BracketLeft') {
+        e.preventDefault(); e.stopPropagation();
+        setLayout((prev) => {
+          const cell = prev.cells.find((c) => c.id === prev.focusedId);
+          if (!cell || cell.tabs.length < 2 || !cell.target) return prev;
+          const idx = cell.tabs.findIndex((t) => t.target === cell.target);
+          if (idx <= 0) return prev;
+          return { ...prev, cells: prev.cells.map((c) => c.id === cell.id ? reorderTab(c, idx, idx - 1) : c) };
+        });
+        return;
+      }
+
+      // Nav+Shift+] — move current tab right (no wrap)
+      if (nav && !mod && shift && e.code === 'BracketRight') {
+        e.preventDefault(); e.stopPropagation();
+        setLayout((prev) => {
+          const cell = prev.cells.find((c) => c.id === prev.focusedId);
+          if (!cell || cell.tabs.length < 2 || !cell.target) return prev;
+          const idx = cell.tabs.findIndex((t) => t.target === cell.target);
+          if (idx < 0 || idx >= cell.tabs.length - 1) return prev;
+          return { ...prev, cells: prev.cells.map((c) => c.id === cell.id ? reorderTab(c, idx, idx + 1) : c) };
+        });
+        return;
+      }
+
       // Nav+W — close current tab in focused cell
       if (nav && !mod && !shift && key === 'w') {
         e.preventDefault(); e.stopPropagation();
@@ -878,7 +1033,7 @@ function App() {
     document.addEventListener('keydown', handleGlobalKey, true);
     document.addEventListener('keydown', handleCapsLock);
     return () => { document.removeEventListener('keydown', handleGlobalKey, true); document.removeEventListener('keydown', handleCapsLock); };
-  }, [switcherOpen, openSwitcher, toggleMaximize, mergeInDirection, splitFocused, swapInDirection, subscribe, unsubscribe, closeTab, layout.cells, layout.focusedId, hotkeyMenuOpen, notifOpen, ticketLookupOpen, playerOpen, dashboardOpen, settingsOpen, kanbanOpen, cmdPaletteOpen]);
+  }, [switcherOpen, openSwitcher, toggleMaximize, mergeInDirection, splitFocused, swapInDirection, subscribe, unsubscribe, closeTab, layout.cells, layout.focusedId, hotkeyMenuOpen, notifOpen, ticketLookupOpen, playerOpen, activeView, cmdPaletteOpen]);
 
   const activeTargets = layout.cells
     .map((c) => c.target)
@@ -967,9 +1122,9 @@ function App() {
     { id: 'notifications', label: 'Toggle Notifications', category: 'Panel', action: () => setNotifOpen((p) => !p) },
     { id: 'hotkeys', label: 'Show Keyboard Shortcuts', category: 'Panel', shortcut: '?', action: () => setHotkeyMenuOpen(true) },
     { id: 'toggle-sidebar', label: 'Toggle Sidebar', category: 'Panel', shortcut: 'Alt+B', action: () => setSidebarCollapsed((p) => !p) },
-    { id: 'kanban', label: 'Open Kanban Board', category: 'Panel', shortcut: 'Ctrl+Shift+K', action: () => setKanbanOpen(true) },
-    { id: 'dashboard', label: 'Open Agent Dashboard', category: 'Panel', shortcut: 'Ctrl+Shift+D', action: () => setDashboardOpen(true) },
-    { id: 'docs', label: 'Open Docs', category: 'Panel', action: () => { setDocsOpen(true); setKanbanOpen(false); setDashboardOpen(false); } },
+    { id: 'kanban', label: 'Open Kanban Board', category: 'Panel', shortcut: 'Ctrl+Shift+K', action: () => setActiveView('kanban') },
+    { id: 'dashboard', label: 'Open Agent Dashboard', category: 'Panel', shortcut: 'Ctrl+Shift+D', action: () => setActiveView('dashboard') },
+    { id: 'docs', label: 'Open Docs', category: 'Panel', action: () => setActiveView('docs') },
     { id: 'ticket-lookup', label: 'Ticket Lookup', category: 'Panel', shortcut: '#', action: () => setTicketLookupOpen(true) },
     { id: 'enable-notifs', label: `Notifications: ${permissionState}`, category: 'Settings', action: requestPermission },
     { id: 'notif-patterns', label: 'Notification Patterns', category: 'Settings', action: () => setNotifSettingsOpen(true) },
@@ -1034,66 +1189,6 @@ function App() {
     }},
 
     // Workspaces
-    // Consensus
-    { id: 'consensus', label: 'Start Consensus Run', category: 'AI', action: async () => {
-      const dir = window.prompt('Working directory (required):', '~/repos/workshop');
-      if (!dir) return;
-      const prompt = window.prompt('Enter prompt for all agents:');
-      if (!prompt) return;
-      const agentCount = window.prompt('Number of agents:', '3');
-      const n = parseInt(agentCount || '3') || 3;
-      const agents = Array.from({ length: n }, (_, i) => ({ name: `agent-${i + 1}`, model: 'sonnet' }));
-      try {
-        const res = await post<{ id: string }>('/consensus', {
-          prompt,
-          directory: dir,
-          agents,
-          timeout: 600,
-        });
-        alert(`Consensus run started: ${res.id}\n${n} agents working in ${dir}.\nCheck sidebar for new sessions.`);
-      } catch (err) {
-        alert('Failed to start consensus: ' + err);
-      }
-    }},
-
-    { id: 'consensus-status', label: 'Check Consensus Status', category: 'AI', action: async () => {
-      try {
-        const runs = await get<any[]>('/consensus');
-        if (!runs || runs.length === 0) {
-          alert('No consensus runs.');
-          return;
-        }
-        const latest = runs[runs.length - 1];
-        const agents = (latest.agentOutputs || []).map((a: any) =>
-          `  ${a.name} (${a.model}): ${a.status}${a.needsInput ? ' ⚠️ NEEDS INPUT' : ''}`
-        ).join('\n');
-        const needsInput = (latest.agentOutputs || []).filter((a: any) => a.needsInput);
-        let msg = `Consensus: ${latest.id}\nStatus: ${latest.status}\n\nAgents:\n${agents}`;
-        if (needsInput.length > 0) {
-          msg += `\n\n⚠️ ${needsInput.length} agent(s) need input! Jump to them in the sidebar.`;
-        }
-        alert(msg);
-        // If any agent needs input, assign it to the focused cell
-        if (needsInput.length > 0) {
-          assignPaneToCell(layout.focusedId, needsInput[0].target);
-        }
-      } catch (err) {
-        alert('Failed to check consensus: ' + err);
-      }
-    }},
-
-    { id: 'consensus-cleanup', label: 'Cleanup Consensus Sessions', category: 'AI', action: async () => {
-      try {
-        const runs = await get<any[]>('/consensus');
-        if (!runs || runs.length === 0) { alert('No consensus runs.'); return; }
-        const latest = runs[runs.length - 1];
-        if (!confirm(`Cleanup sessions for ${latest.id}?`)) return;
-        await fetch(`/api/v1/consensus/${latest.id}`, { method: 'DELETE' });
-        alert('Consensus sessions cleaned up.');
-      } catch (err) {
-        alert('Failed: ' + err);
-      }
-    }},
 
     { id: 'save-workspace', label: 'Save Current as Workspace', category: 'Workspace', action: handleSaveWorkspace },
     ...listWorkspaces().map((name) => ({
@@ -1110,18 +1205,19 @@ function App() {
     })),
   ];
 
-  const activeView = kanbanOpen ? 'kanban' : dashboardOpen ? 'dashboard' : docsOpen ? 'docs' : graphOpen ? 'graph' : ollamaOpen ? 'ollama' : activityOpen ? 'activity' : settingsOpen ? 'settings' : 'sessions';
+  const showSplit = splitView && activeView === 'kanban';
 
-  // Refocus terminal when returning to Sessions view
+  // Refocus terminal when returning to Sessions view (or split view which also shows terminal)
   useEffect(() => {
-    if (activeView === 'sessions') {
+    if (activeView === 'sessions' || showSplit) {
       requestAnimationFrame(() => {
         viewerRefsMap.current.get(layout.focusedId)?.current?.focus();
       });
     }
-  }, [activeView, layout.focusedId]);
+  }, [activeView, showSplit, layout.focusedId]);
 
   return (
+    <AuthGate>
     <div className="app">
       {/* Mobile sidebar backdrop */}
       {!sidebarCollapsed && (
@@ -1161,12 +1257,22 @@ function App() {
         onSessionRenamed={handleSessionRenamed}
         sfwMode={settings.sfwMode}
         nsfwProjects={settings.nsfwProjects}
+        initSessions={initSessions}
         style={{ width: sidebarCollapsed ? undefined : sidebarWidth }}
       />
       {!sidebarCollapsed && (
         <ResizeHandle onResize={(d) => setSidebarWidth((w) => Math.min(500, Math.max(180, w + d)))} />
       )}
       <main className="main-content">
+        {/* Update available banner — backend version differs from embedded.
+            Not dismissible: stale tabs are the root cause of missed freeze
+            fixes, so we keep nudging until the user reloads. */}
+        {versionUpdateAvailable && (
+          <div className="notif-permission-banner version-update-banner">
+            <span>Workshop was updated{latestVersion ? ` (${latestVersion})` : ''} — reload to pick up the new version</span>
+            <button className="btn-create" onClick={() => window.location.reload()}>Reload</button>
+          </div>
+        )}
         {/* Notification permission banner — shown until user grants/denies */}
         {permissionState === 'default' && !notifBannerDismissed && (
           <div className="notif-permission-banner">
@@ -1179,52 +1285,66 @@ function App() {
           <button className="mobile-menu-btn" onClick={() => setSidebarCollapsed((p) => !p)}>☰</button>
           <button
             className={`mode-tab${activeView === 'sessions' ? ' active' : ''}`}
-            onClick={() => { setKanbanOpen(false); setDashboardOpen(false); setDocsOpen(false); setSettingsOpen(false); setGraphOpen(false); setOllamaOpen(false); setActivityOpen(false); }}
+            onClick={() => setActiveView('sessions')}
           >
             Sessions
           </button>
           <button
             className={`mode-tab${activeView === 'kanban' ? ' active' : ''}`}
-            onClick={() => { setKanbanOpen(true); setDashboardOpen(false); setDocsOpen(false); setSettingsOpen(false); setGraphOpen(false); setOllamaOpen(false); setActivityOpen(false); }}
+            onClick={() => setActiveView('kanban')}
           >
             Kanban
           </button>
           <button
             className={`mode-tab${activeView === 'graph' ? ' active' : ''}`}
-            onClick={() => { setGraphOpen(true); setKanbanOpen(false); setDashboardOpen(false); setDocsOpen(false); setSettingsOpen(false); setOllamaOpen(false); setActivityOpen(false); }}
+            onClick={() => setActiveView('graph')}
           >
             Graph
           </button>
           <button
             className={`mode-tab${activeView === 'dashboard' ? ' active' : ''}`}
-            onClick={() => { setDashboardOpen(true); setKanbanOpen(false); setDocsOpen(false); setSettingsOpen(false); setGraphOpen(false); setOllamaOpen(false); setActivityOpen(false); }}
+            onClick={() => setActiveView('dashboard')}
           >
             Agents
           </button>
           <button
             className={`mode-tab${activeView === 'activity' ? ' active' : ''}`}
-            onClick={() => { setActivityOpen(true); setKanbanOpen(false); setDashboardOpen(false); setDocsOpen(false); setSettingsOpen(false); setGraphOpen(false); setOllamaOpen(false); }}
+            onClick={() => setActiveView('activity')}
           >
             Activity
           </button>
           <button
             className={`mode-tab${activeView === 'docs' ? ' active' : ''}`}
-            onClick={() => { setDocsOpen(true); setKanbanOpen(false); setDashboardOpen(false); setSettingsOpen(false); setGraphOpen(false); setOllamaOpen(false); setActivityOpen(false); }}
+            onClick={() => setActiveView('docs')}
           >
             Docs
           </button>
           <button
             className={`mode-tab${activeView === 'ollama' ? ' active' : ''}`}
-            onClick={() => { setOllamaOpen(true); setKanbanOpen(false); setDashboardOpen(false); setDocsOpen(false); setSettingsOpen(false); setGraphOpen(false); setActivityOpen(false); }}
+            onClick={() => setActiveView('ollama')}
           >
             Chat
           </button>
           <button
             className={`mode-tab${activeView === 'settings' ? ' active' : ''}`}
-            onClick={() => { setSettingsOpen(true); setKanbanOpen(false); setDashboardOpen(false); setDocsOpen(false); setGraphOpen(false); setOllamaOpen(false); setActivityOpen(false); }}
+            onClick={() => setActiveView('settings')}
           >
             Settings
           </button>
+          {(activeView === 'kanban' || activeView === 'sessions') && (
+            <button
+              className={`mode-tab split-toggle${showSplit ? ' active' : ''}`}
+              onClick={() => {
+                setSplitView((prev) => {
+                  if (!prev) setActiveView('kanban');
+                  return !prev;
+                });
+              }}
+              title={showSplit ? 'Exit split view (` or Ctrl+Shift+L)' : 'Split: Kanban + Terminal (` or Ctrl+Shift+L)'}
+            >
+              {showSplit ? '\u22A1' : '\u229F'}
+            </button>
+          )}
         </div>
         <div className="status-bar">
           <span className={connected ? 'status-ok' : 'status-err'}>
@@ -1233,7 +1353,7 @@ function App() {
           {capsLockOn && <span className="capslock-warn" title="CapsLock is on — hotkeys still work">CAPS</span>}
 
           {/* Context-specific status bar content */}
-          {activeView === 'sessions' && (
+          {(activeView === 'sessions' || showSplit) && (
             <>
               <WorkspaceManager
                 activeWorkspace={workspaceName}
@@ -1256,7 +1376,7 @@ function App() {
               </div>
             </>
           )}
-          {activeView === 'kanban' && (
+          {activeView === 'kanban' && !showSplit && (
             <span className="active-target">Project Tracking</span>
           )}
           {activeView === 'dashboard' && (
@@ -1279,6 +1399,7 @@ function App() {
           )}
 
           <div className="status-bar-right">
+            <UsageBars />
             <button className="btn-switcher" onClick={() => openSwitcher()}>Ctrl+P</button>
             <button className="btn-switcher" onClick={() => setSearchOpen((p) => !p)}>Search</button>
             <button className="btn-switcher" onClick={() => setHotkeyMenuOpen((p) => !p)} title="Hotkeys (?)">?</button>
@@ -1367,8 +1488,45 @@ function App() {
             />
           </div>
         )}
-        {/* PaneGrid always mounted (hidden when not active) to preserve terminal state */}
-        <div style={{ display: activeView === 'sessions' ? 'contents' : 'none' }}>
+        {/* PaneGrid is always mounted to preserve terminal state.
+            In split mode, kanban sits above PaneGrid as flex siblings inside main-content.
+            In sessions mode, PaneGrid fills all remaining space.
+            In other views, PaneGrid is hidden with display:none. */}
+        {showSplit && (
+          <>
+            <div className="split-view-top" ref={splitContainerRef} style={{ flex: `0 0 ${splitRatio * 100}%`, overflow: 'hidden', minHeight: 100 }}>
+              <KanbanBoard
+                defaultProject={focusedTarget?.split(':')[0]}
+                focusedPath={layout.cells.find((c) => c.id === layout.focusedId)?.target
+                  ? allPanes.find((p) => p.target === focusedTarget)?.path
+                  : undefined}
+                onNavigateToPane={(target) => {
+                  setActiveView('sessions');
+                  const cell = layout.cells.find((c) => c.target === target);
+                  if (cell) handleFocusCell(cell.id);
+                  else assignPaneToCell(layout.focusedId, target);
+                }}
+                ticketAutocomplete={settings.ticketAutocomplete}
+                sfwMode={settings.sfwMode}
+                nsfwProjects={settings.nsfwProjects}
+                openCardId={pendingOpenCardId}
+                onCardOpened={() => setPendingOpenCardId(null)}
+              />
+            </div>
+            <ResizeHandle
+              direction="vertical"
+              onResize={(delta) => {
+                // Use main-content as the reference height for ratio calculation
+                const mainEl = splitContainerRef.current?.parentElement;
+                if (!mainEl) return;
+                const h = mainEl.getBoundingClientRect().height;
+                if (h <= 0) return;
+                setSplitRatio((prev) => Math.min(0.8, Math.max(0.1, prev + delta / h)));
+              }}
+            />
+          </>
+        )}
+        <div style={{ display: (activeView === 'sessions' || showSplit) ? 'contents' : 'none' }}>
           <PaneGrid
             layout={layout}
             viewerRefs={viewerRefsMap.current}
@@ -1381,10 +1539,11 @@ function App() {
             onAssignPane={openSwitcher}
             onSwitchTab={switchTab}
             onCloseTab={closeTab}
-            onTicketHover={(id, x, y) => { if (!id && hoverPinnedRef.current) return; if (id) lastHoverRef.current = { ticket: { id, x, y } }; setTicketHover(id ? { id, x, y } : null); }}
-            onUrlHover={(url, x, y) => { if (!url && hoverPinnedRef.current) return; if (url) lastHoverRef.current = { url: { url, x, y } }; setUrlHover(url ? { url, x, y } : null); }}
-            onCommitHover={(sha, x, y) => { if (!sha && hoverPinnedRef.current) return; if (sha) lastHoverRef.current = { commit: { sha, x, y } }; setCommitHover(sha ? { sha, x, y } : null); }}
-            onTicketClick={(id) => { setKanbanOpen(true); /* TODO: focus the card */ void id; }}
+            onReorderTab={reorderTabInCell}
+            onTicketHover={(id, x, y) => { if (!id && hoverPinnedRef.current) return; setTicketHover(id ? { id, x, y } : null); }}
+            onUrlHover={(url, x, y) => { if (!url && hoverPinnedRef.current) return; setUrlHover(url ? { url, x, y } : null); }}
+            onCommitHover={(sha, x, y) => { if (!sha && hoverPinnedRef.current) return; setCommitHover(sha ? { sha, x, y } : null); }}
+            onTicketClick={(id) => { setActiveView('kanban'); /* TODO: focus the card */ void id; }}
             sfwMode={settings.sfwMode}
             nsfwProjects={settings.nsfwProjects}
             onHashKey={settings.terminalHashKey ? () => {
@@ -1402,23 +1561,26 @@ function App() {
             )}
           />
         </div>
-        {ticketHover && <div className={hoverPinned ? 'hover-pinned' : ''}><TicketHoverPreview cardId={ticketHover.id} x={ticketHover.x} y={ticketHover.y} /></div>}
-        {urlHover && <div className={hoverPinned ? 'hover-pinned' : ''}><LinkHoverPreview url={urlHover.url} x={urlHover.x} y={urlHover.y} /></div>}
+        <MobileToolbar
+          visible={(activeView === 'sessions' || showSplit) && !!focusedTarget && !cmdPaletteOpen}
+          onSend={(data) => { if (focusedTarget) handleInput(focusedTarget, data); }}
+        />
+        {ticketHover && <TicketHoverPreview cardId={ticketHover.id} x={ticketHover.x} y={ticketHover.y} pinned={hoverPinned} />}
+        {urlHover && <LinkHoverPreview url={urlHover.url} x={urlHover.x} y={urlHover.y} pinned={hoverPinned} />}
         {commitHover && (() => {
           const focusedPane = allPanes.find((p) => p.target === focusedTarget);
           return focusedPane?.path ? (
-            <div className={hoverPinned ? 'hover-pinned' : ''}><GitCommitHoverPreview sha={commitHover.sha} repoDir={focusedPane.path} x={commitHover.x} y={commitHover.y} /></div>
+            <GitCommitHoverPreview sha={commitHover.sha} repoDir={focusedPane.path} x={commitHover.x} y={commitHover.y} pinned={hoverPinned} />
           ) : null;
         })()}
-        {activeView === 'kanban' && (
+        {activeView === 'kanban' && !showSplit && (
           <KanbanBoard
             defaultProject={focusedTarget?.split(':')[0]}
             focusedPath={layout.cells.find((c) => c.id === layout.focusedId)?.target
               ? allPanes.find((p) => p.target === focusedTarget)?.path
               : undefined}
             onNavigateToPane={(target) => {
-              setKanbanOpen(false);
-              setDashboardOpen(false);
+              setActiveView('sessions');
               const cell = layout.cells.find((c) => c.target === target);
               if (cell) handleFocusCell(cell.id);
               else assignPaneToCell(layout.focusedId, target);
@@ -1426,7 +1588,6 @@ function App() {
             ticketAutocomplete={settings.ticketAutocomplete}
             sfwMode={settings.sfwMode}
             nsfwProjects={settings.nsfwProjects}
-            dispatchTick={dispatchTick}
             openCardId={pendingOpenCardId}
             onCardOpened={() => setPendingOpenCardId(null)}
           />
@@ -1434,9 +1595,7 @@ function App() {
         {activeView === 'dashboard' && (
           <AgentDashboard
             onNavigateToPane={(target) => {
-              setKanbanOpen(false);
-              setDashboardOpen(false);
-              setDocsOpen(false);
+              setActiveView('sessions');
               const cell = layout.cells.find((c) => c.target === target);
               if (cell) handleFocusCell(cell.id);
               else assignPaneToCell(layout.focusedId, target);
@@ -1445,13 +1604,13 @@ function App() {
             nsfwProjects={settings.nsfwProjects}
           />
         )}
-        {activeView === 'docs' && <DocsView openPath={pendingDocPath} onOpenPathConsumed={() => setPendingDocPath(null)} onTicketClick={(id) => { setKanbanOpen(true); void id; }} onTicketHover={(id, x, y) => { if (!id && hoverPinnedRef.current) return; if (id) lastHoverRef.current = { ticket: { id, x, y } }; setTicketHover(id ? { id, x, y } : null); }} />}
+        {activeView === 'docs' && <DocsView openPath={pendingDocPath} onOpenPathConsumed={() => setPendingDocPath(null)} onTicketClick={(id) => { setActiveView('kanban'); void id; }} onTicketHover={(id, x, y) => { if (!id && hoverPinnedRef.current) return; setTicketHover(id ? { id, x, y } : null); }} />}
         {activeView === 'activity' && <ActivityView />}
         {activeView === 'ollama' && <OllamaChat />}
         {activeView === 'graph' && (
           <DependencyGraph
             defaultProject={focusedTarget?.split(':')[0]}
-            onOpenCard={(id) => { setPendingOpenCardId(id); setGraphOpen(false); setKanbanOpen(true); }}
+            onOpenCard={(id) => { setPendingOpenCardId(id); setActiveView('kanban'); }}
             onConfirm={confirmViaDialog}
           />
         )}
@@ -1482,6 +1641,7 @@ function App() {
         onCancel={() => uiDialog?.onResolve(undefined, true)}
       />
     </div>
+    </AuthGate>
   );
 }
 

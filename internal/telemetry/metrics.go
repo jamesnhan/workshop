@@ -48,9 +48,7 @@ var (
 
 	// --- Agents ---
 
-	AgentLaunchesTotal    metric.Int64Counter       // provider, model
-	ConsensusRunsTotal    metric.Int64Counter       // status
-	ConsensusAgentsActive metric.Int64UpDownCounter
+	AgentLaunchesTotal metric.Int64Counter // provider, model
 
 	// --- Usage ---
 
@@ -103,12 +101,6 @@ func InitMetrics() {
 	// Agents
 	AgentLaunchesTotal, _ = meter.Int64Counter("workshop_agent_launches_total",
 		metric.WithDescription("Total agent launches"),
-	)
-	ConsensusRunsTotal, _ = meter.Int64Counter("workshop_consensus_runs_total",
-		metric.WithDescription("Total consensus runs"),
-	)
-	ConsensusAgentsActive, _ = meter.Int64UpDownCounter("workshop_consensus_agents_active",
-		metric.WithDescription("Currently active consensus agents"),
 	)
 
 	// Usage

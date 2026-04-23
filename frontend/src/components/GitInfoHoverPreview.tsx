@@ -15,11 +15,12 @@ interface Props {
   info: GitInfo;
   x: number;
   y: number;
+  pinned?: boolean;
 }
 
-export function GitInfoHoverPreview({ info, x, y }: Props) {
+export function GitInfoHoverPreview({ info, x, y, pinned }: Props) {
   return (
-    <HoverPreview x={x} y={y} width={380} maxHeight={320} className="git-hover-preview">
+    <HoverPreview x={x} y={y} width={380} maxHeight={320} className={`git-hover-preview${pinned ? ' hover-pinned-inline' : ''}`}>
       <div className="git-hover-header">
         <span className="git-hover-branch">{info.branch}</span>
         {info.repoName && <span className="git-hover-repo">{info.repoName}</span>}

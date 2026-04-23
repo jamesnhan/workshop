@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
+import { counters, post, recordBreadcrumb } from '../lib/telemetry';
 
 interface WsMessage {
   type: string;
@@ -28,7 +29,6 @@ type StatusHandler = (target: string, status: string, message: string) => void;
 type StatusClearHandler = (target: string) => void;
 type ReconnectHandler = () => void;
 type OpenDocHandler = (path: string) => void;
-type DispatchUpdateHandler = (cardId: number, dispatchId: number, status: string) => void;
 type SessionCreatedHandler = (target: string, background: boolean) => void;
 type UICommandHandler = (cmd: UICommand) => void;
 
@@ -42,27 +42,32 @@ export function useWorkshopSocket() {
   const onStatusClearRef = useRef<StatusClearHandler | null>(null);
   const onReconnectRef = useRef<ReconnectHandler | null>(null);
   const onOpenDocRef = useRef<OpenDocHandler | null>(null);
-  const onDispatchUpdateRef = useRef<DispatchUpdateHandler | null>(null);
   const onSessionCreatedRef = useRef<SessionCreatedHandler | null>(null);
   const onUICommandRef = useRef<UICommandHandler | null>(null);
   const wasConnected = useRef(false);
 
   useEffect(() => {
     closedRef.current = false;
+    let retryCount = 0;
 
     function connect() {
       if (closedRef.current) return;
 
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = `${protocol}//${window.location.host}/ws`;
-      console.log('[workshop] connecting to', wsUrl);
+      const token = localStorage.getItem('workshop:api-key') || '';
+      const wsUrl = `${protocol}//${window.location.host}/ws${token ? `?token=${encodeURIComponent(token)}` : ''}`;
+      console.log('[workshop] connecting to', wsUrl.replace(/token=.*/, 'token=***'));
       const ws = new WebSocket(wsUrl);
 
       ws.onopen = () => {
         console.log('[workshop] ws connected');
+        retryCount = 0; // Reset backoff on successful connection
         const isReconnect = wasConnected.current;
         wasConnected.current = true;
         setConnected(true);
+        post({ msg: 'frontend.ws.connect', reconnect: isReconnect });
+        recordBreadcrumb('ws.connect', { reconnect: isReconnect });
+        if (isReconnect) counters.wsReconnects++;
         // Notify App to clear terminals on reconnect (stale PTY state)
         if (isReconnect) {
           console.log('[workshop] reconnect — clearing terminal state');
@@ -75,19 +80,33 @@ export function useWorkshopSocket() {
 
       ws.onerror = (e) => {
         console.error('[workshop] ws error:', e);
+        post({ msg: 'frontend.ws.error' });
+        recordBreadcrumb('ws.error');
       };
 
       ws.onclose = (e) => {
         console.log('[workshop] ws closed:', e.code, e.reason);
         setConnected(false);
+        post({ msg: 'frontend.ws.disconnect', code: e.code, reason: e.reason, was_clean: e.wasClean });
+        recordBreadcrumb('ws.disconnect', { code: e.code, clean: e.wasClean });
         if (!closedRef.current) {
-          setTimeout(connect, 2000);
+          // Exponential backoff with jitter: 1s, 2s, 4s, 8s... capped at 30s
+          const base = Math.min(1000 * Math.pow(2, retryCount), 30000);
+          const jitter = Math.random() * 1000;
+          retryCount++;
+          console.log(`[workshop] reconnecting in ${Math.round(base + jitter)}ms (attempt ${retryCount})`);
+          setTimeout(connect, base + jitter);
         }
       };
 
       ws.onmessage = (e) => {
+        counters.wsMessages++;
+        if (typeof e.data === 'string') counters.wsBytes += e.data.length;
+        const t0 = performance.now();
+        let msgType = 'unknown';
         try {
           const msg: WsMessage = JSON.parse(e.data);
+          msgType = msg.type ?? 'unknown';
           if (msg.type === 'output' && msg.data) {
             onOutputRef.current?.(msg.data.target, msg.data.data);
           } else if (msg.type === 'pane_status' && msg.data) {
@@ -96,9 +115,6 @@ export function useWorkshopSocket() {
             onStatusClearRef.current?.(msg.data.target);
           } else if (msg.type === 'open_doc' && msg.data?.path) {
             onOpenDocRef.current?.(msg.data.path);
-          } else if (msg.type === 'dispatch_updated' && msg.data?.cardId != null) {
-            const dispatchId = typeof msg.data.id === 'number' ? msg.data.id : 0;
-            onDispatchUpdateRef.current?.(msg.data.cardId, dispatchId, msg.data.status || '');
           } else if (msg.type === 'session_created' && msg.data?.target) {
             onSessionCreatedRef.current?.(msg.data.target, msg.data.background ?? true);
           } else if (msg.type === 'activity' && msg.data) {
@@ -114,6 +130,14 @@ export function useWorkshopSocket() {
           }
         } catch (err) {
           console.error('[workshop] bad ws message:', err);
+        }
+        // Breadcrumb non-output messages individually (they're rare and
+        // informative — session_created, ui_command, etc.). Output messages
+        // only breadcrumb if the handler took >10ms so we don't flood the
+        // ring buffer during streaming bursts.
+        const ms = Math.round(performance.now() - t0);
+        if (msgType !== 'output' || ms >= 10) {
+          recordBreadcrumb('ws.msg', { type: msgType }, ms);
         }
       };
 
@@ -188,10 +212,6 @@ export function useWorkshopSocket() {
     onOpenDocRef.current = handler;
   }, []);
 
-  const onDispatchUpdate = useCallback((handler: DispatchUpdateHandler) => {
-    onDispatchUpdateRef.current = handler;
-  }, []);
-
   const onSessionCreated = useCallback((handler: SessionCreatedHandler) => {
     onSessionCreatedRef.current = handler;
   }, []);
@@ -200,5 +220,5 @@ export function useWorkshopSocket() {
     onUICommandRef.current = handler;
   }, []);
 
-  return { connected, subscribe, unsubscribe, sendInput, sendResize, startRecording, stopRecording, onOutput, onStatus, onStatusClear, onReconnect, onOpenDoc, onDispatchUpdate, onSessionCreated, onUICommand };
+  return { connected, subscribe, unsubscribe, sendInput, sendResize, startRecording, stopRecording, onOutput, onStatus, onStatusClear, onReconnect, onOpenDoc, onSessionCreated, onUICommand };
 }

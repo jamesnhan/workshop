@@ -17,6 +17,7 @@ interface Props {
   cardId: number;
   x: number;
   y: number;
+  pinned?: boolean;
 }
 
 const typeColors: Record<string, string> = {
@@ -50,7 +51,7 @@ const columnColors: Record<string, string> = {
 // Cache so we don't refetch on every hover
 const cardCache = new Map<number, Card | null>();
 
-export function TicketHoverPreview({ cardId, x, y }: Props) {
+export function TicketHoverPreview({ cardId, x, y, pinned }: Props) {
   const [card, setCard] = useState<Card | null | undefined>(cardCache.get(cardId));
 
   useEffect(() => {
@@ -73,7 +74,7 @@ export function TicketHoverPreview({ cardId, x, y }: Props) {
 
   if (card === undefined) {
     return (
-      <HoverPreview x={x} y={y} className="ticket-hover-preview">
+      <HoverPreview x={x} y={y} className={`ticket-hover-preview${pinned ? ' hover-pinned-inline' : ''}`}>
         <div className="ticket-hover-loading">Loading #{cardId}…</div>
       </HoverPreview>
     );
@@ -81,14 +82,14 @@ export function TicketHoverPreview({ cardId, x, y }: Props) {
 
   if (card === null) {
     return (
-      <HoverPreview x={x} y={y} className="ticket-hover-preview">
+      <HoverPreview x={x} y={y} className={`ticket-hover-preview${pinned ? ' hover-pinned-inline' : ''}`}>
         <div className="ticket-hover-empty">#{cardId} not found</div>
       </HoverPreview>
     );
   }
 
   return (
-    <HoverPreview x={x} y={y} className="ticket-hover-preview">
+    <HoverPreview x={x} y={y} className={`ticket-hover-preview${pinned ? ' hover-pinned-inline' : ''}`}>
       <div className="ticket-hover-header">
         <span className="ticket-hover-id">#{card.id}</span>
         {card.cardType && (

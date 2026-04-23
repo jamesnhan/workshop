@@ -95,15 +95,18 @@ export function CommandPalette({ commands, onClose }: Props) {
   return (
     <div className="switcher-overlay" onClick={onClose}>
       <div className="command-palette" onClick={(e) => e.stopPropagation()}>
-        <input
-          ref={inputRef}
-          type="text"
-          className="switcher-input"
-          placeholder="Type a command..."
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          onKeyDown={handleKeyDown}
-        />
+        <div className="command-palette-header">
+          <input
+            ref={inputRef}
+            type="text"
+            className="switcher-input"
+            placeholder="Type a command..."
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            onKeyDown={handleKeyDown}
+          />
+          <button className="command-palette-close" onClick={onClose}>✕</button>
+        </div>
         <div className="command-list" ref={listRef}>
           {fzfResults.map((r, i) => (
             <div

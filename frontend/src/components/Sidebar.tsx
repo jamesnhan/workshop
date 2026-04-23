@@ -1,8 +1,10 @@
-import { useEffect, useState, useCallback, useRef } from 'react';
+import { useEffect, useLayoutEffect, useState, useCallback, useRef } from 'react';
 import { get, post, del, patch } from '../api/client';
+import { recordBreadcrumb } from '../lib/telemetry';
 import AnsiToHtml from 'ansi-to-html';
 import DOMPurify from 'dompurify';
 import { ConfirmDialog, type DialogKind } from './ConfirmDialog';
+import { isHoverPinned, onHoverPinChange } from '../hooks/useHoverPin';
 import { GitInfoHoverPreview } from './GitInfoHoverPreview';
 
 interface Session {
@@ -59,6 +61,8 @@ interface Props {
   style?: React.CSSProperties;
   sfwMode?: boolean;
   nsfwProjects?: string[];
+  /** Pre-fetched sessions from /init batch endpoint. Skips first /sessions fetch if provided. */
+  initSessions?: { name: string; windows: number; attached: boolean }[] | null;
 }
 
 // Severity rank for aggregating a session's worst pane status.
@@ -85,14 +89,73 @@ const STATUS_COLORS: Record<string, string> = {
   red: 'var(--error)',
 };
 
-export function Sidebar({ collapsed, onToggleCollapse, onSelectPane, activeTargets, paneStatuses, onSessionRenamed, maximizedTarget, onFocusSession, style, sfwMode = false, nsfwProjects = [] }: Props) {
-  const [sessions, setSessions] = useState<Session[]>([]);
+// Group sessions by project. We use the git repo name (already fetched for
+// the badge) as the project key — for this user, session name and repo
+// name converge most of the time. Sessions without gitInfo land under the
+// catch-all `OTHER_GROUP`. Groups are returned sorted alphabetically with
+// "Other" pinned at the bottom.
+export const OTHER_GROUP = 'Other';
+export interface SessionGroup {
+  project: string;
+  sessions: Session[];
+}
+export function groupSessions(
+  sessions: Session[],
+  gitInfo: Record<string, { repoName: string }>,
+): SessionGroup[] {
+  const byProject = new Map<string, Session[]>();
+  for (const s of sessions) {
+    const project = gitInfo[s.name]?.repoName || OTHER_GROUP;
+    const bucket = byProject.get(project);
+    if (bucket) bucket.push(s);
+    else byProject.set(project, [s]);
+  }
+  return Array.from(byProject.entries())
+    .map(([project, sessions]) => ({ project, sessions }))
+    .sort((a, b) => {
+      if (a.project === OTHER_GROUP) return 1;
+      if (b.project === OTHER_GROUP) return -1;
+      return a.project.localeCompare(b.project);
+    });
+}
+
+const SIDEBAR_GROUPS_KEY = 'workshop:sidebar-collapsed-groups';
+function loadCollapsedGroups(): Set<string> {
+  try {
+    const raw = localStorage.getItem(SIDEBAR_GROUPS_KEY);
+    if (!raw) return new Set();
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) return new Set(parsed.filter((x) => typeof x === 'string'));
+  } catch {}
+  return new Set();
+}
+function saveCollapsedGroups(groups: Set<string>): void {
+  try { localStorage.setItem(SIDEBAR_GROUPS_KEY, JSON.stringify(Array.from(groups))); } catch {}
+}
+
+export function Sidebar({ collapsed, onToggleCollapse, onSelectPane, activeTargets, paneStatuses, onSessionRenamed, maximizedTarget, onFocusSession, style, sfwMode = false, nsfwProjects = [], initSessions }: Props) {
+  const [sessions, setSessions] = useState<Session[]>(() => (initSessions as Session[]) ?? []);
   const [panes, setPanes] = useState<Record<string, Pane[]>>({});
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [showHidden, setShowHidden] = useState(false);
   const [gitInfo, setGitInfo] = useState<Record<string, GitInfo>>({});
   const [gitHover, setGitHover] = useState<GitHoverState | null>(null);
   const [hoverTarget, setHoverTarget] = useState<string | null>(null);
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() => loadCollapsedGroups());
+  const toggleGroup = useCallback((project: string) => {
+    setCollapsedGroups((prev) => {
+      const next = new Set(prev);
+      if (next.has(project)) next.delete(project);
+      else next.add(project);
+      saveCollapsedGroups(next);
+      return next;
+    });
+  }, []);
+
+  // Clear hovers when global pin is released
+  useEffect(() => onHoverPinChange(() => {
+    if (!isHoverPinned()) { setGitHover(null); setHoverTarget(null); setHoverPreview(null); }
+  }), []);
   const [hoverPreview, setHoverPreview] = useState<string | null>(null);
   const [hoverPos, setHoverPos] = useState({ x: 0, y: 0 });
   const previewSize = getPreviewSize();
@@ -113,44 +176,79 @@ export function Sidebar({ collapsed, onToggleCollapse, onSelectPane, activeTarge
   const isNsfw = (name: string) => sfwMode && nsfwSet.has(name.toLowerCase());
   const visibleSessions = sfwMode ? sessions.filter((s) => !isNsfw(s.name)) : sessions;
 
+  // Abort controller for the in-flight /sessions fetch. Aborted before
+  // each new poll so a slow backend can't stack up N concurrent fetches
+  // in the browser connection pool while the user waits.
+  const refreshAbortRef = useRef<AbortController | null>(null);
   const refresh = useCallback(() => {
+    refreshAbortRef.current?.abort();
+    const ac = new AbortController();
+    refreshAbortRef.current = ac;
+
     const q = showHidden ? '?all=true' : '';
-    get<Session[]>(`/sessions${q}`)
-      .then((data) => setSessions(data ?? []))
-      .catch(() => {});
+    const t0 = performance.now();
+    recordBreadcrumb('sidebar.refresh.start');
+    get<Session[]>(`/sessions${q}`, ac.signal)
+      .then((data) => {
+        if (ac.signal.aborted) return;
+        setSessions(data ?? []);
+        recordBreadcrumb('sidebar.refresh.done', { count: (data ?? []).length }, Math.round(performance.now() - t0));
+      })
+      .catch((err: Error) => {
+        const aborted = ac.signal.aborted || err?.name === 'AbortError';
+        recordBreadcrumb(aborted ? 'sidebar.refresh.abort' : 'sidebar.refresh.fail', undefined, Math.round(performance.now() - t0));
+      });
   }, [showHidden]);
 
   // Ensure we have pane info (for the cwd) for every known session, then
   // re-fetch git info. This powers the badges without requiring the user
   // to expand each session first, and keeps ahead/behind/dirty counts
   // live instead of snapshotted at expand time.
+  const gitFetchingRef = useRef(false);
   const refreshGitInfo = useCallback((sessionList: Session[]) => {
-    for (const s of sessionList) {
-      const loadAndFetch = async () => {
-        let paneList = panesRef.current[s.name];
-        if (!paneList) {
-          try {
-            paneList = (await get<Pane[]>(`/sessions/${s.name}/panes`)) ?? [];
-            setPanes((prev) => ({ ...prev, [s.name]: paneList! }));
-          } catch {
-            return;
-          }
-        }
-        const path = paneList[0]?.path;
-        if (!path) return;
+    if (gitFetchingRef.current) return; // Skip if previous batch still running
+    gitFetchingRef.current = true;
+    const t0 = performance.now();
+    recordBreadcrumb('sidebar.git.start', { sessions: sessionList.length });
+    const promises = sessionList.map(async (s) => {
+      let paneList = panesRef.current[s.name];
+      if (!paneList) {
         try {
-          const info = await get<GitInfo>(`/git/info?dir=${encodeURIComponent(path)}`);
-          if (info) setGitInfo((prev) => ({ ...prev, [s.name]: info }));
-        } catch { /* not a git repo */ }
-      };
-      void loadAndFetch();
-    }
+          paneList = (await get<Pane[]>(`/sessions/${s.name}/panes`)) ?? [];
+          setPanes((prev) => ({ ...prev, [s.name]: paneList! }));
+        } catch {
+          return;
+        }
+      }
+      const path = paneList[0]?.path;
+      if (!path) return;
+      try {
+        const info = await get<GitInfo>(`/git/info?dir=${encodeURIComponent(path)}`);
+        if (info) setGitInfo((prev) => ({ ...prev, [s.name]: info }));
+      } catch { /* not a git repo */ }
+    });
+    Promise.allSettled(promises).finally(() => {
+      gitFetchingRef.current = false;
+      recordBreadcrumb('sidebar.git.done', { sessions: sessionList.length }, Math.round(performance.now() - t0));
+    });
   }, []);
+
+  // Render-commit breadcrumb — fires every time Sidebar re-renders. During
+  // idle periods a quiet Sidebar still commits on the 5s poll cycle, so this
+  // keeps the ring populated with periodic activity evidence.
+  useLayoutEffect(() => {
+    recordBreadcrumb('commit:Sidebar', { sessions: sessions.length, expanded: expanded.size });
+  });
 
   // panesRef mirrors `panes` so refreshGitInfo can read the latest value
   // inside the interval without re-binding the callback on every change.
   const panesRef = useRef<Record<string, Pane[]>>({});
   useEffect(() => { panesRef.current = panes; }, [panes]);
+
+  // sessionsRef lets the git polling interval read the latest sessions
+  // without re-creating the interval every time sessions changes.
+  const sessionsRef = useRef<Session[]>([]);
+  useEffect(() => { sessionsRef.current = sessions; }, [sessions]);
 
   useEffect(() => {
     refresh();
@@ -158,13 +256,13 @@ export function Sidebar({ collapsed, onToggleCollapse, onSelectPane, activeTarge
     return () => clearInterval(interval);
   }, [refresh]);
 
-  // Whenever the session list changes (or the 5s tick fires via sessions
-  // state), fan out git info fetches.
+  // Fan out git info fetches on mount and every 5s. Uses a ref for sessions
+  // to avoid tearing down the interval every time the session list updates.
   useEffect(() => {
     refreshGitInfo(sessions);
-    const interval = setInterval(() => refreshGitInfo(sessions), 5000);
+    const interval = setInterval(() => refreshGitInfo(sessionsRef.current), 5000);
     return () => clearInterval(interval);
-  }, [sessions, refreshGitInfo]);
+  }, [refreshGitInfo]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const toggleSession = async (name: string) => {
     const next = new Set(expanded);
@@ -291,6 +389,7 @@ export function Sidebar({ collapsed, onToggleCollapse, onSelectPane, activeTarge
   };
 
   const handlePaneLeave = () => {
+    if (isHoverPinned()) return;
     if (hoverTimer.current) clearTimeout(hoverTimer.current);
     setHoverTarget(null);
     setHoverPreview(null);
@@ -378,7 +477,18 @@ export function Sidebar({ collapsed, onToggleCollapse, onSelectPane, activeTarge
         <p className="muted">No tmux sessions</p>
       ) : (
         <ul>
-          {visibleSessions.map((s) => {
+          {groupSessions(visibleSessions, gitInfo).map((group) => {
+            const groupCollapsed = collapsedGroups.has(group.project);
+            return (
+              <li key={`group:${group.project}`} className="session-group">
+                <div className="session-group-header" onClick={() => toggleGroup(group.project)}>
+                  <span className="expand-icon">{groupCollapsed ? '▶' : '▼'}</span>
+                  <span className="session-group-name">{group.project}</span>
+                  <span className="badge">{group.sessions.length}</span>
+                </div>
+                {!groupCollapsed && (
+                  <ul className="session-group-list">
+                    {group.sessions.map((s) => {
             // Session-level hot status: only highlight when a DIFFERENT
             // pane is fullscreened (#502). The user can't see the hot
             // pane directly, so we surface it in the sidebar.
@@ -410,7 +520,7 @@ export function Sidebar({ collapsed, onToggleCollapse, onSelectPane, activeTarge
                     className={`git-badge${gitInfo[s.name].dirty ? ' dirty' : ''}`}
                     onMouseEnter={(e) => setGitHover({ sessionName: s.name, x: e.clientX, y: e.clientY })}
                     onMouseMove={(e) => setGitHover((prev) => prev && prev.sessionName === s.name ? { ...prev, x: e.clientX, y: e.clientY } : prev)}
-                    onMouseLeave={() => setGitHover((prev) => (prev?.sessionName === s.name ? null : prev))}
+                    onMouseLeave={() => { if (!isHoverPinned()) setGitHover((prev) => (prev?.sessionName === s.name ? null : prev)); }}
                   >
                     {gitInfo[s.name].branch}
                     {gitInfo[s.name].changed > 0 && ` ~${gitInfo[s.name].changed}`}
@@ -479,11 +589,16 @@ export function Sidebar({ collapsed, onToggleCollapse, onSelectPane, activeTarge
             </li>
             );
           })}
+                  </ul>
+                )}
+              </li>
+            );
+          })}
         </ul>
       )}
 
       {gitHover && gitInfo[gitHover.sessionName] && (
-        <GitInfoHoverPreview info={gitInfo[gitHover.sessionName]} x={gitHover.x} y={gitHover.y} />
+        <GitInfoHoverPreview info={gitInfo[gitHover.sessionName]} x={gitHover.x} y={gitHover.y} pinned={isHoverPinned()} />
       )}
 
       <ConfirmDialog
@@ -501,7 +616,7 @@ export function Sidebar({ collapsed, onToggleCollapse, onSelectPane, activeTarge
       {/* Hover preview card */}
       {hoverTarget && hoverPreview !== null && (
         <div
-          className={`pane-hover-preview preview-${previewSize}`}
+          className={`pane-hover-preview preview-${previewSize}${isHoverPinned() ? ' hover-pinned-inline' : ''}`}
           style={{
             top: Math.min(hoverPos.y, window.innerHeight - ({ small: 320, medium: 460, large: 620 }[previewSize])),
             left: 270,

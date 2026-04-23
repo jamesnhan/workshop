@@ -28,6 +28,16 @@ interface ApprovalRequest {
   createdAt: string;
 }
 
+interface CompactionEvent {
+  sessionId: string;
+  timestamp: string;
+  trigger: string;
+  preTokens: number;
+  tools: string[];
+  version: string;
+  slug: string;
+}
+
 const ACTION_ICONS: Record<string, string> = {
   file_write: '📝',
   command: '▶',
@@ -93,6 +103,8 @@ function EntryNode({ entry, depth, collapsed, onToggle, formatTime }: {
 export function ActivityView() {
   const [entries, setEntries] = useState<ActivityEntry[]>([]);
   const [pendingApprovals, setPendingApprovals] = useState<ApprovalRequest[]>([]);
+  const [compactions, setCompactions] = useState<CompactionEvent[]>([]);
+  const [compactionsOpen, setCompactionsOpen] = useState(false);
   const [filterPane, setFilterPane] = useState('');
   const [filterProject, setFilterProject] = useState('');
   const [filterAction, setFilterAction] = useState('');
@@ -138,7 +150,16 @@ export function ActivityView() {
     }
   }, []);
 
-  useEffect(() => { refresh(); refreshApprovals(); }, [refresh, refreshApprovals]);
+  const refreshCompactions = useCallback(async () => {
+    try {
+      const data = await get<{ compactions: CompactionEvent[] }>('/compactions');
+      setCompactions(data?.compactions ?? []);
+    } catch (err) {
+      console.error('Failed to load compactions:', err);
+    }
+  }, []);
+
+  useEffect(() => { refresh(); refreshApprovals(); refreshCompactions(); }, [refresh, refreshApprovals, refreshCompactions]);
 
   // Listen for WebSocket broadcasts of new activity entries
   useEffect(() => {
@@ -240,6 +261,27 @@ export function ActivityView() {
               </div>
             </div>
           ))}
+        </div>
+      )}
+
+      {/* Compaction timeline */}
+      {compactions.length > 0 && (
+        <div className="compaction-section">
+          <h3 onClick={() => setCompactionsOpen((p) => !p)} style={{ cursor: 'pointer' }}>
+            {compactionsOpen ? '▼' : '▶'} Compactions ({compactions.length})
+          </h3>
+          {compactionsOpen && (
+            <div className="compaction-list">
+              {compactions.map((c, i) => (
+                <div key={i} className="compaction-entry">
+                  <span className="compaction-tokens">{(c.preTokens / 1000).toFixed(0)}k tokens</span>
+                  <span className="compaction-trigger">{c.trigger}</span>
+                  <span className="compaction-session" title={c.sessionId}>{c.slug || c.sessionId.slice(0, 8)}</span>
+                  <span className="activity-time">{formatTime(c.timestamp)}</span>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
 

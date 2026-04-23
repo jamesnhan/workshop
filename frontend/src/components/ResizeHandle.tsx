@@ -18,16 +18,40 @@ export function ResizeHandle({ direction = 'horizontal', onResize, onResizeEnd }
     dragging.current = true;
     startPos.current = direction === 'horizontal' ? e.clientX : e.clientY;
 
+    // Coalesce rapid mousemove events into one onResize call per frame.
+    // Without throttling, mousemove fires 60-120Hz and each call triggers a
+    // full App re-render + ResizeObserver cascade on every PaneViewer cell.
+    let pendingDelta = 0;
+    let rafId: number | null = null;
+    const flush = () => {
+      rafId = null;
+      if (pendingDelta === 0) return;
+      const delta = pendingDelta;
+      pendingDelta = 0;
+      onResize(delta);
+    };
+
     const handleMouseMove = (e: MouseEvent) => {
       if (!dragging.current) return;
       const current = direction === 'horizontal' ? e.clientX : e.clientY;
-      const delta = current - startPos.current;
+      pendingDelta += current - startPos.current;
       startPos.current = current;
-      onResize(delta);
+      if (rafId === null) {
+        rafId = requestAnimationFrame(flush);
+      }
     };
 
     const handleMouseUp = () => {
       dragging.current = false;
+      if (rafId !== null) {
+        cancelAnimationFrame(rafId);
+        rafId = null;
+      }
+      if (pendingDelta !== 0) {
+        const delta = pendingDelta;
+        pendingDelta = 0;
+        onResize(delta);
+      }
       document.removeEventListener('mousemove', handleMouseMove);
       document.removeEventListener('mouseup', handleMouseUp);
       document.body.style.cursor = '';

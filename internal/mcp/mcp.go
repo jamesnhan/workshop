@@ -48,7 +48,14 @@ func traced(toolName string, h server.ToolHandlerFunc) server.ToolHandlerFunc {
 }
 
 func Serve() {
-	bridge := tmux.NewExecBridge("")
+	headless := os.Getenv("WORKSHOP_HEADLESS") == "true"
+
+	var bridge tmux.Bridge
+	if headless {
+		bridge = tmux.NewNoBridge()
+	} else {
+		bridge = tmux.NewExecBridge("")
+	}
 
 	// Initialize OTel for the MCP subprocess (service name: workshop-mcp).
 	os.Setenv("OTEL_SERVICE_NAME", "workshop-mcp")
@@ -61,104 +68,108 @@ func Serve() {
 	}()
 
 	// Resolve this subprocess's pane target for span attributes.
-	if pane := os.Getenv("TMUX_PANE"); pane != "" {
-		if out, err := exec.Command("tmux", "display-message", "-p", "-t", pane,
-			"#{session_name}:#{window_index}.#{pane_index}").CombinedOutput(); err == nil {
-			mcpPaneTarget = strings.TrimSpace(string(out))
+	if !headless {
+		if pane := os.Getenv("TMUX_PANE"); pane != "" {
+			if out, err := exec.Command("tmux", "display-message", "-p", "-t", pane,
+				"#{session_name}:#{window_index}.#{pane_index}").CombinedOutput(); err == nil {
+				mcpPaneTarget = strings.TrimSpace(string(out))
+			}
 		}
 	}
 
-	s := server.NewMCPServer("workshop", "0.1.0",
-		server.WithToolCapabilities(true),
-		server.WithInstructions("Workshop is a tmux session manager and channel hub. Channel messages from other agent panes arrive as <channel source=\"workshop\" from=\"<sender>\" project=\"<project>\">body</channel>. Read them and act on them as instructions or context from the sending agent."),
-		server.WithExperimental(map[string]any{
-			"claude/channel": map[string]any{},
-		}),
-	)
+	instructions := "Workshop is a tmux session manager and channel hub. Channel messages from other agent panes arrive as <channel source=\"workshop\" from=\"<sender>\" project=\"<project>\">body</channel>. Read them and act on them as instructions or context from the sending agent."
+	if headless {
+		instructions = "Workshop is running in headless mode (no tmux). Only DB-backed features (kanban, channels, activity, ollama) are available. Session/pane management tools are not registered."
+	}
 
-	// Start the channel listener loop in the background. It detects this
-	// MCP subprocess's pane target via $TMUX_PANE, registers with the
-	// central Workshop server, and emits notifications/claude/channel events
-	// to the parent Claude Code on inbound messages.
-	go runChannelListener(s)
+	opts := []server.ServerOption{
+		server.WithToolCapabilities(true),
+		server.WithInstructions(instructions),
+	}
+	if !headless {
+		opts = append(opts, server.WithExperimental(map[string]any{
+			"claude/channel": map[string]any{},
+		}))
+	}
+
+	s := server.NewMCPServer("workshop", "0.1.0", opts...)
+
+	// Start the channel listener loop in the background (only when tmux is available).
+	if !headless {
+		go runChannelListener(s)
+	}
 
 	// --- Tools ---
 
-	s.AddTool(mcp.NewTool("list_sessions",
-		mcp.WithDescription("List all tmux sessions"),
-		mcp.WithBoolean("include_hidden", mcp.Description("Include hidden sessions (consensus-*, workshop-ctrl-*). Default: false")),
-	), traced("list_sessions", listSessionsHandler(bridge)))
+	// tmux-dependent tools are only registered when tmux is available.
+	if !headless {
+		s.AddTool(mcp.NewTool("list_sessions",
+			mcp.WithDescription("List all tmux sessions"),
+			mcp.WithBoolean("include_hidden", mcp.Description("Include hidden sessions (workshop-ctrl-*). Default: false")),
+		), traced("list_sessions", listSessionsHandler(bridge)))
 
-	s.AddTool(mcp.NewTool("list_panes",
-		mcp.WithDescription("List all panes in a tmux session"),
-		mcp.WithString("session", mcp.Required(), mcp.Description("Session name")),
-	), traced("list_panes", listPanesHandler(bridge)))
+		s.AddTool(mcp.NewTool("list_panes",
+			mcp.WithDescription("List all panes in a tmux session"),
+			mcp.WithString("session", mcp.Required(), mcp.Description("Session name")),
+		), traced("list_panes", listPanesHandler(bridge)))
 
-	s.AddTool(mcp.NewTool("create_session",
-		mcp.WithDescription("Create a new tmux session"),
-		mcp.WithString("name", mcp.Required(), mcp.Description("Session name")),
-		mcp.WithString("directory", mcp.Description("Starting directory")),
-	), traced("create_session", createSessionHandler(bridge)))
+		s.AddTool(mcp.NewTool("create_session",
+			mcp.WithDescription("Create a new tmux session"),
+			mcp.WithString("name", mcp.Required(), mcp.Description("Session name")),
+			mcp.WithString("directory", mcp.Description("Starting directory")),
+		), traced("create_session", createSessionHandler(bridge)))
 
-	s.AddTool(mcp.NewTool("kill_session",
-		mcp.WithDescription("Kill a tmux session"),
-		mcp.WithString("name", mcp.Required(), mcp.Description("Session name")),
-	), traced("kill_session", killSessionHandler(bridge)))
+		s.AddTool(mcp.NewTool("kill_session",
+			mcp.WithDescription("Kill a tmux session"),
+			mcp.WithString("name", mcp.Required(), mcp.Description("Session name")),
+		), traced("kill_session", killSessionHandler(bridge)))
 
-	s.AddTool(mcp.NewTool("send_keys",
-		mcp.WithDescription("Send a command to a tmux pane (appends Enter)"),
-		mcp.WithString("target", mcp.Required(), mcp.Description("Pane target (e.g. 0:1.1)")),
-		mcp.WithString("command", mcp.Required(), mcp.Description("Command to send")),
-	), traced("send_keys", sendKeysHandler(bridge)))
+		s.AddTool(mcp.NewTool("send_keys",
+			mcp.WithDescription("Send a command to a tmux pane (appends Enter)"),
+			mcp.WithString("target", mcp.Required(), mcp.Description("Pane target (e.g. 0:1.1)")),
+			mcp.WithString("command", mcp.Required(), mcp.Description("Command to send")),
+		), traced("send_keys", sendKeysHandler(bridge)))
 
-	s.AddTool(mcp.NewTool("send_text",
-		mcp.WithDescription("Send literal text to a tmux pane (no Enter appended)"),
-		mcp.WithString("target", mcp.Required(), mcp.Description("Pane target (e.g. 0:1.1)")),
-		mcp.WithString("text", mcp.Required(), mcp.Description("Text to send")),
-	), traced("send_text", sendTextHandler(bridge)))
+		s.AddTool(mcp.NewTool("send_text",
+			mcp.WithDescription("Send literal text to a tmux pane (no Enter appended)"),
+			mcp.WithString("target", mcp.Required(), mcp.Description("Pane target (e.g. 0:1.1)")),
+			mcp.WithString("text", mcp.Required(), mcp.Description("Text to send")),
+		), traced("send_text", sendTextHandler(bridge)))
 
-	s.AddTool(mcp.NewTool("capture_pane",
-		mcp.WithDescription("Capture the current visible content of a tmux pane"),
-		mcp.WithString("target", mcp.Required(), mcp.Description("Pane target (e.g. 0:1.1)")),
-		mcp.WithNumber("lines", mcp.Description("Number of scrollback lines to capture (default 50)")),
-	), traced("capture_pane", capturePaneHandler(bridge)))
+		s.AddTool(mcp.NewTool("capture_pane",
+			mcp.WithDescription("Capture the current visible content of a tmux pane"),
+			mcp.WithString("target", mcp.Required(), mcp.Description("Pane target (e.g. 0:1.1)")),
+			mcp.WithNumber("lines", mcp.Description("Number of scrollback lines to capture (default 50)")),
+		), traced("capture_pane", capturePaneHandler(bridge)))
 
-	s.AddTool(mcp.NewTool("split_window",
-		mcp.WithDescription("Split a tmux window to create a new pane"),
-		mcp.WithString("target", mcp.Required(), mcp.Description("Target window/pane to split")),
-		mcp.WithBoolean("horizontal", mcp.Description("Split horizontally (default: vertical)")),
-	), traced("split_window", splitWindowHandler(bridge)))
+		s.AddTool(mcp.NewTool("split_window",
+			mcp.WithDescription("Split a tmux window to create a new pane"),
+			mcp.WithString("target", mcp.Required(), mcp.Description("Target window/pane to split")),
+			mcp.WithBoolean("horizontal", mcp.Description("Split horizontally (default: vertical)")),
+		), traced("split_window", splitWindowHandler(bridge)))
 
-	s.AddTool(mcp.NewTool("create_window",
-		mcp.WithDescription("Create a new window in a tmux session"),
-		mcp.WithString("session", mcp.Required(), mcp.Description("Session name")),
-		mcp.WithString("name", mcp.Description("Window name")),
-	), traced("create_window", createWindowHandler(bridge)))
+		s.AddTool(mcp.NewTool("create_window",
+			mcp.WithDescription("Create a new window in a tmux session"),
+			mcp.WithString("session", mcp.Required(), mcp.Description("Session name")),
+			mcp.WithString("name", mcp.Description("Window name")),
+		), traced("create_window", createWindowHandler(bridge)))
 
-	s.AddTool(mcp.NewTool("launch_agent",
-		mcp.WithDescription("Launch an AI coding agent in a new tmux session. Supports Claude, Gemini, and Codex. Use 'preset' to launch a specialist agent (reviewer, tester, security, planner, refactorer, architect) with pre-configured role prompts."),
-		mcp.WithString("name", mcp.Description("Session name (auto-generated if empty)")),
-		mcp.WithString("preset", mcp.Description("Named agent preset to use (e.g. reviewer, tester, security, planner, refactorer, architect). Loads provider, model, and system prompt from the preset. Explicit params override preset values.")),
-		mcp.WithString("provider", mcp.Description("AI provider: claude (default), gemini, codex")),
-		mcp.WithString("directory", mcp.Description("Working directory")),
-		mcp.WithString("prompt", mcp.Description("Initial prompt for the agent")),
-		mcp.WithString("model", mcp.Description("Model to use (e.g. opus, sonnet, pro, flash, gpt-5-codex)")),
-		mcp.WithString("command", mcp.Description("Full command to run (overrides provider defaults)")),
-		mcp.WithBoolean("dangerouslySkipPermissions", mcp.Description("Skip permission prompts (--yolo for gemini/codex)")),
-	), traced("launch_agent", launchAgentHandler(bridge)))
+	}
 
-	s.AddTool(mcp.NewTool("search_output",
-		mcp.WithDescription("Search terminal output history across panes. Requires the Workshop web server to be running."),
-		mcp.WithString("query", mcp.Required(), mcp.Description("Search string (case-insensitive)")),
-		mcp.WithString("target", mcp.Description("Filter to a specific pane target (e.g. workshop:1.1)")),
-		mcp.WithNumber("limit", mcp.Description("Max results (default 50)")),
-	), traced("search_output", searchOutputHandler()))
+	if !headless {
+		s.AddTool(mcp.NewTool("search_output",
+			mcp.WithDescription("Search terminal output history across panes. Requires the Workshop web server to be running."),
+			mcp.WithString("query", mcp.Required(), mcp.Description("Search string (case-insensitive)")),
+			mcp.WithString("target", mcp.Description("Filter to a specific pane target (e.g. workshop:1.1)")),
+			mcp.WithNumber("limit", mcp.Description("Max results (default 50)")),
+		), traced("search_output", searchOutputHandler()))
 
-	s.AddTool(mcp.NewTool("rename_session",
-		mcp.WithDescription("Rename a tmux session"),
-		mcp.WithString("old_name", mcp.Required(), mcp.Description("Current session name")),
-		mcp.WithString("new_name", mcp.Required(), mcp.Description("New session name")),
-	), traced("rename_session", renameSessionHandler(bridge)))
+		s.AddTool(mcp.NewTool("rename_session",
+			mcp.WithDescription("Rename a tmux session"),
+			mcp.WithString("old_name", mcp.Required(), mcp.Description("Current session name")),
+			mcp.WithString("new_name", mcp.Required(), mcp.Description("New session name")),
+		), traced("rename_session", renameSessionHandler(bridge)))
+	}
 
 	// Kanban tools — these call the Workshop HTTP API
 	s.AddTool(mcp.NewTool("kanban_list",
@@ -232,47 +243,7 @@ func Serve() {
 		mcp.WithNumber("parent_id", mcp.Description("Parent activity ID — use to nest this action under a parent (e.g. subagent work under the spawning agent's entry)")),
 	), traced("report_activity", reportActivityHandler()))
 
-	// Task orchestrator — drives a card through phased agent workflow
-	s.AddTool(mcp.NewTool("orchestrate_card",
-		mcp.WithDescription("Launch an autonomous orchestrator that drives a kanban card through plan→implement→test→review→PR phases. Each phase launches a specialist agent, captures output, and checkpoints with the user via approval gates. The orchestrator runs as a separate Claude agent session."),
-		mcp.WithNumber("id", mcp.Required(), mcp.Description("Kanban card ID to orchestrate")),
-		mcp.WithString("directory", mcp.Description("Working directory for all agents (defaults to current directory)")),
-		mcp.WithString("isolation", mcp.Description("Set to 'worktree' to auto-create a git worktree so all work happens on an isolated branch. The worktree is kept after completion for you to merge/cherry-pick.")),
-	), traced("orchestrate_card", orchestrateCardHandler()))
-
-	s.AddTool(mcp.NewTool("consensus_start",
-		mcp.WithDescription("Start a consensus run — multiple agents work on the same prompt, then a coordinator synthesizes. Requires Workshop server."),
-		mcp.WithString("prompt", mcp.Required(), mcp.Description("The prompt for all agents")),
-		mcp.WithString("directory", mcp.Description("Working directory for agents")),
-		mcp.WithString("agents", mcp.Description("Comma-separated agent specs. Formats: 'provider' (e.g. 'codex'), 'provider:model' (e.g. 'claude:opus'), or 'name:provider:model' (e.g. 'deep:gemini:pro'). Provider must be claude/gemini/codex. Default: 3 sonnet claude agents.")),
-		mcp.WithNumber("timeout", mcp.Description("Timeout in seconds (default 300)")),
-	), traced("consensus_start", consensusStartHandler()))
-
-	s.AddTool(mcp.NewTool("consensus_status",
-		mcp.WithDescription("Check the status of a consensus run"),
-		mcp.WithString("id", mcp.Required(), mcp.Description("Consensus run ID")),
-	), traced("consensus_status", consensusStatusHandler()))
-
-	s.AddTool(mcp.NewTool("consensus_list",
-		mcp.WithDescription("List all consensus runs with their status"),
-	), traced("consensus_list", consensusListHandler()))
-
-	s.AddTool(mcp.NewTool("consensus_capture",
-		mcp.WithDescription("Capture the full output from a specific consensus agent"),
-		mcp.WithString("id", mcp.Required(), mcp.Description("Consensus run ID")),
-		mcp.WithString("agent", mcp.Required(), mcp.Description("Agent name (e.g. 'reviewer-1' or 'coordinator')")),
-		mcp.WithNumber("lines", mcp.Description("Lines to capture (default 200)")),
-	), traced("consensus_capture", consensusCaptureHandler()))
-
-	s.AddTool(mcp.NewTool("consensus_review",
-		mcp.WithDescription("Collect and display all agent outputs from a consensus run for review. Shows each agent's findings side by side."),
-		mcp.WithString("id", mcp.Required(), mcp.Description("Consensus run ID")),
-	), traced("consensus_review", consensusReviewHandler()))
-
-	s.AddTool(mcp.NewTool("consensus_cleanup",
-		mcp.WithDescription("Kill all tmux sessions for a finished consensus run (agents + coordinator). ALWAYS call this when you're done reviewing a consensus run — the sessions linger otherwise and clutter tmux."),
-		mcp.WithString("id", mcp.Required(), mcp.Description("Consensus run ID")),
-	), traced("consensus_cleanup", consensusCleanupHandler()))
+	// tmux-dependent orchestration tools
 
 	s.AddTool(mcp.NewTool("run_config",
 		mcp.WithDescription("Run a Lua config script. Requires Workshop web server running."),
@@ -282,14 +253,14 @@ func Serve() {
 
 	s.AddTool(mcp.NewTool("set_pane_status",
 		mcp.WithDescription("Set a status indicator on your pane in Workshop. Use this when you finish a task (green), need user input (yellow), or encounter an error (red)."),
-		mcp.WithString("target", mcp.Required(), mcp.Description("Pane target (e.g. 'workshop:1.1')")),
+		mcp.WithString("target", mcp.Description("Pane target (e.g. 'workshop:1.1'). Omit to use your own pane.")),
 		mcp.WithString("status", mcp.Required(), mcp.Description("Status color: green (done), yellow (needs input), red (error)")),
 		mcp.WithString("message", mcp.Description("Short status message")),
 	), traced("set_pane_status", setPaneStatusHandler()))
 
 	s.AddTool(mcp.NewTool("clear_pane_status",
 		mcp.WithDescription("Clear the status indicator on a pane in Workshop."),
-		mcp.WithString("target", mcp.Required(), mcp.Description("Pane target (e.g. 'workshop:1.1')")),
+		mcp.WithString("target", mcp.Description("Pane target (e.g. 'workshop:1.1'). Omit to use your own pane.")),
 	), traced("clear_pane_status", clearPaneStatusHandler()))
 
 	s.AddTool(mcp.NewTool("open_doc",
@@ -390,7 +361,7 @@ func Serve() {
 		mcp.WithString("prompt", mcp.Required(), mcp.Description("User message to send")),
 		mcp.WithString("system", mcp.Description("System prompt (optional)")),
 		mcp.WithNumber("temperature", mcp.Description("Sampling temperature (default: model default)")),
-		mcp.WithNumber("max_tokens", mcp.Description("Max tokens to generate")),
+		mcp.WithNumber("max_tokens", mcp.Description("Max tokens to generate (default: unlimited)")),
 		mcp.WithBoolean("think", mcp.Description("Enable thinking mode (default: false, recommended for Gemma 4)")),
 	), traced("ollama_chat", ollamaChatHandler()))
 
@@ -400,7 +371,7 @@ func Serve() {
 		mcp.WithString("prompt", mcp.Required(), mcp.Description("Prompt text")),
 		mcp.WithString("system", mcp.Description("System prompt (optional)")),
 		mcp.WithNumber("temperature", mcp.Description("Sampling temperature")),
-		mcp.WithNumber("max_tokens", mcp.Description("Max tokens to generate")),
+		mcp.WithNumber("max_tokens", mcp.Description("Max tokens to generate (default: unlimited)")),
 		mcp.WithBoolean("think", mcp.Description("Enable thinking mode (default: false)")),
 	), traced("ollama_generate", ollamaGenerateHandler()))
 
@@ -460,7 +431,7 @@ func createSessionHandler(bridge tmux.Bridge) server.ToolHandlerFunc {
 		// broadcast (background=true since MCP isn't user-initiated).
 		body := map[string]any{"name": name, "startDir": dir, "background": true}
 		raw, _ := json.Marshal(body)
-		resp, err := http.Post(workshopAPIURL()+"/api/v1/sessions", "application/json", strings.NewReader(string(raw)))
+		resp, err := workshopHTTP.Post(workshopAPIURL()+"/api/v1/sessions", "application/json", strings.NewReader(string(raw)))
 		if err != nil {
 			if err := bridge.CreateSession(name, dir); err != nil {
 				return mcp.NewToolResultError(err.Error()), nil
@@ -563,91 +534,6 @@ func createWindowHandler(bridge tmux.Bridge) server.ToolHandlerFunc {
 	}
 }
 
-func launchAgentHandler(bridge tmux.Bridge) server.ToolHandlerFunc {
-	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		// Resolve preset if provided — fetch from REST API, then let explicit params override.
-		provider := mcp.ParseString(req, "provider", "")
-		model := mcp.ParseString(req, "model", "")
-		prompt := mcp.ParseString(req, "prompt", "")
-		directory := mcp.ParseString(req, "directory", "")
-		name := mcp.ParseString(req, "name", "")
-
-		if presetName := mcp.ParseString(req, "preset", ""); presetName != "" {
-			presetResp, err := http.Get(workshopAPIURL() + "/api/v1/agent-presets")
-			if err == nil {
-				defer presetResp.Body.Close()
-				var presets []map[string]any
-				json.NewDecoder(presetResp.Body).Decode(&presets)
-				for _, p := range presets {
-					if pName, _ := p["name"].(string); pName == presetName {
-						if provider == "" { provider, _ = p["provider"].(string) }
-						if model == "" { model, _ = p["model"].(string) }
-						if directory == "" { directory, _ = p["directory"].(string) }
-						// Prepend system prompt to the user's prompt
-						if sp, _ := p["systemPrompt"].(string); sp != "" {
-							if prompt != "" {
-								prompt = sp + "\n\n" + prompt
-							} else if pp, _ := p["prompt"].(string); pp != "" {
-								prompt = sp + "\n\n" + pp
-							} else {
-								prompt = sp
-							}
-						} else if prompt == "" {
-							prompt, _ = p["prompt"].(string)
-						}
-						if name == "" { name = presetName }
-						break
-					}
-				}
-			}
-		}
-
-		// Route through the REST endpoint so the frontend receives the
-		// session_created broadcast. Agent launches from MCP are always
-		// background=true — the user isn't directly creating them.
-		body := map[string]any{
-			"name":                     name,
-			"provider":                 provider,
-			"directory":                directory,
-			"command":                  mcp.ParseString(req, "command", ""),
-			"prompt":                   prompt,
-			"model":                    model,
-			"dangerousSkipPermissions": mcp.ParseBoolean(req, "dangerouslySkipPermissions", false),
-			"background":               true,
-		}
-		raw, _ := json.Marshal(body)
-		resp, err := http.Post(workshopAPIURL()+"/api/v1/agents/launch", "application/json", strings.NewReader(string(raw)))
-		if err != nil {
-			// Fall back to direct bridge call if the web server isn't running.
-			execBridge, ok := bridge.(*tmux.ExecBridge)
-			if !ok {
-				return mcp.NewToolResultError(fmt.Sprintf("agent launch failed: %v", err)), nil
-			}
-			cfg := tmux.AgentConfig{
-				Name:      mcp.ParseString(req, "name", ""),
-				Provider:  mcp.ParseString(req, "provider", ""),
-				Directory: mcp.ParseString(req, "directory", ""),
-				Command:   mcp.ParseString(req, "command", ""),
-				Prompt:    mcp.ParseString(req, "prompt", ""),
-				Model:     mcp.ParseString(req, "model", ""),
-				DangerousSkipPermissions: mcp.ParseBoolean(req, "dangerouslySkipPermissions", false),
-			}
-			result, ferr := execBridge.LaunchAgent(cfg)
-			if ferr != nil {
-				return mcp.NewToolResultError(ferr.Error()), nil
-			}
-			data, _ := json.MarshalIndent(result, "", "  ")
-			return mcp.NewToolResultText(string(data)), nil
-		}
-		defer resp.Body.Close()
-		result, _ := io.ReadAll(resp.Body)
-		if resp.StatusCode != 201 {
-			return mcp.NewToolResultError(string(result)), nil
-		}
-		return mcp.NewToolResultText(string(result)), nil
-	}
-}
-
 func renameSessionHandler(bridge tmux.Bridge) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		oldName := mcp.ParseString(req, "old_name", "")
@@ -670,6 +556,25 @@ func workshopAPIURL() string {
 	return u
 }
 
+// authTransport injects the WORKSHOP_API_KEY as a Bearer token on every outbound
+// request from the MCP subprocess to the Workshop server.
+type authTransport struct {
+	key string
+}
+
+func (t *authTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if t.key != "" {
+		req.Header.Set("Authorization", "Bearer "+t.key)
+	}
+	return http.DefaultTransport.RoundTrip(req)
+}
+
+// workshopHTTP is the HTTP client used for all MCP→Workshop API calls.
+// It automatically attaches the API key when WORKSHOP_API_KEY is set.
+var workshopHTTP = &http.Client{
+	Transport: &authTransport{key: os.Getenv("WORKSHOP_API_KEY")},
+}
+
 func kanbanListHandler() server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		project := mcp.ParseString(req, "project", "")
@@ -688,7 +593,7 @@ func kanbanListHandler() server.ToolHandlerFunc {
 		if offset > 0 {
 			params.Set("offset", fmt.Sprintf("%d", offset))
 		}
-		resp, err := http.Get(workshopAPIURL() + "/api/v1/cards?" + params.Encode())
+		resp, err := workshopHTTP.Get(workshopAPIURL() + "/api/v1/cards?" + params.Encode())
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("Failed to reach Workshop: %v", err)), nil
 		}
@@ -751,7 +656,7 @@ func kanbanCreateHandler() server.ToolHandlerFunc {
 			"parentId":    mcp.ParseInt(req, "parent_id", 0),
 		}
 		body, _ := json.Marshal(card)
-		resp, err := http.Post(workshopAPIURL()+"/api/v1/cards", "application/json", strings.NewReader(string(body)))
+		resp, err := workshopHTTP.Post(workshopAPIURL()+"/api/v1/cards", "application/json", strings.NewReader(string(body)))
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("Failed to reach Workshop: %v", err)), nil
 		}
@@ -774,7 +679,7 @@ func kanbanEditHandler() server.ToolHandlerFunc {
 		}
 
 		// Fetch current card
-		resp, err := http.Get(fmt.Sprintf("%s/api/v1/cards?project=", workshopAPIURL()))
+		resp, err := workshopHTTP.Get(fmt.Sprintf("%s/api/v1/cards?project=", workshopAPIURL()))
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("Failed to reach Workshop: %v", err)), nil
 		}
@@ -830,7 +735,7 @@ func kanbanEditHandler() server.ToolHandlerFunc {
 		updateBody, _ := json.Marshal(card)
 		putReq, _ := http.NewRequest("PUT", fmt.Sprintf("%s/api/v1/cards/%d", workshopAPIURL(), id), strings.NewReader(string(updateBody)))
 		putReq.Header.Set("Content-Type", "application/json")
-		putResp, err := http.DefaultClient.Do(putReq)
+		putResp, err := workshopHTTP.Do(putReq)
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("Failed to update: %v", err)), nil
 		}
@@ -852,7 +757,7 @@ func kanbanAddNoteHandler() server.ToolHandlerFunc {
 			return mcp.NewToolResultError("id and text are required"), nil
 		}
 		body, _ := json.Marshal(map[string]string{"text": text})
-		resp, err := http.Post(fmt.Sprintf("%s/api/v1/cards/%d/notes", workshopAPIURL(), id), "application/json", strings.NewReader(string(body)))
+		resp, err := workshopHTTP.Post(fmt.Sprintf("%s/api/v1/cards/%d/notes", workshopAPIURL(), id), "application/json", strings.NewReader(string(body)))
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("Failed to reach Workshop: %v", err)), nil
 		}
@@ -873,7 +778,7 @@ func kanbanMoveHandler() server.ToolHandlerFunc {
 			return mcp.NewToolResultError("id and column are required"), nil
 		}
 		body, _ := json.Marshal(map[string]any{"column": column, "position": 0})
-		resp, err := http.Post(fmt.Sprintf("%s/api/v1/cards/%d/move", workshopAPIURL(), id), "application/json", strings.NewReader(string(body)))
+		resp, err := workshopHTTP.Post(fmt.Sprintf("%s/api/v1/cards/%d/move", workshopAPIURL(), id), "application/json", strings.NewReader(string(body)))
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("Failed to reach Workshop: %v", err)), nil
 		}
@@ -893,7 +798,7 @@ func kanbanDeleteHandler() server.ToolHandlerFunc {
 			return mcp.NewToolResultError("id is required"), nil
 		}
 		req2, _ := http.NewRequest("DELETE", fmt.Sprintf("%s/api/v1/cards/%d", workshopAPIURL(), id), nil)
-		resp, err := http.DefaultClient.Do(req2)
+		resp, err := workshopHTTP.Do(req2)
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("Failed to reach Workshop: %v", err)), nil
 		}
@@ -902,349 +807,6 @@ func kanbanDeleteHandler() server.ToolHandlerFunc {
 	}
 }
 
-func consensusStartHandler() server.ToolHandlerFunc {
-	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		prompt := mcp.ParseString(req, "prompt", "")
-		if prompt == "" {
-			return mcp.NewToolResultError("prompt is required"), nil
-		}
-		dir := mcp.ParseString(req, "directory", "")
-		timeout := mcp.ParseInt(req, "timeout", 300)
-		agentsStr := mcp.ParseString(req, "agents", "agent1:sonnet,agent2:sonnet,agent3:sonnet")
-
-		// Parse agent specs. Supported formats per agent (comma-separated):
-		//   provider                    → e.g. "codex" (auto name, default model)
-		//   provider:model              → e.g. "claude:opus", "gemini:pro"
-		//   name:provider:model         → e.g. "deep:claude:opus"
-		// Provider must be one of: claude, gemini, codex
-		// Model defaults: sonnet (claude), pro (gemini), gpt-5.4 (codex)
-		validProviders := map[string]bool{"claude": true, "gemini": true, "codex": true}
-		defaultModels := map[string]string{"claude": "sonnet", "gemini": "pro", "codex": "gpt-5.4"}
-		var agents []map[string]string
-		for i, spec := range strings.Split(agentsStr, ",") {
-			spec = strings.TrimSpace(spec)
-			if spec == "" {
-				continue
-			}
-			parts := strings.SplitN(spec, ":", 3)
-			var name, provider, model string
-
-			switch len(parts) {
-			case 1:
-				// Single part: must be a provider name
-				if validProviders[parts[0]] {
-					provider = parts[0]
-					name = fmt.Sprintf("agent%d", i+1)
-					model = defaultModels[provider]
-				} else {
-					return mcp.NewToolResultError(fmt.Sprintf("invalid agent spec %q: single value must be a provider (claude/gemini/codex)", spec)), nil
-				}
-			case 2:
-				// provider:model OR name:model (legacy, only if first part isn't a provider)
-				if validProviders[parts[0]] {
-					provider = parts[0]
-					model = parts[1]
-					name = fmt.Sprintf("agent%d", i+1)
-				} else {
-					// Legacy: name:model defaults to claude
-					name = parts[0]
-					provider = "claude"
-					model = parts[1]
-				}
-			case 3:
-				// name:provider:model
-				name = parts[0]
-				provider = parts[1]
-				model = parts[2]
-				if !validProviders[provider] {
-					return mcp.NewToolResultError(fmt.Sprintf("invalid agent spec %q: provider %q must be claude/gemini/codex", spec, provider)), nil
-				}
-			}
-
-			agents = append(agents, map[string]string{"name": name, "provider": provider, "model": model})
-		}
-
-		if len(agents) == 0 {
-			return mcp.NewToolResultError("no valid agents in spec"), nil
-		}
-
-		body, _ := json.Marshal(map[string]any{
-			"prompt":    prompt,
-			"directory": dir,
-			"timeout":   timeout,
-			"agents":    agents,
-		})
-		resp, err := http.Post(workshopAPIURL()+"/api/v1/consensus", "application/json", strings.NewReader(string(body)))
-		if err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("Failed to reach Workshop: %v", err)), nil
-		}
-		defer resp.Body.Close()
-		result, _ := io.ReadAll(resp.Body)
-		if resp.StatusCode != 201 {
-			return mcp.NewToolResultError(string(result)), nil
-		}
-		var run map[string]any
-		json.Unmarshal(result, &run)
-		return mcp.NewToolResultText(fmt.Sprintf("Consensus run started: %s\nStatus: %s\nUse consensus_status(id=\"%s\") to check progress.", run["id"], run["status"], run["id"])), nil
-	}
-}
-
-func consensusStatusHandler() server.ToolHandlerFunc {
-	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		id := mcp.ParseString(req, "id", "")
-		if id == "" {
-			return mcp.NewToolResultError("id is required"), nil
-		}
-		resp, err := http.Get(fmt.Sprintf("%s/api/v1/consensus/%s", workshopAPIURL(), id))
-		if err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("Failed to reach Workshop: %v", err)), nil
-		}
-		defer resp.Body.Close()
-		body, _ := io.ReadAll(resp.Body)
-		if resp.StatusCode != 200 {
-			return mcp.NewToolResultError(string(body)), nil
-		}
-		var run map[string]any
-		json.Unmarshal(body, &run)
-
-		var sb strings.Builder
-		fmt.Fprintf(&sb, "Consensus: %s\nStatus: %s\nPrompt: %s\n\n", run["id"], run["status"], run["prompt"])
-
-		if agents, ok := run["agentOutputs"].([]any); ok {
-			sb.WriteString("Agents:\n")
-			for _, a := range agents {
-				agent := a.(map[string]any)
-				fmt.Fprintf(&sb, "  %s (%s): %s\n", agent["name"], agent["model"], agent["status"])
-			}
-		}
-		if coord, ok := run["coordinatorPane"].(string); ok && coord != "" {
-			fmt.Fprintf(&sb, "\nCoordinator pane: %s\n", coord)
-		}
-
-		return mcp.NewToolResultText(sb.String()), nil
-	}
-}
-
-func consensusListHandler() server.ToolHandlerFunc {
-	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		resp, err := http.Get(workshopAPIURL() + "/api/v1/consensus")
-		if err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("Failed to reach Workshop: %v", err)), nil
-		}
-		defer resp.Body.Close()
-		body, _ := io.ReadAll(resp.Body)
-
-		var runs []map[string]any
-		json.Unmarshal(body, &runs)
-		if len(runs) == 0 {
-			return mcp.NewToolResultText("No consensus runs."), nil
-		}
-
-		var sb strings.Builder
-		for _, r := range runs {
-			fmt.Fprintf(&sb, "=== %s ===\n", r["id"])
-			fmt.Fprintf(&sb, "Status: %s\n", r["status"])
-			prompt := fmt.Sprintf("%v", r["prompt"])
-			if len(prompt) > 100 {
-				prompt = prompt[:100] + "..."
-			}
-			fmt.Fprintf(&sb, "Prompt: %s\n", prompt)
-			if agents, ok := r["agentOutputs"].([]any); ok {
-				for _, a := range agents {
-					agent := a.(map[string]any)
-					needs := ""
-					if ni, ok := agent["needsInput"].(bool); ok && ni {
-						needs = " ⚠️ NEEDS INPUT"
-					}
-					fmt.Fprintf(&sb, "  %s (%s): %s%s\n", agent["name"], agent["model"], agent["status"], needs)
-				}
-			}
-			sb.WriteString("\n")
-		}
-		return mcp.NewToolResultText(sb.String()), nil
-	}
-}
-
-func consensusCaptureHandler() server.ToolHandlerFunc {
-	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		id := mcp.ParseString(req, "id", "")
-		agentName := mcp.ParseString(req, "agent", "")
-		lines := mcp.ParseInt(req, "lines", 200)
-		if id == "" || agentName == "" {
-			return mcp.NewToolResultError("id and agent are required"), nil
-		}
-
-		// Get the consensus run to find the agent's target
-		resp, err := http.Get(fmt.Sprintf("%s/api/v1/consensus/%s", workshopAPIURL(), id))
-		if err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("Failed to reach Workshop: %v", err)), nil
-		}
-		defer resp.Body.Close()
-		body, _ := io.ReadAll(resp.Body)
-		if resp.StatusCode != 200 {
-			return mcp.NewToolResultError(string(body)), nil
-		}
-
-		var run map[string]any
-		json.Unmarshal(body, &run)
-
-		// Find the agent target
-		var target string
-		if agentName == "coordinator" {
-			target, _ = run["coordinatorPane"].(string)
-		} else if agents, ok := run["agentOutputs"].([]any); ok {
-			for _, a := range agents {
-				agent := a.(map[string]any)
-				if agent["name"] == agentName {
-					target, _ = agent["target"].(string)
-					break
-				}
-			}
-		}
-		if target == "" {
-			return mcp.NewToolResultError(fmt.Sprintf("Agent '%s' not found in run %s", agentName, id)), nil
-		}
-
-		// Capture the pane output
-		session := strings.Split(target, ":")[0]
-		captureURL := fmt.Sprintf("%s/api/v1/sessions/%s/capture?target=%s&lines=%d", workshopAPIURL(), session, target, lines)
-		captureResp, err := http.Get(captureURL)
-		if err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("Capture failed: %v", err)), nil
-		}
-		defer captureResp.Body.Close()
-		captureBody, _ := io.ReadAll(captureResp.Body)
-
-		var captureResult map[string]string
-		json.Unmarshal(captureBody, &captureResult)
-		output := captureResult["output"]
-
-		// Strip ANSI for clean LLM consumption
-		clean := stripAnsi(output)
-		return mcp.NewToolResultText(fmt.Sprintf("=== %s (%s) ===\n%s", agentName, target, clean)), nil
-	}
-}
-
-func consensusCleanupHandler() server.ToolHandlerFunc {
-	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		id := mcp.ParseString(req, "id", "")
-		if id == "" {
-			return mcp.NewToolResultError("id is required"), nil
-		}
-		httpReq, err := http.NewRequest("DELETE", fmt.Sprintf("%s/api/v1/consensus/%s", workshopAPIURL(), id), nil)
-		if err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("Failed to build request: %v", err)), nil
-		}
-		resp, err := http.DefaultClient.Do(httpReq)
-		if err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("Failed to reach Workshop: %v", err)), nil
-		}
-		defer resp.Body.Close()
-		body, _ := io.ReadAll(resp.Body)
-		if resp.StatusCode != 200 {
-			return mcp.NewToolResultError(string(body)), nil
-		}
-		var result map[string]any
-		json.Unmarshal(body, &result)
-		return mcp.NewToolResultText(fmt.Sprintf("Cleaned up consensus %s: killed %v sessions", id, result["killed"])), nil
-	}
-}
-
-func consensusReviewHandler() server.ToolHandlerFunc {
-	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		id := mcp.ParseString(req, "id", "")
-		if id == "" {
-			return mcp.NewToolResultError("id is required"), nil
-		}
-
-		// Get the consensus run
-		resp, err := http.Get(fmt.Sprintf("%s/api/v1/consensus/%s", workshopAPIURL(), id))
-		if err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("Failed to reach Workshop: %v", err)), nil
-		}
-		defer resp.Body.Close()
-		body, _ := io.ReadAll(resp.Body)
-		if resp.StatusCode != 200 {
-			return mcp.NewToolResultError(string(body)), nil
-		}
-
-		var run map[string]any
-		json.Unmarshal(body, &run)
-
-		var sb strings.Builder
-		fmt.Fprintf(&sb, "=== Consensus Review: %s ===\n", id)
-		fmt.Fprintf(&sb, "Status: %s\n", run["status"])
-		fmt.Fprintf(&sb, "Prompt: %s\n\n", run["prompt"])
-
-		// Capture each agent's output
-		if agents, ok := run["agentOutputs"].([]any); ok {
-			for _, a := range agents {
-				agent := a.(map[string]any)
-				name, _ := agent["name"].(string)
-				model, _ := agent["model"].(string)
-				status, _ := agent["status"].(string)
-				target, _ := agent["target"].(string)
-
-				fmt.Fprintf(&sb, "--- Agent: %s (model: %s, status: %s) ---\n", name, model, status)
-
-				if target != "" {
-					session := strings.Split(target, ":")[0]
-					captureURL := fmt.Sprintf("%s/api/v1/sessions/%s/capture?target=%s&lines=200", workshopAPIURL(), session, target)
-					captureResp, err := http.Get(captureURL)
-					if err == nil {
-						defer captureResp.Body.Close()
-						captureBody, _ := io.ReadAll(captureResp.Body)
-						var captureResult map[string]string
-						json.Unmarshal(captureBody, &captureResult)
-						clean := stripAnsi(captureResult["output"])
-						sb.WriteString(clean)
-					} else {
-						sb.WriteString("(capture failed)\n")
-					}
-				} else {
-					sb.WriteString("(no target)\n")
-				}
-				sb.WriteString("\n\n")
-			}
-		}
-
-		// Capture coordinator if present
-		if coord, ok := run["coordinatorPane"].(string); ok && coord != "" {
-			sb.WriteString("--- Coordinator ---\n")
-			session := strings.Split(coord, ":")[0]
-			captureURL := fmt.Sprintf("%s/api/v1/sessions/%s/capture?target=%s&lines=200", workshopAPIURL(), session, coord)
-			captureResp, err := http.Get(captureURL)
-			if err == nil {
-				defer captureResp.Body.Close()
-				captureBody, _ := io.ReadAll(captureResp.Body)
-				var captureResult map[string]string
-				json.Unmarshal(captureBody, &captureResult)
-				clean := stripAnsi(captureResult["output"])
-				sb.WriteString(clean)
-			}
-			sb.WriteString("\n")
-		}
-
-		// Auto-cleanup: now that we've captured all outputs, kill the
-		// tmux sessions so they don't linger. Only if the run is in a
-		// terminal state — we don't want to nuke a still-running consensus.
-		status, _ := run["status"].(string)
-		if status == "done" || status == "error" || status == "timeout" {
-			delReq, err := http.NewRequest("DELETE", fmt.Sprintf("%s/api/v1/consensus/%s", workshopAPIURL(), id), nil)
-			if err == nil {
-				if delResp, err := http.DefaultClient.Do(delReq); err == nil {
-					delBody, _ := io.ReadAll(delResp.Body)
-					delResp.Body.Close()
-					var delResult map[string]any
-					json.Unmarshal(delBody, &delResult)
-					fmt.Fprintf(&sb, "\n(cleaned up %v tmux sessions)\n", delResult["killed"])
-				}
-			}
-		}
-
-		return mcp.NewToolResultText(sb.String()), nil
-	}
-}
 
 func runConfigHandler() server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -1254,7 +816,7 @@ func runConfigHandler() server.ToolHandlerFunc {
 			return mcp.NewToolResultError("path or code is required"), nil
 		}
 		body, _ := json.Marshal(map[string]string{"path": path, "code": code})
-		resp, err := http.Post(workshopAPIURL()+"/api/v1/config/load", "application/json", strings.NewReader(string(body)))
+		resp, err := workshopHTTP.Post(workshopAPIURL()+"/api/v1/config/load", "application/json", strings.NewReader(string(body)))
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("Failed to reach Workshop: %v", err)), nil
 		}
@@ -1282,7 +844,7 @@ func searchOutputHandler() server.ToolHandlerFunc {
 			params.Set("target", target)
 		}
 
-		resp, err := http.Get(workshopAPIURL() + "/api/v1/search?" + params.Encode())
+		resp, err := workshopHTTP.Get(workshopAPIURL() + "/api/v1/search?" + params.Encode())
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("Failed to reach Workshop server: %v. Is it running?", err)), nil
 		}
@@ -1344,8 +906,14 @@ func setPaneStatusHandler() server.ToolHandlerFunc {
 		status := mcp.ParseString(req, "status", "")
 		message := mcp.ParseString(req, "message", "")
 
+		// Default to the calling pane's own target so agents don't need to
+		// call list_panes first (and can't accidentally set status on the
+		// wrong pane by hardcoding a target from a different session).
+		if target == "" {
+			target = mcpPaneTarget
+		}
 		if target == "" || status == "" {
-			return mcp.NewToolResultError("target and status are required"), nil
+			return mcp.NewToolResultError("status is required (target defaults to your own pane)"), nil
 		}
 
 		body, _ := json.Marshal(map[string]string{
@@ -1354,7 +922,7 @@ func setPaneStatusHandler() server.ToolHandlerFunc {
 			"message": message,
 		})
 
-		resp, err := http.Post(workshopAPIURL()+"/api/v1/panes/status", "application/json", strings.NewReader(string(body)))
+		resp, err := workshopHTTP.Post(workshopAPIURL()+"/api/v1/panes/status", "application/json", strings.NewReader(string(body)))
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("Failed to reach Workshop server: %v", err)), nil
 		}
@@ -1373,13 +941,16 @@ func clearPaneStatusHandler() server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		target := mcp.ParseString(req, "target", "")
 		if target == "" {
+			target = mcpPaneTarget
+		}
+		if target == "" {
 			return mcp.NewToolResultError("target is required"), nil
 		}
 
 		body, _ := json.Marshal(map[string]string{"target": target})
 		httpReq, _ := http.NewRequest("DELETE", workshopAPIURL()+"/api/v1/panes/status", strings.NewReader(string(body)))
 		httpReq.Header.Set("Content-Type", "application/json")
-		resp, err := http.DefaultClient.Do(httpReq)
+		resp, err := workshopHTTP.Do(httpReq)
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("Failed to reach Workshop server: %v", err)), nil
 		}
@@ -1398,7 +969,7 @@ func channelPublishHandler() server.ToolHandlerFunc {
 			"project": mcp.ParseString(req, "project", ""),
 		}
 		raw, _ := json.Marshal(body)
-		resp, err := http.Post(workshopAPIURL()+"/api/v1/channels/publish", "application/json", strings.NewReader(string(raw)))
+		resp, err := workshopHTTP.Post(workshopAPIURL()+"/api/v1/channels/publish", "application/json", strings.NewReader(string(raw)))
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("Failed to reach Workshop: %v", err)), nil
 		}
@@ -1419,7 +990,7 @@ func channelSubscribeHandler() server.ToolHandlerFunc {
 			"project": mcp.ParseString(req, "project", ""),
 		}
 		raw, _ := json.Marshal(body)
-		resp, err := http.Post(workshopAPIURL()+"/api/v1/channels/subscribe", "application/json", strings.NewReader(string(raw)))
+		resp, err := workshopHTTP.Post(workshopAPIURL()+"/api/v1/channels/subscribe", "application/json", strings.NewReader(string(raw)))
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("Failed to reach Workshop: %v", err)), nil
 		}
@@ -1439,7 +1010,7 @@ func channelUnsubscribeHandler() server.ToolHandlerFunc {
 			"target":  mcp.ParseString(req, "target", ""),
 		}
 		raw, _ := json.Marshal(body)
-		resp, err := http.Post(workshopAPIURL()+"/api/v1/channels/unsubscribe", "application/json", strings.NewReader(string(raw)))
+		resp, err := workshopHTTP.Post(workshopAPIURL()+"/api/v1/channels/unsubscribe", "application/json", strings.NewReader(string(raw)))
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("Failed to reach Workshop: %v", err)), nil
 		}
@@ -1455,7 +1026,7 @@ func channelListHandler() server.ToolHandlerFunc {
 		if project != "" {
 			u += "?project=" + url.QueryEscape(project)
 		}
-		resp, err := http.Get(u)
+		resp, err := workshopHTTP.Get(u)
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("Failed to reach Workshop: %v", err)), nil
 		}
@@ -1473,7 +1044,7 @@ func channelMessagesHandler() server.ToolHandlerFunc {
 			return mcp.NewToolResultError("channel is required"), nil
 		}
 		u := fmt.Sprintf("%s/api/v1/channels/%s/messages?limit=%d", workshopAPIURL(), url.PathEscape(channel), limit)
-		resp, err := http.Get(u)
+		resp, err := workshopHTTP.Get(u)
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("Failed to reach Workshop: %v", err)), nil
 		}
@@ -1506,7 +1077,7 @@ func uiActionHandler(action string, blocking bool, fields []string) server.ToolH
 			}
 		}
 		raw, _ := json.Marshal(payload)
-		resp, err := http.Post(workshopAPIURL()+"/api/v1/ui/"+action, "application/json", strings.NewReader(string(raw)))
+		resp, err := workshopHTTP.Post(workshopAPIURL()+"/api/v1/ui/"+action, "application/json", strings.NewReader(string(raw)))
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("Failed to reach Workshop server: %v", err)), nil
 		}
@@ -1584,7 +1155,7 @@ func detectPaneTarget() string {
 
 func streamChannelListener(s *server.MCPServer, target string) error {
 	u := workshopAPIURL() + "/api/v1/channel-listen/" + url.PathEscape(target)
-	resp, err := http.Get(u)
+	resp, err := workshopHTTP.Get(u)
 	if err != nil {
 		return err
 	}
@@ -1645,7 +1216,7 @@ func openDocHandler() server.ToolHandlerFunc {
 		}
 
 		body, _ := json.Marshal(map[string]string{"path": path})
-		resp, err := http.Post(workshopAPIURL()+"/api/v1/docs/open", "application/json", strings.NewReader(string(body)))
+		resp, err := workshopHTTP.Post(workshopAPIURL()+"/api/v1/docs/open", "application/json", strings.NewReader(string(body)))
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("Failed to reach Workshop server: %v", err)), nil
 		}
@@ -1660,7 +1231,7 @@ func openDocHandler() server.ToolHandlerFunc {
 
 func ollamaModelsHandler() server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		resp, err := http.Get(workshopAPIURL() + "/api/v1/ollama/models")
+		resp, err := workshopHTTP.Get(workshopAPIURL() + "/api/v1/ollama/models")
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("Failed to reach Workshop: %v", err)), nil
 		}
@@ -1714,7 +1285,7 @@ func ollamaChatHandler() server.ToolHandlerFunc {
 		}
 
 		jsonBody, _ := json.Marshal(chatReq)
-		resp, err := http.Post(workshopAPIURL()+"/api/v1/ollama/chat", "application/json", strings.NewReader(string(jsonBody)))
+		resp, err := workshopHTTP.Post(workshopAPIURL()+"/api/v1/ollama/chat", "application/json", strings.NewReader(string(jsonBody)))
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("Failed to reach Workshop: %v", err)), nil
 		}
@@ -1784,7 +1355,7 @@ func ollamaGenerateHandler() server.ToolHandlerFunc {
 		}
 
 		jsonBody, _ := json.Marshal(genReq)
-		resp, err := http.Post(workshopAPIURL()+"/api/v1/ollama/generate", "application/json", strings.NewReader(string(jsonBody)))
+		resp, err := workshopHTTP.Post(workshopAPIURL()+"/api/v1/ollama/generate", "application/json", strings.NewReader(string(jsonBody)))
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("Failed to reach Workshop: %v", err)), nil
 		}
@@ -1836,7 +1407,7 @@ func postUsage(model, provider string, inputTokens, outputTokens int64) {
 		"outputTokens": outputTokens,
 		"project":      "",
 	})
-	resp, err := http.Post(workshopAPIURL()+"/api/v1/usage", "application/json", strings.NewReader(string(payload)))
+	resp, err := workshopHTTP.Post(workshopAPIURL()+"/api/v1/usage", "application/json", strings.NewReader(string(payload)))
 	if err != nil {
 		slog.Warn("failed to record ollama usage", "err", err)
 		return
@@ -1844,109 +1415,6 @@ func postUsage(model, provider string, inputTokens, outputTokens int64) {
 	resp.Body.Close()
 }
 
-func orchestrateCardHandler() server.ToolHandlerFunc {
-	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		// Prevent recursive calls — if we're already inside an orchestrator session, refuse.
-		if strings.HasPrefix(mcpPaneTarget, "orchestrate-") {
-			return mcp.NewToolResultError("You ARE the orchestrator. Do not call orchestrate_card. Use launch_agent, capture_pane, report_activity, request_approval, kanban_add_note, and kanban_move directly to drive through the phases."), nil
-		}
-
-		cardID := mcp.ParseInt(req, "id", 0)
-		if cardID == 0 {
-			return mcp.NewToolResultError("id is required"), nil
-		}
-		directory := mcp.ParseString(req, "directory", "")
-		isolation := mcp.ParseString(req, "isolation", "")
-
-		// Fetch the card details
-		cardResp, err := http.Get(fmt.Sprintf("%s/api/v1/cards/%d", workshopAPIURL(), cardID))
-		if err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("Failed to reach Workshop: %v", err)), nil
-		}
-		defer cardResp.Body.Close()
-		cardBody, _ := io.ReadAll(cardResp.Body)
-		if cardResp.StatusCode != 200 {
-			return mcp.NewToolResultError(fmt.Sprintf("Card #%d not found", cardID)), nil
-		}
-
-		var card map[string]any
-		json.Unmarshal(cardBody, &card)
-		title, _ := card["title"].(string)
-		description, _ := card["description"].(string)
-		project, _ := card["project"].(string)
-
-		// Fetch existing notes for context
-		notesResp, _ := http.Get(fmt.Sprintf("%s/api/v1/cards/%d/notes", workshopAPIURL(), cardID))
-		var notesText string
-		if notesResp != nil {
-			defer notesResp.Body.Close()
-			notesBody, _ := io.ReadAll(notesResp.Body)
-			var notes []map[string]any
-			json.Unmarshal(notesBody, &notes)
-			for _, n := range notes {
-				if t, ok := n["text"].(string); ok {
-					notesText += "- " + t + "\n"
-				}
-			}
-		}
-
-		// Build the orchestrator prompt — avoid the word "orchestrate" to prevent
-		// the agent from recursively calling orchestrate_card on itself.
-		prompt := fmt.Sprintf(`Drive card #%d through all workflow phases using the tools described in your system prompt.
-
-## Card Details
-**Title:** %s
-**Project:** %s
-**Description:**
-%s
-`, cardID, title, project, description)
-
-		if notesText != "" {
-			prompt += fmt.Sprintf("\n## Existing Notes\n%s", notesText)
-		}
-
-		if directory != "" {
-			prompt += fmt.Sprintf("\n## Working Directory\n%s\n", directory)
-		}
-
-		prompt += fmt.Sprintf("\nThe card ID is %d and the project is %q. Use these in all kanban_add_note, kanban_move, and report_activity calls.", cardID, project)
-
-		// Launch the orchestrator agent — needs skip-permissions since it
-		// operates autonomously (user approves via Activity tab, not CLI prompts)
-		launchBody := map[string]any{
-			"name":                       fmt.Sprintf("orchestrate-%d", cardID),
-			"preset":                     "orchestrator",
-			"prompt":                     prompt,
-			"directory":                  directory,
-			"isolation":                  isolation,
-			"background":                 true,
-			"dangerouslySkipPermissions": true,
-		}
-		raw, _ := json.Marshal(launchBody)
-		resp, err := http.Post(workshopAPIURL()+"/api/v1/agents/launch", "application/json", strings.NewReader(string(raw)))
-		if err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("Failed to launch orchestrator: %v", err)), nil
-		}
-		defer resp.Body.Close()
-		result, _ := io.ReadAll(resp.Body)
-		if resp.StatusCode != 201 {
-			return mcp.NewToolResultError(string(result)), nil
-		}
-
-		var launched map[string]any
-		json.Unmarshal(result, &launched)
-		target, _ := launched["target"].(string)
-		sessionName, _ := launched["sessionName"].(string)
-
-		msg := fmt.Sprintf("Orchestrator launched for card #%d\nSession: %s\nTarget: %s", cardID, sessionName, target)
-		if wt, ok := launched["worktreeDir"].(string); ok && wt != "" {
-			br, _ := launched["branch"].(string)
-			msg += fmt.Sprintf("\nWorktree: %s\nBranch: %s", wt, br)
-		}
-		msg += "\n\nThe orchestrator will drive through plan→implement→test→review→PR phases with approval checkpoints at each step. Watch the Activity tab for progress."
-		return mcp.NewToolResultText(msg), nil
-	}
-}
 
 func requestApprovalHandler() server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -1964,7 +1432,7 @@ func requestApprovalHandler() server.ToolHandlerFunc {
 			"diff":       mcp.ParseString(req, "diff", ""),
 		}
 		body, _ := json.Marshal(entry)
-		resp, err := http.Post(workshopAPIURL()+"/api/v1/approvals", "application/json", strings.NewReader(string(body)))
+		resp, err := workshopHTTP.Post(workshopAPIURL()+"/api/v1/approvals", "application/json", strings.NewReader(string(body)))
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("Failed to reach Workshop: %v", err)), nil
 		}
@@ -2003,7 +1471,7 @@ func reportActivityHandler() server.ToolHandlerFunc {
 			"parentId":   mcp.ParseInt(req, "parent_id", 0),
 		}
 		body, _ := json.Marshal(entry)
-		resp, err := http.Post(workshopAPIURL()+"/api/v1/activity", "application/json", strings.NewReader(string(body)))
+		resp, err := workshopHTTP.Post(workshopAPIURL()+"/api/v1/activity", "application/json", strings.NewReader(string(body)))
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("Failed to reach Workshop: %v", err)), nil
 		}

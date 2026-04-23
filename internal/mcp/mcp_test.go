@@ -290,11 +290,11 @@ func withFakeAPI(t *testing.T) *http.ServeMux {
 	return mux
 }
 
-func TestSetPaneStatusHandler_requiresTargetAndStatus(t *testing.T) {
+func TestSetPaneStatusHandler_requiresStatus(t *testing.T) {
 	withFakeAPI(t)
 	res := callTool(t, setPaneStatusHandler(), map[string]any{"target": "a:1.1"})
 	assert.True(t, isError(res))
-	assert.Contains(t, resultText(res), "target and status are required")
+	assert.Contains(t, resultText(res), "status is required")
 }
 
 func TestSetPaneStatusHandler_postsToAPI(t *testing.T) {

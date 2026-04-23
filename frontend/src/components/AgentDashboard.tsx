@@ -15,22 +15,6 @@ interface PaneInfo {
   active: boolean;
 }
 
-interface ConsensusRun {
-  id: string;
-  prompt: string;
-  status: string;
-  agentOutputs: {
-    name: string;
-    model: string;
-    provider: string;
-    target: string;
-    status: string;
-    needsInput: boolean;
-    inputPrompt: string;
-  }[];
-  coordinatorPane: string;
-}
-
 interface AgentInfo {
   target: string;
   name: string;
@@ -39,8 +23,6 @@ interface AgentInfo {
   path: string;
   status: 'working' | 'idle' | 'needs_input' | 'done' | 'unknown';
   lastOutput: string;
-  consensusId?: string;
-  model?: string;
 }
 
 interface Props {
@@ -70,41 +52,10 @@ export function AgentDashboard({ onNavigateToPane, sfwMode = false, nsfwProjects
       // Get all panes
       const panes = await get<PaneInfo[]>('/panes') ?? [];
 
-      // Get consensus runs
-      let consensusRuns: ConsensusRun[] = [];
-      try {
-        consensusRuns = await get<ConsensusRun[]>('/consensus') ?? [];
-      } catch {}
-
-      // Build consensus agent map
-      const consensusAgents = new Map<string, { consensusId: string; status: string; needsInput: boolean; model: string; provider: string }>();
-      for (const run of consensusRuns) {
-        for (const agent of (run.agentOutputs || [])) {
-          if (agent.target) {
-            consensusAgents.set(agent.target, {
-              consensusId: run.id,
-              status: agent.status,
-              needsInput: agent.needsInput,
-              model: agent.model,
-              provider: agent.provider || 'claude',
-            });
-          }
-        }
-        if (run.coordinatorPane) {
-          consensusAgents.set(run.coordinatorPane, {
-            consensusId: run.id,
-            status: run.status === 'done' ? 'completed' : 'running',
-            needsInput: false,
-            model: 'opus',
-            provider: 'claude',
-          });
-        }
-      }
-
       // Filter to agent-like panes (running claude, gemini, or codex)
       const agentCommands = ['claude', 'gemini', 'codex'];
       const agentPanes = panes.filter((p) =>
-        agentCommands.includes(p.command) || agentCommands.includes(p.windowName) || consensusAgents.has(p.target)
+        agentCommands.includes(p.command) || agentCommands.includes(p.windowName)
       );
 
       // Capture last output for each (batched with concurrency limit)
@@ -130,64 +81,53 @@ export function AgentDashboard({ onNavigateToPane, sfwMode = false, nsfwProjects
       const agentInfos: AgentInfo[] = agentPanes.map((pane) => {
           const lastOutput = captureResults.get(pane.target) ?? '';
 
-          const consensus = consensusAgents.get(pane.target);
-          // Determine provider from command name or consensus data
-          const provider = consensus?.provider ?? (['gemini', 'codex'].includes(pane.command) ? pane.command : 'claude');
+          const provider = ['gemini', 'codex'].includes(pane.command) ? pane.command : 'claude';
           let status: AgentInfo['status'] = 'unknown';
 
-          if (consensus) {
-            if (consensus.needsInput) status = 'needs_input';
-            else if (consensus.status === 'completed') status = 'done';
-            else status = 'working';
-          } else {
-            // Strip ANSI escape codes for cleaner matching
-            const plain = lastOutput.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '');
-            const lower = plain.toLowerCase();
-            // Check last few lines for prompt patterns (tmux borders may follow the prompt)
-            const lines = plain.split('\n').map((l) => l.trim()).filter((l) => l && !/^[─━┄┈═]+$/.test(l));
-            const lastLines = lines.slice(-3).join(' ').toLowerCase();
+          // Strip ANSI escape codes for cleaner matching
+          const plain = lastOutput.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '');
+          const lower = plain.toLowerCase();
+          // Check last few lines for prompt patterns (tmux borders may follow the prompt)
+          const lines = plain.split('\n').map((l) => l.trim()).filter((l) => l && !/^[─━┄┈═]+$/.test(l));
+          const lastLines = lines.slice(-3).join(' ').toLowerCase();
 
-            // Common input patterns (all providers)
-            if (lower.includes('do you want to proceed') || lower.includes('(y/n)') || lower.includes('approve')) {
-              status = 'needs_input';
-            } else if (provider === 'claude') {
-              // Claude-specific patterns
-              if (lower.includes('worked for') || lower.includes('baked for') || lower.includes('sautéed for') || lower.includes('crunched for')) {
-                status = 'done';
-              } else if (lastLines.includes('accept edits') || lastLines.includes('esc to cancel') || lastLines.includes('ctrl+e to explain')) {
-                status = 'idle';
-              } else if (lines.some((l) => /❯\s*$/.test(l))) {
-                status = 'idle';
-              } else if (plain.includes('…') || lower.includes('thinking') || lower.includes('running')) {
-                status = 'working';
-              } else {
-                status = 'working';
-              }
-            } else if (provider === 'gemini') {
-              // Gemini CLI patterns
-              if (lower.includes('✦')) {
-                status = 'done';
-              } else if (lines.some((l) => /^>\s*$/.test(l))) {
-                status = 'idle';
-              } else {
-                status = 'working';
-              }
-            } else if (provider === 'codex') {
-              // Codex CLI patterns
-              if (lower.includes('completed in') || lower.includes('done in')) {
-                status = 'done';
-              } else if (lines.some((l) => /[>$#]\s*$/.test(l))) {
-                status = 'idle';
-              } else {
-                status = 'working';
-              }
+          // Common input patterns (all providers)
+          if (lower.includes('do you want to proceed') || lower.includes('(y/n)') || lower.includes('approve')) {
+            status = 'needs_input';
+          } else if (provider === 'claude') {
+            // Claude-specific patterns
+            if (lower.includes('worked for') || lower.includes('baked for') || lower.includes('sautéed for') || lower.includes('crunched for')) {
+              status = 'done';
+            } else if (lastLines.includes('accept edits') || lastLines.includes('esc to cancel') || lastLines.includes('ctrl+e to explain')) {
+              status = 'idle';
+            } else if (lines.some((l) => /❯\s*$/.test(l))) {
+              status = 'idle';
+            } else if (plain.includes('…') || lower.includes('thinking') || lower.includes('running')) {
+              status = 'working';
             } else {
-              // Generic fallback
-              if (lines.some((l) => /[❯>$#]\s*$/.test(l))) {
-                status = 'idle';
-              } else {
-                status = 'working';
-              }
+              status = 'working';
+            }
+          } else if (provider === 'gemini') {
+            if (lower.includes('✦')) {
+              status = 'done';
+            } else if (lines.some((l) => /^>\s*$/.test(l))) {
+              status = 'idle';
+            } else {
+              status = 'working';
+            }
+          } else if (provider === 'codex') {
+            if (lower.includes('completed in') || lower.includes('done in')) {
+              status = 'done';
+            } else if (lines.some((l) => /[>$#]\s*$/.test(l))) {
+              status = 'idle';
+            } else {
+              status = 'working';
+            }
+          } else {
+            if (lines.some((l) => /[❯>$#]\s*$/.test(l))) {
+              status = 'idle';
+            } else {
+              status = 'working';
             }
           }
 
@@ -199,8 +139,6 @@ export function AgentDashboard({ onNavigateToPane, sfwMode = false, nsfwProjects
             path: pane.path,
             status,
             lastOutput,
-            consensusId: consensus?.consensusId,
-            model: consensus?.model,
           };
       });
 
@@ -276,14 +214,12 @@ function AgentCard({ agent, onNavigate }: { agent: AgentInfo; onNavigate: (targe
         <ChibiAvatar state={(agent.status === 'unknown' ? 'idle' : agent.status) as ChibiState} variant={variantFromName(agent.name)} size="md" />
         <span className="dashboard-card-name">{agent.name}</span>
         {agent.provider && agent.provider !== 'claude' && <span className="dashboard-card-provider">{agent.provider}</span>}
-        {agent.model && <span className="dashboard-card-model">{agent.model}</span>}
         <span className="dashboard-card-status" style={{ color: statusColor(agent.status) }}>
           {agent.status.replace('_', ' ')}
         </span>
       </div>
       <div className="dashboard-card-target">{agent.target}</div>
       {agent.path && <div className="dashboard-card-path">{agent.path}</div>}
-      {agent.consensusId && <div className="dashboard-card-consensus">Consensus: {agent.consensusId}</div>}
       <pre
         className="dashboard-card-output"
         dangerouslySetInnerHTML={{ __html: outputHtml }}

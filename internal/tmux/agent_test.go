@@ -21,11 +21,13 @@ func TestBuildProviderCommand_claudeWithModel(t *testing.T) {
 }
 
 func TestBuildProviderCommand_claudeSkipPermissions(t *testing.T) {
-	assert.Equal(t, "claude --dangerously-skip-permissions", buildProviderCommand("claude", "", true))
+	expected := "claude --dangerously-skip-permissions " + autoApproveSettings
+	assert.Equal(t, expected, buildProviderCommand("claude", "", true))
 }
 
 func TestBuildProviderCommand_claudeWithModelAndSkip(t *testing.T) {
-	assert.Equal(t, "claude --model sonnet --dangerously-skip-permissions", buildProviderCommand("claude", "sonnet", true))
+	expected := "claude --model sonnet --dangerously-skip-permissions " + autoApproveSettings
+	assert.Equal(t, expected, buildProviderCommand("claude", "sonnet", true))
 }
 
 func TestBuildProviderCommand_gemini(t *testing.T) {

@@ -5,7 +5,23 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
+
+	"golang.org/x/sync/singleflight"
 )
+
+// DefaultTmuxTimeout caps how long any tmux shell-out can run before we
+// abandon it. tmux commands normally return in <10ms; a multi-second wait
+// means the tmux server is blocked (e.g. by a PTY output burst). Killing
+// the hung command frees up Workshop's HTTP handlers so the Sidebar poller
+// doesn't stack N concurrent fetches into the browser connection pool.
+var DefaultTmuxTimeout = 3 * time.Second
+
+// listSessionsCacheTTL keeps the result of ListSessions cached briefly so
+// concurrent callers (e.g. the Sidebar polling /sessions + /git/info in
+// quick succession) share a single tmux shell-out.
+var listSessionsCacheTTL = 500 * time.Millisecond
 
 // Session represents a tmux session.
 type Session struct {
@@ -13,7 +29,7 @@ type Session struct {
 	Windows  int    `json:"windows"`
 	Created  string `json:"created"`
 	Attached bool   `json:"attached"`
-	Hidden   bool   `json:"hidden,omitempty"` // true for internal sessions (workshop-ctrl-*, consensus-*)
+	Hidden   bool   `json:"hidden,omitempty"` // true for internal sessions (workshop-ctrl-*)
 }
 
 // Pane represents a tmux pane.
@@ -60,6 +76,15 @@ type CommandRunner func(name string, args ...string) *exec.Cmd
 type ExecBridge struct {
 	tmuxPath string
 	runCmd   CommandRunner
+
+	// Short-TTL cache + single-flight for ListSessions. Under normal
+	// load there's one caller (Sidebar poll every 5s), but during tmux
+	// stalls multiple fetches stack up and every one pays the full
+	// wait. Sharing the result bounds the damage.
+	sfGroup    singleflight.Group
+	lsMu       sync.Mutex
+	lsCached   []Session
+	lsCachedAt time.Time
 }
 
 // NewExecBridge creates a new ExecBridge. Pass "" for tmuxPath to use "tmux" from PATH.
@@ -76,12 +101,70 @@ func (b *ExecBridge) RunRaw(args ...string) (string, error) {
 }
 
 func (b *ExecBridge) run(args ...string) (string, error) {
+	return b.runTimeout(DefaultTmuxTimeout, args...)
+}
+
+// runTimeout runs a tmux command, killing it if it exceeds the given
+// timeout. Pass timeout <= 0 to disable the cap (e.g. for long-running
+// commands like attach-session). Using CombinedOutput in a goroutine and
+// Kill() on timeout avoids changing the CommandRunner signature so
+// existing tests keep working.
+func (b *ExecBridge) runTimeout(timeout time.Duration, args ...string) (string, error) {
 	cmd := b.runCmd(b.tmuxPath, args...)
-	out, err := cmd.CombinedOutput()
-	return strings.TrimSpace(string(out)), err
+	if timeout <= 0 {
+		out, err := cmd.CombinedOutput()
+		return strings.TrimSpace(string(out)), err
+	}
+
+	type result struct {
+		out []byte
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		out, err := cmd.CombinedOutput()
+		done <- result{out: out, err: err}
+	}()
+
+	select {
+	case r := <-done:
+		return strings.TrimSpace(string(r.out)), r.err
+	case <-time.After(timeout):
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		r := <-done
+		return strings.TrimSpace(string(r.out)),
+			fmt.Errorf("tmux %v timed out after %v", args, timeout)
+	}
 }
 
 func (b *ExecBridge) ListSessions() ([]Session, error) {
+	b.lsMu.Lock()
+	if time.Since(b.lsCachedAt) < listSessionsCacheTTL && b.lsCached != nil {
+		cached := b.lsCached
+		b.lsMu.Unlock()
+		return cached, nil
+	}
+	b.lsMu.Unlock()
+
+	v, err, _ := b.sfGroup.Do("list-sessions", func() (any, error) {
+		sessions, err := b.listSessionsUncached()
+		if err == nil {
+			b.lsMu.Lock()
+			b.lsCached = sessions
+			b.lsCachedAt = time.Now()
+			b.lsMu.Unlock()
+		}
+		return sessions, err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return v.([]Session), nil
+}
+
+func (b *ExecBridge) listSessionsUncached() ([]Session, error) {
 	out, err := b.run("list-sessions", "-F",
 		"#{session_name}\t#{session_windows}\t#{session_created}\t#{session_attached}")
 	if err != nil {
@@ -102,7 +185,7 @@ func (b *ExecBridge) ListSessions() ([]Session, error) {
 			continue
 		}
 		name := parts[0]
-		hidden := strings.HasPrefix(name, "workshop-ctrl-") || strings.HasPrefix(name, "consensus-")
+		hidden := strings.HasPrefix(name, "workshop-ctrl-")
 		// Skip internal sessions by default
 		if hidden {
 			continue
@@ -139,7 +222,7 @@ func (b *ExecBridge) ListAllSessions() ([]Session, error) {
 			continue
 		}
 		name := parts[0]
-		hidden := strings.HasPrefix(name, "workshop-ctrl-") || strings.HasPrefix(name, "consensus-")
+		hidden := strings.HasPrefix(name, "workshop-ctrl-")
 		windows, _ := strconv.Atoi(parts[1])
 		sessions = append(sessions, Session{
 			Name:     name,
@@ -293,7 +376,12 @@ func (b *ExecBridge) ResizePane(target string, cols, rows int) error {
 // match the smallest client (-A). This forces a full redraw which is
 // needed after the PTY is resized client-side.
 func (b *ExecBridge) ResizeWindow(target string, cols, rows int) error {
-	if out, err := b.run("resize-window", "-t", target, "-A"); err != nil {
+	// Set window-size to manual so tmux doesn't fight our explicit dimensions
+	// based on its own attached clients. Then resize the window explicitly.
+	b.run("set-option", "-s", "-t", target, "window-size", "manual")
+	if out, err := b.run("resize-window", "-t", target,
+		"-x", fmt.Sprintf("%d", cols),
+		"-y", fmt.Sprintf("%d", rows)); err != nil {
 		return fmt.Errorf("resize-window: %w: %s", err, out)
 	}
 	return nil

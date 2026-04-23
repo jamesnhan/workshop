@@ -176,6 +176,18 @@ export function mergeCells(layout: LayoutState, sourceId: string, targetId: stri
   return { ...layout, cells: newCells };
 }
 
+// Move a tab within a cell's tabs array. Returns the cell unchanged if indices
+// are out of range or identical. Does not change cell.target (the active tab).
+export function reorderTab(cell: GridCell, fromIndex: number, toIndex: number): GridCell {
+  if (fromIndex === toIndex) return cell;
+  if (fromIndex < 0 || toIndex < 0) return cell;
+  if (fromIndex >= cell.tabs.length || toIndex >= cell.tabs.length) return cell;
+  const newTabs = [...cell.tabs];
+  const [moved] = newTabs.splice(fromIndex, 1);
+  newTabs.splice(toIndex, 0, moved);
+  return { ...cell, tabs: newTabs };
+}
+
 // Split a merged cell back into individual cells
 export function splitCell(layout: LayoutState, cellId: string): LayoutState {
   const cell = layout.cells.find((c) => c.id === cellId);

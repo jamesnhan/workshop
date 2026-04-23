@@ -17,6 +17,7 @@ interface Props {
   repoDir: string;
   x: number;
   y: number;
+  pinned?: boolean;
 }
 
 const previewCache = new Map<string, CommitPreview | null>();
@@ -36,7 +37,7 @@ function relativeDate(dateStr: string): string {
   } catch { return dateStr; }
 }
 
-export function GitCommitHoverPreview({ sha, repoDir, x, y }: Props) {
+export function GitCommitHoverPreview({ sha, repoDir, x, y, pinned }: Props) {
   const [preview, setPreview] = useState<CommitPreview | null | undefined>(previewCache.get(sha));
 
   useEffect(() => {
@@ -64,7 +65,7 @@ export function GitCommitHoverPreview({ sha, repoDir, x, y }: Props) {
   const bodyLines = preview.body ? preview.body.split('\n').slice(0, 3).join('\n') : '';
 
   return (
-    <HoverPreview x={x} y={y} width={400} className="git-commit-hover-preview">
+    <HoverPreview x={x} y={y} width={400} maxHeight={350} className={`git-commit-hover-preview${pinned ? ' hover-pinned-inline' : ''}`}>
       <div className="git-commit-header">
         <span className="git-commit-sha">{preview.shortSha}</span>
         <span className="git-commit-date">{relativeDate(preview.date)}</span>

@@ -17,6 +17,11 @@ import (
 //go:embed all:frontend/dist
 var frontendFS embed.FS
 
+// Version is set at build time via -ldflags "-X main.Version=<sha>".
+// Matches the frontend's VITE_BUILD_VERSION so /api/v1/version can tell a
+// stale tab that the server has been upgraded and prompt a reload.
+var Version = "dev"
+
 func main() {
 	if len(os.Args) > 1 && os.Args[0] != "-" {
 		switch os.Args[1] {
@@ -24,7 +29,7 @@ func main() {
 			workshopmcp.Serve()
 			return
 		case "version":
-			fmt.Println("workshop v0.1.0")
+			fmt.Println("workshop " + Version)
 			return
 		}
 	}
@@ -33,8 +38,21 @@ func main() {
 	addr := flag.String("addr", ":9090", "listen address")
 	flag.Parse()
 
-	localHandler := slog.NewTextHandler(os.Stderr, nil)
+	// Log level from WORKSHOP_LOG_LEVEL (debug|info|warn|error). Default: info.
+	// Raise to debug when chasing intermittent bugs — telemetry pipeline
+	// already ships logs to Loki so cranking this up gives a rich timeline.
+	level := slog.LevelInfo
+	switch os.Getenv("WORKSHOP_LOG_LEVEL") {
+	case "debug", "DEBUG":
+		level = slog.LevelDebug
+	case "warn", "WARN":
+		level = slog.LevelWarn
+	case "error", "ERROR":
+		level = slog.LevelError
+	}
+	localHandler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})
 	logger := slog.New(localHandler)
+	logger.Info("log level", "level", level.String())
 
 	// Telemetry — no-op when WORKSHOP_OTEL_ENABLED != true.
 	otelShutdown, err := telemetry.Init(context.Background(), logger)
@@ -53,7 +71,7 @@ func main() {
 		}
 	}()
 
-	srv, err := server.New(logger, frontendFS)
+	srv, err := server.New(logger, frontendFS, Version)
 	if err != nil {
 		logger.Error("failed to initialize server", "err", err)
 		os.Exit(1)

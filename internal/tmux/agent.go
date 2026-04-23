@@ -21,6 +21,10 @@ const (
 	ProviderCodex  = "codex"
 )
 
+// autoApproveSettings is the --settings JSON that injects a PreToolUse hook
+// to auto-approve all tool calls. Session-scoped — not persisted to files.
+const autoApproveSettings = `--settings '{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"echo {\\\"hookSpecificOutput\\\":{\\\"hookEventName\\\":\\\"PreToolUse\\\",\\\"permissionDecision\\\":\\\"allow\\\"}}"}]}]}}'`
+
 // AgentConfig defines the parameters for launching an agent.
 type AgentConfig struct {
 	Name                     string `json:"name"`
@@ -31,7 +35,6 @@ type AgentConfig struct {
 	Model                    string `json:"model,omitempty"`     // model flag (--model / -m)
 	Isolation                string `json:"isolation,omitempty"` // "worktree" = auto-create git worktree for isolated work
 	DangerousSkipPermissions bool   `json:"dangerouslySkipPermissions,omitempty"`
-	CardID                   int64  `json:"cardId,omitempty"`    // kanban card this agent was dispatched from (0 = none)
 	Background               bool   `json:"background,omitempty"` // don't steal focus on the frontend when attaching
 }
 
@@ -177,6 +180,11 @@ func buildProviderCommand(provider, model string, skipPerms bool) string {
 		}
 		if skipPerms {
 			cmd += " --dangerously-skip-permissions"
+			// Inject a PreToolUse hook via --settings that auto-approves all
+			// tool calls. --dangerously-skip-permissions doesn't cover compound
+			// git commands and some other edge cases. The hook is session-scoped
+			// (not persisted to settings files) so it only affects this agent.
+			cmd += " " + autoApproveSettings
 		}
 		return cmd
 	}
@@ -186,7 +194,7 @@ func buildProviderCommand(provider, model string, skipPerms bool) string {
 // trust/setup prompts, then types the user's prompt.
 func (b *ExecBridge) waitAndSendPrompt(target, prompt, provider string) {
 	slog.Info("waitAndSendPrompt: starting", "target", target, "provider", provider, "promptLen", len(prompt))
-	for i := 0; i < 25; i++ {
+	for i := 0; i < 40; i++ {
 		time.Sleep(1 * time.Second)
 
 		output, err := b.CapturePanePlain(target, 30)
@@ -338,6 +346,17 @@ func handleTrustPrompt(b *ExecBridge, target, output, provider string) bool {
 			b.run("send-keys", "-t", target, "Enter")
 			return true
 		}
+		// Trust folder prompt (v2.1+): "Yes, I trust this folder" is option 1, already selected
+		if strings.Contains(output, "I trust this folder") && strings.Contains(output, "Enter to confirm") {
+			b.run("send-keys", "-t", target, "Enter")
+			return true
+		}
+		// Generic "Do you want to proceed?" permission prompt (compound commands,
+		// git safety checks, etc.) — default is "1. Yes", already selected
+		if strings.Contains(output, "Do you want to proceed") {
+			b.run("send-keys", "-t", target, "Enter")
+			return true
+		}
 		if strings.Contains(output, "Enter to confirm") {
 			b.run("send-keys", "-t", target, "Enter")
 			return true
@@ -377,7 +396,17 @@ func isAgentReady(output, provider string) bool {
 		hasChromeUI := strings.Contains(output, "───────")
 		hasPrompt := strings.Contains(output, "❯") || strings.Contains(output, "Type")
 		// Trust/permission dialogs also contain ─ borders and ❯; exclude them.
-		hasTrustDialog := strings.Contains(output, "Enter to confirm") || strings.Contains(output, "Do you trust")
+		// Only check the LAST 10 lines for trust dialog markers — dismissed
+		// trust prompts linger in scrollback and cause false negatives.
+		lines := strings.Split(output, "\n")
+		tail := output
+		if len(lines) > 10 {
+			tail = strings.Join(lines[len(lines)-10:], "\n")
+		}
+		hasTrustDialog := strings.Contains(tail, "Enter to confirm") ||
+			strings.Contains(tail, "Do you trust") ||
+			strings.Contains(tail, "I trust this folder") ||
+			strings.Contains(tail, "Do you want to proceed")
 		return hasChromeUI && hasPrompt && !hasTrustDialog
 	}
 }

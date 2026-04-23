@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -33,7 +34,57 @@ type paneSession struct {
 	cancel context.CancelFunc
 }
 
+type clientSize struct {
+	cols int
+	rows int
+}
+
 func wsHandler(logger *slog.Logger, bridge tmuxpkg.Bridge, outputBuffer *OutputBuffer, recorder *RecordingManager, statusStore *StatusStore) http.HandlerFunc {
+	// Shared across all WS connections: track each client's reported size per pane.
+	// Key: pane target, Value: map of client ID → size.
+	// Used to resize tmux to the smallest connected client (like native tmux).
+	var sizeMu sync.Mutex
+	clientSizes := make(map[string]map[string]clientSize) // target → clientID → size
+	lastApplied := make(map[string]clientSize)            // target → last dims pushed to tmux
+
+	smallestSize := func(target string) (int, int) {
+		sizeMu.Lock()
+		defer sizeMu.Unlock()
+		clients := clientSizes[target]
+		if len(clients) == 0 {
+			return 0, 0
+		}
+		minCols, minRows := 9999, 9999
+		for _, sz := range clients {
+			if sz.cols < minCols {
+				minCols = sz.cols
+			}
+			if sz.rows < minRows {
+				minRows = sz.rows
+			}
+		}
+		return minCols, minRows
+	}
+
+	// applyTmuxResize is the single choke-point for tmux ResizeWindow calls.
+	// It skips the call (and the SIGWINCH-induced full-screen repaint that
+	// gets broadcast to every subscriber) when the dimensions haven't changed
+	// since the last applied resize for this target. Without this dedup, every
+	// focus/reconnect/force-resize triggered a redundant tmux repaint on every
+	// connected client — an amplification loop under multi-client resize (#934).
+	applyTmuxResize := func(eb *tmuxpkg.ExecBridge, target string, cols, rows int) bool {
+		sizeMu.Lock()
+		prev, ok := lastApplied[target]
+		if ok && prev.cols == cols && prev.rows == rows {
+			sizeMu.Unlock()
+			return false
+		}
+		lastApplied[target] = clientSize{cols: cols, rows: rows}
+		sizeMu.Unlock()
+		eb.ResizeWindow(target, cols, rows)
+		return true
+	}
+
 	return func(w http.ResponseWriter, r *http.Request) {
 		conn, err := websocket.Accept(w, r, nil)
 		if err != nil {
@@ -42,9 +93,39 @@ func wsHandler(logger *slog.Logger, bridge tmuxpkg.Bridge, outputBuffer *OutputB
 		}
 		defer conn.CloseNow()
 
-		logger.Info("websocket connected", "remote", r.RemoteAddr)
+		clientID := fmt.Sprintf("%s-%d", r.RemoteAddr, time.Now().UnixNano())
+		logger.Info("websocket connected", "remote", r.RemoteAddr, "clientID", clientID)
 		telemetry.WSConnectionsActive.Add(r.Context(), 1)
 		defer telemetry.WSConnectionsActive.Add(context.Background(), -1)
+
+		// Clean up this client's sizes on disconnect and re-apply the
+		// smallest remaining client's size to each pane (so the desktop
+		// resizes back to full size when the phone disconnects).
+		defer func() {
+			sizeMu.Lock()
+			var affectedTargets []string
+			for target, clients := range clientSizes {
+				delete(clients, clientID)
+				if len(clients) == 0 {
+					delete(clientSizes, target)
+				} else {
+					affectedTargets = append(affectedTargets, target)
+				}
+			}
+			sizeMu.Unlock()
+
+			// Re-apply smallest size for panes that still have clients.
+			if eb, ok := bridge.(*tmuxpkg.ExecBridge); ok {
+				for _, target := range affectedTargets {
+					cols, rows := smallestSize(target)
+					if cols > 0 && rows > 0 {
+						if applyTmuxResize(eb, target, cols, rows) {
+							logger.Info("resize-on-disconnect", "target", target, "clientID", clientID, "newCols", cols, "newRows", rows)
+						}
+					}
+				}
+			}
+		}()
 
 		ctx, cancel := context.WithCancel(r.Context())
 		defer cancel()
@@ -278,6 +359,28 @@ func wsHandler(logger *slog.Logger, bridge tmuxpkg.Bridge, outputBuffer *OutputB
 				mu.Unlock()
 				logger.Info("unsubscribe", "target", req.Target)
 
+				// Remove this client's size entry for the pane and re-apply
+				// smallest remaining size. This restores the desktop's full
+				// dimensions when the phone switches away from a pane.
+				sizeMu.Lock()
+				if clients, ok := clientSizes[req.Target]; ok {
+					delete(clients, clientID)
+					if len(clients) == 0 {
+						delete(clientSizes, req.Target)
+					}
+				}
+				sizeMu.Unlock()
+				if eb, ok := bridge.(*tmuxpkg.ExecBridge); ok {
+					cols, rows := smallestSize(req.Target)
+					if cols > 0 && rows > 0 {
+						go func(t string, c, r int) {
+							if applyTmuxResize(eb, t, c, r) {
+								logger.Info("resize-on-unsub", "target", t, "clientID", clientID, "cols", c, "rows", r)
+							}
+						}(req.Target, cols, rows)
+					}
+				}
+
 			case "resize":
 				var req struct {
 					Target string `json:"target"`
@@ -290,16 +393,62 @@ func wsHandler(logger *slog.Logger, bridge tmuxpkg.Bridge, outputBuffer *OutputB
 				mu.Lock()
 				s := sessions[req.Target]
 				mu.Unlock()
+				// Track this client's size for the pane. Also remove this
+				// client's entries for any other panes — on mobile, the user
+				// views one pane at a time, so switching panes should release
+				// the size constraint on the old pane.
+				sizeMu.Lock()
+				var staleTargets []string
+				for target, clients := range clientSizes {
+					if target != req.Target {
+						if _, ok := clients[clientID]; ok {
+							delete(clients, clientID)
+							if len(clients) == 0 {
+								delete(clientSizes, target)
+							}
+							staleTargets = append(staleTargets, target)
+						}
+					}
+				}
+				if clientSizes[req.Target] == nil {
+					clientSizes[req.Target] = make(map[string]clientSize)
+				}
+				clientSizes[req.Target][clientID] = clientSize{cols: req.Cols, rows: req.Rows}
+				sizeMu.Unlock()
+
+				// Re-apply smallest size to panes we just left.
+				if eb, ok := bridge.(*tmuxpkg.ExecBridge); ok {
+					for _, target := range staleTargets {
+						c, r := smallestSize(target)
+						if c > 0 && r > 0 {
+							go func(t string, c, r int) {
+								if applyTmuxResize(eb, t, c, r) {
+									logger.Info("resize-on-pane-switch", "target", t, "clientID", clientID, "cols", c, "rows", r)
+								}
+							}(target, c, r)
+						}
+					}
+				}
+
+				// Use the smallest connected client's dimensions (like native tmux).
+				cols, rows := smallestSize(req.Target)
+				if cols < 1 || rows < 1 {
+					cols, rows = req.Cols, req.Rows
+				}
 				if s != nil {
 					pty.Setsize(s.ptmx, &pty.Winsize{
-						Cols: uint16(req.Cols),
-						Rows: uint16(req.Rows),
+						Cols: uint16(cols),
+						Rows: uint16(rows),
 					})
-					// Tell tmux to auto-resize the window to the smallest client.
-					// This forces a full redraw at the new dimensions.
-					if eb, ok := bridge.(*tmuxpkg.ExecBridge); ok {
-						go eb.ResizeWindow(req.Target, req.Cols, req.Rows)
-					}
+				}
+				if eb, ok := bridge.(*tmuxpkg.ExecBridge); ok {
+					go func(t string, c, r int) {
+						if applyTmuxResize(eb, t, c, r) {
+							logger.Info("resize", "target", t, "clientID", clientID,
+								"clientCols", req.Cols, "clientRows", req.Rows,
+								"effectiveCols", c, "effectiveRows", r)
+						}
+					}(req.Target, cols, rows)
 				}
 
 			case "input":

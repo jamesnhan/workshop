@@ -69,7 +69,6 @@ func TestListSessions_hidesInternalSessions(t *testing.T) {
 	s.outputs["list-sessions"] = strings.Join([]string{
 		"alpha\t1\t0\t0",
 		"workshop-ctrl-abc\t1\t0\t0",
-		"consensus-xyz\t1\t0\t0",
 		"beta\t1\t0\t0",
 	}, "\n")
 
@@ -87,12 +86,11 @@ func TestListAllSessions_includesHidden(t *testing.T) {
 	s.outputs["list-sessions"] = strings.Join([]string{
 		"alpha\t1\t0\t0",
 		"workshop-ctrl-abc\t1\t0\t0",
-		"consensus-xyz\t1\t0\t0",
 	}, "\n")
 
 	sessions, err := b.ListAllSessions()
 	require.NoError(t, err)
-	require.Len(t, sessions, 3)
+	require.Len(t, sessions, 2)
 
 	hidden := map[string]bool{}
 	for _, sess := range sessions {
@@ -100,7 +98,6 @@ func TestListAllSessions_includesHidden(t *testing.T) {
 	}
 	assert.False(t, hidden["alpha"])
 	assert.True(t, hidden["workshop-ctrl-abc"])
-	assert.True(t, hidden["consensus-xyz"])
 }
 
 // --- CreateSession ---

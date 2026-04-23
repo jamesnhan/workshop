@@ -40,6 +40,8 @@ const sections = [
       [`${mod} + Shift + P`, 'Command palette'],
       [`${mod} + Shift + F`, 'Search pane output'],
       [`${mod} + Shift + K`, 'Kanban board'],
+      ['\`', 'Split view (Kanban + Terminal)'],
+      [`${mod} + Shift + L`, 'Split view (Kanban + Terminal)'],
       [`${mod} + Shift + D`, 'Agent dashboard'],
       ['z', 'Pin / unpin hover preview (for screenshots)'],
       ['?', 'This hotkey menu'],

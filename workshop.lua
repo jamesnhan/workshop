@@ -32,6 +32,17 @@ workshop.agent({
   prompt = "Generate a comprehensive README.md for this project based on the codebase.",
 })
 
+-- Ollama endpoints (local LLM fleet)
+workshop.ollama({
+  name = "4090",
+  url = "http://127.0.0.1:11434",
+  default = true,
+})
+workshop.ollama({
+  name = "m1max",
+  url = "http://192.168.1.108:11434",
+})
+
 -- Dynamic: check if we have existing sessions
 local sessions = workshop.list_sessions()
 if sessions then

@@ -7,16 +7,17 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	apiv1 "github.com/jamesnhan/workshop/internal/api/v1"
 	"github.com/jamesnhan/workshop/internal/config"
-	"github.com/jamesnhan/workshop/internal/consensus"
 	"github.com/jamesnhan/workshop/internal/db"
 	"github.com/jamesnhan/workshop/internal/ollama"
 	"github.com/jamesnhan/workshop/internal/telemetry"
 	"github.com/jamesnhan/workshop/internal/tmux"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // channelHubAdapter bridges server.ChannelHub to apiv1.ChannelHubAPI,
@@ -96,40 +97,92 @@ func (a *uiHubAdapter) Resolve(id string, resp apiv1.UIResponse) bool {
 }
 
 type Server struct {
-	handler  http.Handler
-	logger   *slog.Logger
-	db       *db.DB
-	recorder *RecordingManager
+	handler    http.Handler
+	logger     *slog.Logger
+	db         *db.DB
+	recorder   *RecordingManager
+	stopReaper chan struct{}
 }
 
-func New(logger *slog.Logger, frontendFS embed.FS) (*Server, error) {
-	tmux.CleanupStaleControlSessions()
+func New(logger *slog.Logger, frontendFS embed.FS, version string) (*Server, error) {
+	headless := os.Getenv("WORKSHOP_HEADLESS") == "true"
 
-	dataDir := filepath.Join(os.Getenv("HOME"), ".local", "share", "workshop")
+	if !headless {
+		tmux.CleanupStaleControlSessions()
+	}
+
+	dataDir := os.Getenv("WORKSHOP_DATA_DIR")
+	if dataDir == "" {
+		dataDir = filepath.Join(os.Getenv("HOME"), ".local", "share", "workshop")
+	}
 	database, err := db.Open(dataDir)
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
 	}
-	logger.Info("database opened", "path", filepath.Join(dataDir, "workshop.db"))
+	logger.Info("database opened", "path", filepath.Join(dataDir, "workshop.db"), "headless", headless)
 
 	mux := http.NewServeMux()
 
-	bridge := tmux.NewExecBridge("")
+	var bridge tmux.Bridge
+	if headless {
+		bridge = tmux.NewNoBridge()
+	} else {
+		bridge = tmux.NewExecBridge("")
+	}
 	outputBuffer := NewOutputBuffer(10000)
 	recorder := NewRecordingManager(logger, database)
 	statusStore := NewStatusStore()
 	paneMonitor := NewPaneMonitor(bridge, statusStore, logger)
 	statusStore.AttachMonitor(paneMonitor)
-	paneMonitor.Start(make(chan struct{})) // runs for the lifetime of the server
+	if !headless {
+		paneMonitor.Start(make(chan struct{})) // runs for the lifetime of the server
+	}
 	uiHub := NewUICommandHub(statusStore)
-	channelHub := NewChannelHub(database, logger, NewSendTextDelivery(bridge), DeliveryAuto)
-	consensusEngine := consensus.NewEngine(bridge, database, logger)
-	approvalHub := NewApprovalHub(statusStore)
-	api := apiv1.New(logger, bridge, outputBuffer, database, consensusEngine, recorder, statusStore, &uiHubAdapter{hub: uiHub}, &channelHubAdapter{hub: channelHub})
-	api.SetApprovalHub(approvalHub)
 
-	// Auto-load Ollama endpoints from config at startup
-	if cfgPath := config.FindConfig(filepath.Join(os.Getenv("HOME"), ".config", "workshop")); cfgPath != "" {
+	// In headless mode, force native-only channel delivery (no compat/send_text)
+	channelMode := DeliveryAuto
+	if headless {
+		channelMode = DeliveryNative
+	}
+	channelHub := NewChannelHub(database, logger, NewSendTextDelivery(bridge), channelMode)
+	approvalHub := NewApprovalHub(statusStore)
+	api := apiv1.New(logger, bridge, outputBuffer, database, recorder, statusStore, &uiHubAdapter{hub: uiHub}, &channelHubAdapter{hub: channelHub})
+	api.SetApprovalHub(approvalHub)
+	api.SetVersion(version)
+
+	// Upload directory: persist uploads alongside the DB so they survive
+	// pod restarts on K8s (both use WORKSHOP_DATA_DIR / PVC).
+	uploadDir := filepath.Join(dataDir, "uploads")
+	api.SetUploadDir(uploadDir)
+	stopReaper := make(chan struct{})
+	apiv1.StartUploadReaper(uploadDir, 30*24*time.Hour, logger, stopReaper)
+
+	// Configure tmux reverse proxy for headless mode.
+	if proxyURL := os.Getenv("WORKSHOP_TMUX_PROXY_URL"); proxyURL != "" && headless {
+		if err := api.SetTmuxProxy(proxyURL); err != nil {
+			logger.Warn("failed to set tmux proxy", "url", proxyURL, "err", err)
+		} else {
+			logger.Info("tmux proxy enabled", "target", proxyURL)
+		}
+	}
+
+	// Auto-load Ollama endpoints: env var first, then Lua config fallback.
+	// WORKSHOP_OLLAMA_ENDPOINTS format: "name=url,name=url" (first is default)
+	if envEps := os.Getenv("WORKSHOP_OLLAMA_ENDPOINTS"); envEps != "" {
+		var eps []ollama.Endpoint
+		for i, entry := range strings.Split(envEps, ",") {
+			parts := strings.SplitN(strings.TrimSpace(entry), "=", 2)
+			if len(parts) == 2 {
+				eps = append(eps, ollama.Endpoint{Name: parts[0], URL: parts[1], Default: i == 0})
+			} else if len(parts) == 1 && parts[0] != "" {
+				eps = append(eps, ollama.Endpoint{Name: "default", URL: parts[0], Default: i == 0})
+			}
+		}
+		if len(eps) > 0 {
+			api.SetOllama(ollama.NewClient(eps))
+			logger.Info("ollama endpoints loaded from env", "count", len(eps))
+		}
+	} else if cfgPath := config.FindConfig(filepath.Join(os.Getenv("HOME"), ".config", "workshop")); cfgPath != "" {
 		engine := config.NewLuaEngine(bridge, logger)
 		if err := engine.RunFile(cfgPath); err != nil {
 			logger.Warn("failed to load startup config for ollama", "path", cfgPath, "err", err)
@@ -144,22 +197,67 @@ func New(logger *slog.Logger, frontendFS embed.FS) (*Server, error) {
 		engine.Close()
 	}
 
-	mux.Handle("/api/v1/", http.StripPrefix("/api/v1", api.Routes()))
-	mux.HandleFunc("GET /ws", wsHandler(logger, bridge, outputBuffer, recorder, statusStore))
+	apiHandler := http.Handler(api.Routes())
+	if telemetry.Enabled() {
+		// Wrap API routes with otelhttp INSIDE StripPrefix so that
+		// Request.Pattern from the inner mux (e.g. "GET /cards/{id}")
+		// is visible. We prepend /api/v1 to restore the full path.
+		apiHandler = otelhttp.NewHandler(apiHandler, "workshop-api",
+			otelhttp.WithSpanNameFormatter(func(_ string, r *http.Request) string {
+				if pat := r.Pattern; pat != "" {
+					return r.Method + " /api/v1" + pat[strings.Index(pat, " ")+1:]
+				}
+				return r.Method + " /api/v1" + r.URL.Path
+			}),
+			otelhttp.WithMetricAttributesFn(func(r *http.Request) []attribute.KeyValue {
+				route := r.URL.Path
+				if pat := r.Pattern; pat != "" {
+					// Pattern is "GET /cards/{id}" — extract just the path part
+					if idx := strings.Index(pat, " "); idx >= 0 {
+						route = pat[idx+1:]
+					}
+				}
+				return []attribute.KeyValue{
+					attribute.String("http.route", "/api/v1"+route),
+				}
+			}),
+		)
+	}
+	mux.Handle("/api/v1/", http.StripPrefix("/api/v1", apiHandler))
+	// Proxy the WebSocket to the desktop in headless mode, otherwise handle locally.
+	if proxyURL := api.TmuxProxyURL(); proxyURL != "" {
+		mux.Handle("GET /ws", newWSProxy(proxyURL))
+		logger.Info("websocket proxied to desktop", "target", proxyURL)
+	} else {
+		mux.HandleFunc("GET /ws", wsHandler(logger, bridge, outputBuffer, recorder, statusStore))
+	}
 	mux.Handle("/", spaHandler(frontendFS))
 
-	return &Server{handler: mux, logger: logger, db: database, recorder: recorder}, nil
+	// Wrap with API key auth if WORKSHOP_API_KEY is set.
+	apiKey := os.Getenv("WORKSHOP_API_KEY")
+	if apiKey != "" {
+		logger.Info("API key authentication enabled")
+	}
+	handler := authMiddleware(apiKey, mux)
+
+	return &Server{handler: handler, logger: logger, db: database, recorder: recorder, stopReaper: stopReaper}, nil
 }
 
 func (s *Server) ListenAndServe(addr string) error {
 	defer s.db.Close()
 	defer s.recorder.StopAll()
+	defer close(s.stopReaper)
 
 	handler := http.Handler(s.handler)
-	// Wrap with otelhttp if telemetry is enabled — adds a span per HTTP
-	// request with method, route, status, and duration attributes.
+	// Outer otelhttp wrap for non-API routes only (WS, static files).
+	// API routes have their own otelhttp wrap inside StripPrefix with
+	// specific route patterns, so we skip them here to avoid double-counting.
 	if telemetry.Enabled() {
-		handler = otelhttp.NewHandler(handler, "workshop-http")
+		handler = otelhttp.NewHandler(handler, "workshop-http",
+			otelhttp.WithFilter(func(r *http.Request) bool {
+				return !strings.HasPrefix(r.URL.Path, "/api/v1/")
+			}),
+		)
 	}
 	return http.ListenAndServe(addr, handler)
 }

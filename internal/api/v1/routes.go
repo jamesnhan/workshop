@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/jamesnhan/workshop/internal/consensus"
 	"github.com/jamesnhan/workshop/internal/db"
 	"github.com/jamesnhan/workshop/internal/ollama"
 	"github.com/jamesnhan/workshop/internal/tmux"
@@ -81,17 +80,38 @@ type API struct {
 	tmux      tmux.Bridge
 	searcher  OutputSearcher
 	db        *db.DB
-	consensus *consensus.Engine
 	recorder  Recorder
 	status    StatusManager
 	ui        UIHub
 	channels  ChannelHubAPI
 	ollama    *ollama.Client
 	approvals ApprovalHubAPI
+	tmuxProxy *tmuxProxy
+	uploadDir string
+	version   string
 }
 
-func New(logger *slog.Logger, bridge tmux.Bridge, searcher OutputSearcher, database *db.DB, consensusEngine *consensus.Engine, recorder Recorder, status StatusManager, ui UIHub, channels ChannelHubAPI) *API {
-	return &API{logger: logger, tmux: bridge, searcher: searcher, db: database, consensus: consensusEngine, recorder: recorder, status: status, ui: ui, channels: channels}
+func New(logger *slog.Logger, bridge tmux.Bridge, searcher OutputSearcher, database *db.DB, recorder Recorder, status StatusManager, ui UIHub, channels ChannelHubAPI) *API {
+	return &API{logger: logger, tmux: bridge, searcher: searcher, db: database, recorder: recorder, status: status, ui: ui, channels: channels}
+}
+
+// SetUploadDir sets the directory for file uploads. Falls back to /tmp/workshop-uploads.
+func (a *API) SetUploadDir(dir string) {
+	a.uploadDir = dir
+}
+
+// SetVersion records the build version string. Exposed via /version so the
+// frontend can detect a backend upgrade and prompt the user to reload.
+func (a *API) SetVersion(v string) {
+	a.version = v
+}
+
+func (a *API) handleVersion(w http.ResponseWriter, _ *http.Request) {
+	v := a.version
+	if v == "" {
+		v = "dev"
+	}
+	a.jsonOK(w, map[string]string{"version": v})
 }
 
 // SetOllama configures the Ollama client for local model integration.
@@ -107,21 +127,35 @@ func (a *API) SetApprovalHub(hub ApprovalHubAPI) {
 func (a *API) Routes() http.Handler {
 	mux := http.NewServeMux()
 
+	// tmuxHandler returns the proxy handler for tmux-dependent routes when a
+	// proxy is configured, otherwise the normal handler (which will 503 via
+	// requireTmux if headless).
+	tmuxHandler := func(normal http.HandlerFunc) http.HandlerFunc {
+		if a.tmuxProxy != nil {
+			return a.tmuxProxy.ServeHTTP
+		}
+		return normal
+	}
+
 	mux.HandleFunc("GET /health", a.handleHealth)
-	mux.HandleFunc("GET /sessions", a.handleListSessions)
-	mux.HandleFunc("POST /sessions", a.handleCreateSession)
-	mux.HandleFunc("DELETE /sessions/{name}", a.handleKillSession)
-	mux.HandleFunc("PATCH /sessions/{name}", a.handleRenameSession)
-	mux.HandleFunc("POST /sessions/{name}/send-keys", a.handleSendKeys)
-	mux.HandleFunc("GET /sessions/{name}/capture", a.handleCapturePane)
-	mux.HandleFunc("GET /sessions/{name}/panes", a.handleListPanes)
-	mux.HandleFunc("POST /sessions/{name}/windows", a.handleCreateWindow)
-	mux.HandleFunc("PATCH /windows/{target}", a.handleRenameWindow)
-	mux.HandleFunc("GET /panes", a.handleListAllPanes)
-	mux.HandleFunc("POST /agents/launch", a.handleLaunchAgent)
-	mux.HandleFunc("GET /search", a.handleSearch)
-	mux.HandleFunc("GET /search/lines", a.handleListLines)
-	mux.HandleFunc("GET /search/context", a.handleSearchContext)
+	mux.HandleFunc("GET /version", a.handleVersion)
+	mux.HandleFunc("GET /init", a.handleInit)
+	mux.HandleFunc("POST /debug/log", a.handleDebugLog)
+	mux.HandleFunc("POST /upload", a.handleUpload)
+	mux.HandleFunc("GET /sessions", tmuxHandler(a.handleListSessions))
+	mux.HandleFunc("POST /sessions", tmuxHandler(a.handleCreateSession))
+	mux.HandleFunc("DELETE /sessions/{name}", tmuxHandler(a.handleKillSession))
+	mux.HandleFunc("PATCH /sessions/{name}", tmuxHandler(a.handleRenameSession))
+	mux.HandleFunc("POST /sessions/{name}/send-keys", tmuxHandler(a.handleSendKeys))
+	mux.HandleFunc("GET /sessions/{name}/capture", tmuxHandler(a.handleCapturePane))
+	mux.HandleFunc("GET /sessions/{name}/panes", tmuxHandler(a.handleListPanes))
+	mux.HandleFunc("POST /sessions/{name}/windows", tmuxHandler(a.handleCreateWindow))
+	mux.HandleFunc("PATCH /windows/{target}", tmuxHandler(a.handleRenameWindow))
+	mux.HandleFunc("GET /panes", tmuxHandler(a.handleListAllPanes))
+	mux.HandleFunc("POST /agents/launch", tmuxHandler(a.handleLaunchAgent))
+	mux.HandleFunc("GET /search", tmuxHandler(a.handleSearch))
+	mux.HandleFunc("GET /search/lines", tmuxHandler(a.handleListLines))
+	mux.HandleFunc("GET /search/context", tmuxHandler(a.handleSearchContext))
 
 	// Kanban
 	mux.HandleFunc("GET /cards", a.handleListCards)
@@ -137,8 +171,6 @@ func (a *API) Routes() http.Handler {
 	mux.HandleFunc("POST /cards/{id}/messages", a.handleAddMessage)
 	mux.HandleFunc("GET /cards/{id}/log", a.handleListCardLog)
 	mux.HandleFunc("GET /cards/log", a.handleListProjectLog)
-	mux.HandleFunc("GET /cards/{id}/dispatches", a.handleListDispatches)
-	mux.HandleFunc("GET /dispatches/active", a.handleListActiveDispatches)
 	mux.HandleFunc("GET /card-dependencies", a.handleListDependencies)
 	mux.HandleFunc("POST /cards/{id}/blocks", a.handleAddDependency)
 	mux.HandleFunc("DELETE /cards/{id}/blocks/{blockerId}", a.handleRemoveDependency)
@@ -160,6 +192,10 @@ func (a *API) Routes() http.Handler {
 	mux.HandleFunc("GET /agent-presets", a.handleListPresets)
 	mux.HandleFunc("PUT /agent-presets", a.handleUpsertPreset)
 	mux.HandleFunc("DELETE /agent-presets/{name}", a.handleDeletePreset)
+
+	// Claude Code session analysis
+	mux.HandleFunc("GET /compactions", a.handleListCompactions)
+	mux.HandleFunc("GET /session-usage", a.handleSessionUsage)
 
 	// Recordings
 	mux.HandleFunc("GET /recordings", a.handleListRecordings)
@@ -208,6 +244,12 @@ func (a *API) Routes() http.Handler {
 	mux.HandleFunc("GET /ollama/health", a.handleOllamaHealth)
 	mux.HandleFunc("POST /ollama/chat", a.handleOllamaChat)
 	mux.HandleFunc("POST /ollama/generate", a.handleOllamaGenerate)
+	mux.HandleFunc("GET /ollama/conversations", a.handleListConversations)
+	mux.HandleFunc("POST /ollama/conversations", a.handleCreateConversation)
+	mux.HandleFunc("GET /ollama/conversations/{id}", a.handleGetConversation)
+	mux.HandleFunc("PUT /ollama/conversations/{id}", a.handleUpdateConversation)
+	mux.HandleFunc("DELETE /ollama/conversations/{id}", a.handleDeleteConversation)
+	mux.HandleFunc("POST /ollama/conversations/{id}/messages", a.handleCreateConversationMessage)
 
 	// Usage tracking
 	mux.HandleFunc("POST /usage", a.handleRecordUsage)
@@ -221,12 +263,6 @@ func (a *API) Routes() http.Handler {
 	// Config
 	mux.HandleFunc("POST /config/load", a.handleLoadConfig)
 	mux.HandleFunc("GET /config/find", a.handleFindConfig)
-
-	// Consensus
-	mux.HandleFunc("POST /consensus", a.handleStartConsensus)
-	mux.HandleFunc("GET /consensus", a.handleListConsensus)
-	mux.HandleFunc("GET /consensus/{id}", a.handleGetConsensus)
-	mux.HandleFunc("DELETE /consensus/{id}", a.handleCleanupConsensus)
 
 	return mux
 }

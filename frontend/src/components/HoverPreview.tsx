@@ -29,7 +29,11 @@ export function HoverPreview({
   style,
   children,
 }: Props) {
-  const top = Math.min(y + offset, Math.max(0, window.innerHeight - maxHeight));
+  // If placing below the cursor would overflow, flip above
+  const spaceBelow = window.innerHeight - (y + offset);
+  const top = spaceBelow >= maxHeight
+    ? y + offset
+    : Math.max(0, y - maxHeight - 4);
   const left = Math.min(x, Math.max(0, window.innerWidth - width));
   return (
     <div

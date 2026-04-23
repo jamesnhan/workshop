@@ -1,8 +1,9 @@
-import { useEffect, useRef, useImperativeHandle, forwardRef } from 'react';
+import { useEffect, useLayoutEffect, useRef, useImperativeHandle, forwardRef, useCallback } from 'react';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { SearchAddon } from '@xterm/addon-search';
 import '@xterm/xterm/css/xterm.css';
+import { counters, recordBreadcrumb } from '../lib/telemetry';
 
 export interface PaneViewerHandle {
   write: (data: string) => void;
@@ -10,7 +11,7 @@ export interface PaneViewerHandle {
   searchInTerminal: (text: string) => boolean;
   clearSearch: () => void;
   refit: () => void;
-  forceResize: () => void;
+  forceResize: (force?: boolean) => void;
 }
 
 interface TerminalTheme {
@@ -72,6 +73,12 @@ export const PaneViewer = forwardRef<PaneViewerHandle, Props>(
     onUrlHoverRef.current = onUrlHover;
     onCommitHoverRef.current = onCommitHover;
 
+    // Render-commit breadcrumb — per-pane, so we can see which viewer
+    // re-rendered most recently before a freeze.
+    useLayoutEffect(() => {
+      recordBreadcrumb('commit:PaneViewer', { target });
+    });
+
     const notifyResizeIfChanged = () => {
       const term = termRef.current;
       if (!term) return;
@@ -93,9 +100,21 @@ export const PaneViewer = forwardRef<PaneViewerHandle, Props>(
         if (!term || !pending) return;
 
         const shouldStickToBottom = term.buffer.active.viewportY >= term.buffer.active.baseY;
+        const writeStart = performance.now();
+        const flushBytes = pending.length;
+        counters.outputFlushes++;
+        counters.outputFlushBytes += flushBytes;
         term.write(pending, () => {
           if (shouldStickToBottom) {
             term.scrollToBottom();
+          }
+          const dur = performance.now() - writeStart;
+          if (dur > counters.maxOutputFlushMs) counters.maxOutputFlushMs = dur;
+          // Breadcrumb only slow flushes (>=20ms) so the ring buffer isn't
+          // filled with normal-rate output. Slow flushes are most likely
+          // to correlate with a freeze.
+          if (dur >= 20) {
+            recordBreadcrumb('xterm.flush', { bytes: flushBytes }, Math.round(dur));
           }
           if (pendingWriteRef.current) {
             scheduleWriteFlush();
@@ -125,6 +144,9 @@ export const PaneViewer = forwardRef<PaneViewerHandle, Props>(
         if (!term) return;
         term.focus();
         term.scrollToBottom();
+        // Notify server of this client's current size without re-fitting.
+        // This ensures the smallest-wins logic stays up to date on focus.
+        notifyResizeIfChanged();
       },
       searchInTerminal: (text: string) => {
         return searchRef.current?.findNext(text, { caseSensitive: false }) ?? false;
@@ -139,10 +161,13 @@ export const PaneViewer = forwardRef<PaneViewerHandle, Props>(
           });
         });
       },
-      forceResize: () => {
-        // Fit and always push the current dims to the backend, even if they
-        // match lastSizeRef — tmux may be out of sync after focus, reconnect,
-        // or page reload, and we want to force it to reflow.
+      forceResize: (force = false) => {
+        // Fit and notify the backend. By default, only emit a resize message
+        // when the dims actually changed — repeat emissions of unchanged dims
+        // caused the #934 amplification loop (tmux still repainted and the
+        // repaint was broadcast to every client).
+        // Pass force=true from reconnect/first-mount paths where we genuinely
+        // want tmux to reflow even if the browser-side dims match cache.
         requestAnimationFrame(() => {
           requestAnimationFrame(() => {
             const term = termRef.current;
@@ -151,8 +176,12 @@ export const PaneViewer = forwardRef<PaneViewerHandle, Props>(
             if (!term || !fit || !container) return;
             if (container.offsetWidth === 0 || container.offsetHeight === 0) return;
             fit.fit();
-            lastSizeRef.current = { cols: term.cols, rows: term.rows };
-            onResizeRef.current(term.cols, term.rows);
+            if (force) {
+              lastSizeRef.current = { cols: term.cols, rows: term.rows };
+              onResizeRef.current(term.cols, term.rows);
+            } else {
+              notifyResizeIfChanged();
+            }
           });
         });
       },
@@ -229,19 +258,20 @@ export const PaneViewer = forwardRef<PaneViewerHandle, Props>(
           let m: RegExpExecArray | null;
           while ((m = regex.exec(text)) !== null) {
             const id = parseInt(m[1], 10);
-            if (id <= 0) continue;
-            const startCol = m.index + 1;
-            const endCol = m.index + m[0].length;
-            matches.push({
-              range: {
-                start: { x: startCol, y: bufferLineNumber },
-                end: { x: endCol, y: bufferLineNumber },
-              },
-              text: m[0],
-              activate: () => onTicketClickRef.current?.(id),
-              hover: (e: MouseEvent) => onTicketHoverRef.current?.(id, e.clientX, e.clientY),
-              leave: () => onTicketHoverRef.current?.(null, 0, 0),
-            });
+            if (id > 0) {
+              const startCol = m.index + 1;
+              const endCol = m.index + m[0].length;
+              matches.push({
+                range: {
+                  start: { x: startCol, y: bufferLineNumber },
+                  end: { x: endCol, y: bufferLineNumber },
+                },
+                text: m[0],
+                activate: () => onTicketClickRef.current?.(id),
+                hover: (e: MouseEvent) => onTicketHoverRef.current?.(id, e.clientX, e.clientY),
+                leave: () => onTicketHoverRef.current?.(null, 0, 0),
+              });
+            }
           }
           callback(matches);
         },
@@ -301,20 +331,22 @@ export const PaneViewer = forwardRef<PaneViewerHandle, Props>(
           while ((m = shaRegex.exec(text)) !== null) {
             const sha = m[0];
             // Skip if it looks like a URL fragment or ticket ref (already handled)
-            if (text.charAt(m.index - 1) === '#') continue;
-            if (/https?:/.test(text.slice(Math.max(0, m.index - 10), m.index))) continue;
-            const startCol = m.index + 1;
-            const endCol = m.index + sha.length;
-            matches.push({
-              range: {
-                start: { x: startCol, y: bufferLineNumber },
-                end: { x: endCol, y: bufferLineNumber },
-              },
-              text: sha,
-              activate: () => {},
-              hover: (e: MouseEvent) => onCommitHoverRef.current?.(sha, e.clientX, e.clientY),
-              leave: () => onCommitHoverRef.current?.(null, 0, 0),
-            });
+            const isTicketRef = text.charAt(m.index - 1) === '#';
+            const isUrlFragment = /https?:/.test(text.slice(Math.max(0, m.index - 10), m.index));
+            if (!isTicketRef && !isUrlFragment) {
+              const startCol = m.index + 1;
+              const endCol = m.index + sha.length;
+              matches.push({
+                range: {
+                  start: { x: startCol, y: bufferLineNumber },
+                  end: { x: endCol, y: bufferLineNumber },
+                },
+                text: sha,
+                activate: () => {},
+                hover: (e: MouseEvent) => onCommitHoverRef.current?.(sha, e.clientX, e.clientY),
+                leave: () => onCommitHoverRef.current?.(null, 0, 0),
+              });
+            }
           }
           callback(matches);
         },
@@ -410,6 +442,9 @@ export const PaneViewer = forwardRef<PaneViewerHandle, Props>(
       };
       window.addEventListener('resize', handleWindowResize);
 
+      // No visualViewport constraint needed — on mobile we skip fit.fit()
+      // entirely and let the container scroll through the full terminal.
+
       // Touch scroll → mouse wheel escape sequences for tmux
       let touchStartY = 0;
       let touchAccum = 0;
@@ -466,10 +501,53 @@ export const PaneViewer = forwardRef<PaneViewerHandle, Props>(
       };
     }, [target]);
 
+    const fileInputRef = useRef<HTMLInputElement>(null);
+
+    const handleUpload = useCallback(async (file: File) => {
+      const form = new FormData();
+      form.append('file', file);
+      try {
+        // Only set auth header — do NOT set Content-Type, the browser
+        // needs to set multipart/form-data with the boundary automatically.
+        const headers: Record<string, string> = {};
+        const token = localStorage.getItem('workshop:api-key');
+        if (token) headers['Authorization'] = `Bearer ${token}`;
+        const resp = await fetch('/api/v1/upload', { method: 'POST', headers, body: form });
+        if (!resp.ok) {
+          const err = await resp.json().catch(() => ({ error: resp.statusText }));
+          alert(`Upload failed: ${err.error || resp.statusText}`);
+          return;
+        }
+        const { path } = await resp.json();
+        // Type the file path into the terminal so the agent can read it
+        onDataRef.current(path + ' ');
+      } catch (err) {
+        alert(`Upload failed: ${err}`);
+      }
+    }, []);
+
     return (
       <div className="pane-viewer">
         <div className="pane-header">
           <span className="pane-target">{target}</span>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*"
+            style={{ display: 'none' }}
+            onChange={(e) => {
+              const file = e.target.files?.[0];
+              if (file) handleUpload(file);
+              e.target.value = ''; // reset so same file can be picked again
+            }}
+          />
+          <button
+            className="btn-upload"
+            title="Upload image to terminal"
+            onClick={() => fileInputRef.current?.click()}
+          >
+            📷
+          </button>
         </div>
         <div ref={containerRef} className="pane-terminal" />
       </div>

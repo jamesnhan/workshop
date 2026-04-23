@@ -13,11 +13,12 @@ interface Props {
   url: string;
   x: number;
   y: number;
+  pinned?: boolean;
 }
 
 const previewCache = new Map<string, LinkPreview | null>();
 
-export function LinkHoverPreview({ url, x, y }: Props) {
+export function LinkHoverPreview({ url, x, y, pinned }: Props) {
   const [preview, setPreview] = useState<LinkPreview | null | undefined>(previewCache.get(url));
 
   useEffect(() => {
@@ -43,7 +44,7 @@ export function LinkHoverPreview({ url, x, y }: Props) {
   if (!preview?.title) return null;
 
   return (
-    <HoverPreview x={x} y={y} width={380} className="link-hover-preview">
+    <HoverPreview x={x} y={y} width={380} className={`link-hover-preview${pinned ? ' hover-pinned-inline' : ''}`}>
       <div className="link-preview-header">
         {preview.favicon && <img src={preview.favicon} alt="" className="link-preview-favicon" />}
         <span className="link-preview-title">{preview.title}</span>

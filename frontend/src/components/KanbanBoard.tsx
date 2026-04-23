@@ -2,7 +2,7 @@ import { useEffect, useState, useCallback, useRef } from 'react';
 import { get, post } from '../api/client';
 import { useTicketAutocomplete } from '../hooks/useTicketAutocomplete';
 import { TicketSuggestions } from './TicketSuggestions';
-import { Linkify } from './Linkify';
+import { CardDetailSidebar } from './CardDetailSidebar';
 
 interface Card {
   id: number;
@@ -44,17 +44,6 @@ interface CardLogEntry {
   afterValue: string;
   source: string;
   createdAt: string;
-}
-
-interface Dispatch {
-  id: number;
-  cardId: number;
-  sessionName: string;
-  target: string;
-  provider: string;
-  status: string; // running, done, error
-  dispatchedAt: string;
-  completedAt?: string;
 }
 
 interface WorkflowColumn { id: string; label: string; }
@@ -121,14 +110,13 @@ interface Props {
   defaultProject?: string;
   focusedPath?: string;
   ticketAutocomplete?: boolean;
-  dispatchTick?: number; // increment to signal a dispatch update (triggers refresh)
   openCardId?: number | null; // when set, expands the matching card on next render
   onCardOpened?: () => void; // called after openCardId has been consumed
   sfwMode?: boolean;
   nsfwProjects?: string[];
 }
 
-export function KanbanBoard({ onNavigateToPane, defaultProject, focusedPath, ticketAutocomplete = true, dispatchTick, openCardId, onCardOpened, sfwMode = false, nsfwProjects = [] }: Props) {
+export function KanbanBoard({ onNavigateToPane, defaultProject, focusedPath, ticketAutocomplete = true, openCardId, onCardOpened, sfwMode = false, nsfwProjects = [] }: Props) {
   const [cards, setCards] = useState<Card[]>([]);
   const [projects, setProjects] = useState<string[]>([]);
   const [filterProject, setFilterProject] = useState(defaultProject ?? '');
@@ -153,14 +141,9 @@ export function KanbanBoard({ onNavigateToPane, defaultProject, focusedPath, tic
   const [editCard, setEditCard] = useState<Card | null>(null);
   const [notes, setNotes] = useState<CardNote[]>([]);
   const [cardLog, setCardLog] = useState<CardLogEntry[]>([]);
-  const [dispatches, setDispatches] = useState<Dispatch[]>([]);
   const [messages, setMessages] = useState<CardMessage[]>([]);
-  const [newMsgText, setNewMsgText] = useState('');
-  const [msgAuthor, setMsgAuthor] = useState(() => localStorage.getItem('workshop:msg-author') || 'James');
-  const [activeDispatches, setActiveDispatches] = useState<Record<number, number>>({}); // cardId → running count
   const [showChangelog, setShowChangelog] = useState(false);
   const [projectLog, setProjectLog] = useState<CardLogEntry[]>([]);
-  const [newNote, setNewNote] = useState('');
   const [newCardCol, setNewCardCol] = useState<string | null>(null);
   const [newTitle, setNewTitle] = useState('');
   const [newDesc, setNewDesc] = useState('');
@@ -170,11 +153,9 @@ export function KanbanBoard({ onNavigateToPane, defaultProject, focusedPath, tic
   const [newType, setNewType] = useState('');
   const [newPriority, setNewPriority] = useState('');
 
-  const noteInputRef = useRef<HTMLInputElement>(null);
   const editDescRef = useRef<HTMLTextAreaElement>(null);
   const newDescRef = useRef<HTMLTextAreaElement>(null);
 
-  const noteAC = useTicketAutocomplete({ inputRef: noteInputRef, value: newNote, onChange: setNewNote, cards, enabled: ticketAutocomplete });
   const editDescAC = useTicketAutocomplete({
     inputRef: editDescRef,
     value: editCard?.description ?? '',
@@ -194,34 +175,17 @@ export function KanbanBoard({ onNavigateToPane, defaultProject, focusedPath, tic
     }
   }, [openCardId, cards, onCardOpened]);
 
-  // Fetch notes, activity log, and dispatches when expanding a card
+  // Fetch notes, activity log, and messages when expanding a card
   useEffect(() => {
     if (expandedCard) {
       get<CardNote[]>(`/cards/${expandedCard.id}/notes`).then((n) => setNotes(n ?? [])).catch(() => setNotes([]));
       get<CardLogEntry[]>(`/cards/${expandedCard.id}/log`).then((l) => setCardLog(l ?? [])).catch(() => setCardLog([]));
-      get<Dispatch[]>(`/cards/${expandedCard.id}/dispatches`).then((d) => setDispatches(d ?? [])).catch(() => setDispatches([]));
       get<CardMessage[]>(`/cards/${expandedCard.id}/messages`).then((m) => setMessages(m ?? [])).catch(() => setMessages([]));
-      setNewNote('');
-      setNewMsgText('');
     } else {
       setNotes([]);
       setCardLog([]);
-      setDispatches([]);
     }
   }, [expandedCard]);
-
-  // Load active dispatch counts on mount and when notified
-  const refreshActiveDispatches = useCallback(() => {
-    get<Dispatch[]>('/dispatches/active').then((active) => {
-      const counts: Record<number, number> = {};
-      for (const d of active ?? []) {
-        counts[d.cardId] = (counts[d.cardId] ?? 0) + 1;
-      }
-      setActiveDispatches(counts);
-    }).catch(() => {});
-  }, []);
-
-  useEffect(() => { refreshActiveDispatches(); }, [refreshActiveDispatches]);
 
 
   // Fetch project changelog when toggled on
@@ -232,28 +196,6 @@ export function KanbanBoard({ onNavigateToPane, defaultProject, focusedPath, tic
     }
   }, [showChangelog, filterProject]);
 
-  const handleAddNote = async () => {
-    if (!expandedCard || !newNote.trim()) return;
-    try {
-      await post(`/cards/${expandedCard.id}/notes`, { text: newNote.trim() });
-      const updated = await get<CardNote[]>(`/cards/${expandedCard.id}/notes`);
-      setNotes(updated ?? []);
-      setNewNote('');
-      noteInputRef.current?.focus();
-    } catch {}
-  };
-
-  const handleAddMessage = async () => {
-    if (!expandedCard || !newMsgText.trim()) return;
-    try {
-      localStorage.setItem('workshop:msg-author', msgAuthor);
-      await post(`/cards/${expandedCard.id}/messages`, { author: msgAuthor, text: newMsgText.trim() });
-      const updated = await get<CardMessage[]>(`/cards/${expandedCard.id}/messages`);
-      setMessages(updated ?? []);
-      setNewMsgText('');
-    } catch {}
-  };
-
   const wasDragging = useRef(false);
 
   const refresh = useCallback(() => {
@@ -261,44 +203,38 @@ export function KanbanBoard({ onNavigateToPane, defaultProject, focusedPath, tic
     if (filterProject) params.set('project', filterProject);
     params.set('include_archived', 'true');
     get<Card[]>(`/cards?${params}`).then(setCards).catch((err) => console.error('Failed to load cards:', err));
-    get<string[]>('/projects').then((p) => {
-      setProjects(p ?? []);
-      // Auto-filter on first load: try session name, path basename, then substring match
-      if (!hasAutoFiltered && (p ?? []).length > 0) {
-        const projects = p ?? [];
-        let match = '';
-        // 1. Exact session name match
-        if (defaultProject && projects.includes(defaultProject)) {
-          match = defaultProject;
-        }
-        // 2. Git repo name match (e.g. remote "jamesnhan/workshop.git" → "workshop")
-        if (!match && repoName && projects.includes(repoName)) {
-          match = repoName;
-        }
-        // 3. Path basename match (e.g. /home/james/repos/workshop → "workshop")
-        if (!match && focusedPath) {
-          const basename = focusedPath.split('/').filter(Boolean).pop() || '';
-          if (projects.includes(basename)) match = basename;
-        }
-        // 3. Any project name appears in the path
-        if (!match && focusedPath) {
-          const pathLower = focusedPath.toLowerCase();
-          for (const proj of projects) {
-            if (pathLower.includes(proj.toLowerCase())) {
-              match = proj;
-              break;
-            }
-          }
-        }
-        if (match) {
-          setFilterProject(match);
-          setHasAutoFiltered(true);
-        }
-      }
-    }).catch((err) => console.error('Failed to load projects:', err));
-  }, [filterProject, defaultProject, focusedPath, repoName, hasAutoFiltered]);
+    get<string[]>('/projects').then((p) => setProjects(p ?? [])).catch((err) => console.error('Failed to load projects:', err));
+  }, [filterProject]);
 
   useEffect(() => { refresh(); }, [refresh]);
+
+  // Auto-filter on first load: try session name, path basename, then substring match.
+  // Separated from refresh to avoid a re-render loop (refresh depends on filterProject,
+  // and auto-filter sets filterProject).
+  useEffect(() => {
+    if (hasAutoFiltered || projects.length === 0) return;
+    let match = '';
+    if (defaultProject && projects.includes(defaultProject)) {
+      match = defaultProject;
+    }
+    if (!match && repoName && projects.includes(repoName)) {
+      match = repoName;
+    }
+    if (!match && focusedPath) {
+      const basename = focusedPath.split('/').filter(Boolean).pop() || '';
+      if (projects.includes(basename)) match = basename;
+    }
+    if (!match && focusedPath) {
+      const pathLower = focusedPath.toLowerCase();
+      for (const proj of projects) {
+        if (pathLower.includes(proj.toLowerCase())) { match = proj; break; }
+      }
+    }
+    if (match) {
+      setFilterProject(match);
+      setHasAutoFiltered(true);
+    }
+  }, [projects, defaultProject, focusedPath, repoName, hasAutoFiltered]);
 
   // Fetch workflow columns + transitions when the active project changes.
   useEffect(() => {
@@ -316,16 +252,6 @@ export function KanbanBoard({ onNavigateToPane, defaultProject, focusedPath, tic
   const isHidden = (project: string) => sfwMode && nsfwSet.has(project.toLowerCase());
   const visibleProjects = sfwMode ? projects.filter((p) => !isHidden(p)) : projects;
   const visibleCards = sfwMode ? cards.filter((c) => !isHidden(c.project)) : cards;
-
-  // When a dispatch update arrives (via dispatchTick), refresh active counts + card list
-  useEffect(() => {
-    if (dispatchTick === undefined) return;
-    refreshActiveDispatches();
-    refresh();
-    if (expandedCard) {
-      get<Dispatch[]>(`/cards/${expandedCard.id}/dispatches`).then((d) => setDispatches(d ?? [])).catch(() => {});
-    }
-  }, [dispatchTick]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleCreate = async () => {
     if (!newTitle.trim() || !newCardCol) return;
@@ -373,45 +299,6 @@ export function KanbanBoard({ onNavigateToPane, defaultProject, focusedPath, tic
       refresh();
     } catch (err) {
       alert('Failed to delete card: ' + err);
-    }
-  };
-
-  const handleDispatch = async (card: Card) => {
-    // Build a prompt from the card
-    const lines = [
-      `Working on ticket #${card.id}: ${card.title}`,
-    ];
-    if (card.cardType) lines.push(`Type: ${card.cardType}`);
-    if (card.priority) lines.push(`Priority: ${card.priority}`);
-    if (card.project) lines.push(`Project: ${card.project}`);
-    if (card.description) {
-      lines.push('');
-      lines.push('Description:');
-      lines.push(card.description);
-    }
-    lines.push('');
-    lines.push('Please move this ticket to in_progress and start working on it. Update the card with notes as you make progress.');
-    const prompt = lines.join('\n');
-
-    try {
-      const res = await post<{ target: string }>('/agents/launch', {
-        name: `card-${card.id}-${Date.now().toString(36).slice(-5)}`,
-        provider: 'claude',
-        directory: undefined,
-        prompt,
-        cardId: card.id,
-      });
-      // Link the launched session back to the card
-      await fetch(`/api/v1/cards/${card.id}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...card, paneTarget: res.target }),
-      });
-      setExpandedCard(null);
-      onNavigateToPane(res.target);
-      refresh();
-    } catch (err) {
-      alert('Failed to dispatch agent: ' + err);
     }
   };
 
@@ -473,162 +360,6 @@ export function KanbanBoard({ onNavigateToPane, defaultProject, focusedPath, tic
         </button>
       </div>
 
-      {/* Expanded card modal */}
-      {expandedCard && !editCard && (
-        <div className="kanban-modal-overlay" onClick={() => setExpandedCard(null)}>
-          <div className="kanban-modal" onClick={(e) => e.stopPropagation()}>
-            <div className="kanban-modal-header">
-              <div className="kanban-modal-badges">
-                <span className="kanban-card-id-badge">#{expandedCard.id}</span>
-                {expandedCard.cardType && (
-                  <span className="kanban-type-badge" style={{ borderColor: typeColors[expandedCard.cardType] || 'var(--border)' }}>
-                    {expandedCard.cardType}
-                  </span>
-                )}
-                {expandedCard.priority && (
-                  <span className="kanban-priority-badge" style={{ color: priorityColors[expandedCard.priority] || 'var(--text-muted)' }}>
-                    {expandedCard.priority}
-                  </span>
-                )}
-              </div>
-              <button className="search-close" onClick={() => setExpandedCard(null)}>x</button>
-            </div>
-            <h3 className="kanban-modal-title">{expandedCard.title}</h3>
-            {expandedCard.description && (
-              <div className="kanban-modal-desc">
-                {expandedCard.description.split('\n').map((line, li) => {
-                  const checkMatch = line.match(/^- \[([ x])\] (.*)$/);
-                  if (checkMatch) {
-                    const isChecked = checkMatch[1] === 'x';
-                    const label = checkMatch[2];
-                    return (
-                      <label key={li} className="kanban-checklist-item">
-                        <input type="checkbox" checked={isChecked} onChange={async () => {
-                          const newDesc = toggleCheckbox(expandedCard.description, expandedCard.description.split('\n').slice(0, li + 1)
-                            .filter((l) => /^- \[[ x]\]/.test(l)).length - 1);
-                          const updated = { ...expandedCard, description: newDesc };
-                          setExpandedCard(updated);
-                          setCards((prev) => prev.map((c) => c.id === updated.id ? { ...c, description: newDesc } : c));
-                          await fetch(`/api/v1/cards/${expandedCard.id}`, {
-                            method: 'PUT', headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify(updated),
-                          });
-                        }} />
-                        <span className={isChecked ? 'checked' : ''}>{label}</span>
-                      </label>
-                    );
-                  }
-                  return <p key={li}>{line ? <Linkify>{line}</Linkify> : '\u00A0'}</p>;
-                })}
-              </div>
-            )}
-            <div className="kanban-modal-meta">
-              {expandedCard.project && <span className="kanban-label project">{expandedCard.project}</span>}
-              {expandedCard.labels && expandedCard.labels.split(',').map((l) => (
-                <span key={l.trim()} className="kanban-label">{l.trim()}</span>
-              ))}
-            </div>
-            {expandedCard.paneTarget && (
-              <div className="kanban-card-pane" onClick={() => { onNavigateToPane(expandedCard.paneTarget); setExpandedCard(null); }}>
-                → {expandedCard.paneTarget}
-              </div>
-            )}
-            {/* Notes */}
-            <div className="kanban-notes">
-              <h4 className="kanban-notes-title">Notes</h4>
-              {notes.length === 0 && <p className="muted" style={{ fontSize: '0.75rem' }}>No notes yet</p>}
-              {notes.map((n) => (
-                <div key={n.id} className="kanban-note">
-                  <span className="kanban-note-date">{new Date(n.createdAt).toLocaleString()}</span>
-                  <span className="kanban-note-text"><Linkify>{n.text}</Linkify></span>
-                </div>
-              ))}
-              <div className="kanban-note-input kanban-autocomplete-wrapper">
-                <input
-                  ref={noteInputRef}
-                  type="text"
-                  placeholder="Add a note..."
-                  value={newNote}
-                  onChange={noteAC.handleChange}
-                  onKeyDown={(e) => { noteAC.handleKeyDown(e); if (!noteAC.showDropdown && e.key === 'Enter') handleAddNote(); }}
-                />
-                <button className="btn-create" onClick={handleAddNote} disabled={!newNote.trim()}>Add</button>
-                {noteAC.showDropdown && <TicketSuggestions suggestions={noteAC.suggestions} selectedIdx={noteAC.selectedIdx} onSelect={noteAC.accept} />}
-              </div>
-            </div>
-            {/* Messages */}
-            <div className="kanban-messages">
-              <h4 className="kanban-notes-title">Messages</h4>
-              {messages.length === 0 && <p className="muted" style={{ fontSize: '0.75rem' }}>No messages yet</p>}
-              {messages.map((m) => (
-                <div key={m.id} className="kanban-msg-item">
-                  <div className="kanban-msg-meta">
-                    <strong className="kanban-msg-author">{m.author || 'Anonymous'}</strong>
-                    <span className="kanban-msg-date">{new Date(m.createdAt).toLocaleString()}</span>
-                  </div>
-                  <div className="kanban-msg-text"><Linkify>{m.text}</Linkify></div>
-                </div>
-              ))}
-              <div className="kanban-msg-input">
-                <input
-                  type="text"
-                  className="kanban-msg-author-input"
-                  placeholder="Name"
-                  value={msgAuthor}
-                  onChange={(e) => setMsgAuthor(e.target.value)}
-                />
-                <input
-                  type="text"
-                  placeholder="Write a message..."
-                  value={newMsgText}
-                  onChange={(e) => setNewMsgText(e.target.value)}
-                  onKeyDown={(e) => { if (e.key === 'Enter') handleAddMessage(); }}
-                />
-                <button className="btn-create" onClick={handleAddMessage} disabled={!newMsgText.trim()}>Send</button>
-              </div>
-            </div>
-            {/* Dispatches */}
-            {dispatches.length > 0 && (
-              <div className="kanban-dispatches">
-                <h4 className="kanban-notes-title">Agents</h4>
-                {dispatches.map((d) => (
-                  <div key={d.id} className={`kanban-dispatch-item dispatch-${d.status}`}>
-                    <span className={`dispatch-status-dot dispatch-dot-${d.status}`} title={d.status} />
-                    <span className="dispatch-session"
-                      onClick={() => { onNavigateToPane(d.target); setExpandedCard(null); }}
-                      title={`Jump to ${d.target}`}
-                    >{d.sessionName}</span>
-                    <span className="dispatch-meta">{new Date(d.dispatchedAt).toLocaleString()}</span>
-                    {d.completedAt && <span className="dispatch-meta">→ {new Date(d.completedAt).toLocaleString()}</span>}
-                  </div>
-                ))}
-              </div>
-            )}
-            {/* Activity log */}
-            {cardLog.length > 0 && (
-              <div className="kanban-log">
-                <h4 className="kanban-notes-title">Activity</h4>
-                {cardLog.map((entry) => (
-                  <div key={entry.id} className="kanban-log-entry">
-                    <span className="kanban-log-date">{new Date(entry.createdAt).toLocaleString()}</span>
-                    <span className="kanban-log-action">{formatLogAction(entry)}</span>
-                    {entry.source !== 'user' && <span className="kanban-log-source">{entry.source}</span>}
-                  </div>
-                ))}
-              </div>
-            )}
-            <div className="kanban-modal-footer">
-              <span className="kanban-modal-date">Created: {new Date(expandedCard.createdAt).toLocaleDateString()}</span>
-              <div className="kanban-card-actions">
-                <button className="btn-dispatch" onClick={() => handleDispatch(expandedCard)} title="Launch a Claude agent to work on this ticket">⚡ Dispatch</button>
-                <button className="btn-create" onClick={() => setEditCard(expandedCard)}>Edit</button>
-                <button className="btn-danger-small" onClick={() => handleDelete(expandedCard.id)}>Delete</button>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-
       {/* Edit modal */}
       {editCard && (
         <div className="kanban-modal-overlay" onClick={() => setEditCard(null)}>
@@ -688,7 +419,8 @@ export function KanbanBoard({ onNavigateToPane, defaultProject, focusedPath, tic
         </div>
       )}
 
-      {!showChangelog && <div className="kanban-columns">
+      {!showChangelog && <div className={`kanban-body${expandedCard && !editCard ? ' sidebar-open' : ''}`}>
+      <div className="kanban-columns">
         {columns.map((col) => {
           const allowed = dragCard && dragCard.column !== col.id
             ? (transitions[dragCard.column] ?? []).includes(col.id)
@@ -785,9 +517,6 @@ export function KanbanBoard({ onNavigateToPane, defaultProject, focusedPath, tic
                   )}
                   <span className="kanban-card-id">#{card.id}</span>
                   <span className="kanban-card-title">{card.title}</span>
-                  {activeDispatches[card.id] > 0 && (
-                    <span className="kanban-agent-badge" title={`${activeDispatches[card.id]} agent(s) running`}>⚡{activeDispatches[card.id]}</span>
-                  )}
                   {completion && (
                     <span className="kanban-card-completion" title={`${completion.done} of ${completion.total} subtasks done`}>
                       {completion.done}/{completion.total}
@@ -841,6 +570,45 @@ export function KanbanBoard({ onNavigateToPane, defaultProject, focusedPath, tic
           </div>
           );
         })}
+      </div>
+      {expandedCard && !editCard && (
+        <CardDetailSidebar
+          card={expandedCard}
+          notes={notes}
+          messages={messages}
+          cardLog={cardLog}
+          allCards={cards}
+          ticketAutocomplete={ticketAutocomplete}
+          onClose={() => setExpandedCard(null)}
+          onAddNote={async (text) => {
+            try {
+              await post(`/cards/${expandedCard.id}/notes`, { text });
+              const updated = await get<CardNote[]>(`/cards/${expandedCard.id}/notes`);
+              setNotes(updated ?? []);
+            } catch {}
+          }}
+          onAddMessage={async (author, text) => {
+            try {
+              await post(`/cards/${expandedCard.id}/messages`, { author, text });
+              const updated = await get<CardMessage[]>(`/cards/${expandedCard.id}/messages`);
+              setMessages(updated ?? []);
+            } catch {}
+          }}
+          onEdit={() => setEditCard(expandedCard)}
+          onDelete={() => handleDelete(expandedCard.id)}
+          onNavigateToPane={(target) => { onNavigateToPane(target); }}
+          onCheckboxToggle={async (card, checkIndex) => {
+            const newDesc = toggleCheckbox(card.description, checkIndex);
+            const updated = { ...card, description: newDesc };
+            setExpandedCard(updated);
+            setCards((prev) => prev.map((c) => c.id === updated.id ? { ...c, description: newDesc } : c));
+            await fetch(`/api/v1/cards/${card.id}`, {
+              method: 'PUT', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(updated),
+            });
+          }}
+        />
+      )}
       </div>}
     </div>
   );

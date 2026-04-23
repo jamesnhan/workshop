@@ -59,9 +59,9 @@ func (d *SendTextDelivery) Deliver(target string, msg ChannelMessage) error {
 		time.Sleep(500 * time.Millisecond)
 	}
 
-	// Submit. Use the dispatch supervisor's exact pattern: send a single
-	// Enter via RunRaw (NOT SendKeys, which appends its own Enter). Verify
-	// the input cleared by checking the pane between attempts.
+	// Submit. Send a single Enter via RunRaw (NOT SendKeys, which appends
+	// its own Enter). Verify the input cleared by checking the pane between
+	// attempts.
 	for attempt := 0; attempt < 3; attempt++ {
 		time.Sleep(300 * time.Millisecond)
 		if _, err := d.bridge.RunRaw("send-keys", "-t", target, "Enter"); err != nil {

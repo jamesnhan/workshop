@@ -77,8 +77,8 @@ func (m *PaneMonitor) scan() {
 	var newTargets []newTarget
 
 	for _, s := range sessions {
-		// Skip internal/hidden sessions — workshop-ctrl-*, consensus-*
-		if strings.HasPrefix(s.Name, "workshop-ctrl-") || strings.HasPrefix(s.Name, "consensus-") {
+		// Skip internal/hidden sessions — workshop-ctrl-*
+		if strings.HasPrefix(s.Name, "workshop-ctrl-") {
 			continue
 		}
 		panes, err := m.bridge.ListPanes(s.Name)
@@ -101,8 +101,8 @@ func (m *PaneMonitor) scan() {
 	// Broadcast session_created for any targets that weren't seen before.
 	// These default to background=true — the only way a target reaches
 	// this path without being pre-registered via MarkSeen is via direct
-	// bridge calls (MCP, external tmux, consensus), none of which are
-	// user-initiated in-UI actions.
+	// bridge calls (MCP, external tmux), none of which are user-initiated
+	// in-UI actions.
 	for _, nt := range newTargets {
 		m.store.Broadcast("session_created", map[string]any{
 			"target":     nt.target,

@@ -8,6 +8,16 @@ import (
 	"github.com/jamesnhan/workshop/internal/tmux"
 )
 
+// requireTmux returns false and writes a 503 if the server is running in
+// headless mode (no tmux). Callers should return immediately when false.
+func (a *API) requireTmux(w http.ResponseWriter) bool {
+	if _, ok := a.tmux.(*tmux.NoBridge); ok {
+		a.jsonError(w, "tmux not available in headless mode", http.StatusServiceUnavailable)
+		return false
+	}
+	return true
+}
+
 type createSessionRequest struct {
 	Name       string `json:"name"`
 	StartDir   string `json:"startDir,omitempty"`
@@ -19,6 +29,9 @@ type sendKeysRequest struct {
 }
 
 func (a *API) handleListSessions(w http.ResponseWriter, r *http.Request) {
+	if !a.requireTmux(w) {
+		return
+	}
 	var sessions []tmux.Session
 	var err error
 
@@ -39,6 +52,9 @@ func (a *API) handleListSessions(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) handleCreateSession(w http.ResponseWriter, r *http.Request) {
+	if !a.requireTmux(w) {
+		return
+	}
 	var req createSessionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		a.jsonError(w, "invalid request body", http.StatusBadRequest)
@@ -67,6 +83,9 @@ func (a *API) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) handleKillSession(w http.ResponseWriter, r *http.Request) {
+	if !a.requireTmux(w) {
+		return
+	}
 	name := r.PathValue("name")
 	if err := a.tmux.KillSession(name); err != nil {
 		a.serverErr(w, "operation failed", err)
@@ -76,6 +95,9 @@ func (a *API) handleKillSession(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) handleSendKeys(w http.ResponseWriter, r *http.Request) {
+	if !a.requireTmux(w) {
+		return
+	}
 	name := r.PathValue("name")
 	var req sendKeysRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -90,6 +112,9 @@ func (a *API) handleSendKeys(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) handleCapturePane(w http.ResponseWriter, r *http.Request) {
+	if !a.requireTmux(w) {
+		return
+	}
 	// Use ?target= query param if provided, otherwise fall back to session name
 	target := r.URL.Query().Get("target")
 	if target == "" {
@@ -110,6 +135,9 @@ func (a *API) handleCapturePane(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) handleListPanes(w http.ResponseWriter, r *http.Request) {
+	if !a.requireTmux(w) {
+		return
+	}
 	name := r.PathValue("name")
 	panes, err := a.tmux.ListPanes(name)
 	if err != nil {
@@ -120,6 +148,9 @@ func (a *API) handleListPanes(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) handleRenameSession(w http.ResponseWriter, r *http.Request) {
+	if !a.requireTmux(w) {
+		return
+	}
 	name := r.PathValue("name")
 	var req struct {
 		NewName string `json:"newName"`
@@ -136,6 +167,9 @@ func (a *API) handleRenameSession(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) handleCreateWindow(w http.ResponseWriter, r *http.Request) {
+	if !a.requireTmux(w) {
+		return
+	}
 	session := r.PathValue("name")
 	var req struct {
 		Name string `json:"name"`
@@ -150,6 +184,9 @@ func (a *API) handleCreateWindow(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) handleRenameWindow(w http.ResponseWriter, r *http.Request) {
+	if !a.requireTmux(w) {
+		return
+	}
 	target := r.PathValue("target")
 	var req struct {
 		NewName string `json:"newName"`
@@ -166,8 +203,10 @@ func (a *API) handleRenameWindow(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) handleListAllPanes(w http.ResponseWriter, r *http.Request) {
-	// Include hidden sessions (consensus-*, workshop-ctrl-*) so the agent
-	// dashboard can detect consensus agents.
+	if !a.requireTmux(w) {
+		return
+	}
+	// Include hidden sessions (workshop-ctrl-*).
 	var sessions []tmux.Session
 	var err error
 	if eb, ok := a.tmux.(*tmux.ExecBridge); ok {
