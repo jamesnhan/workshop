@@ -17,7 +17,25 @@ import (
 //go:embed all:frontend/dist
 var frontendFS embed.FS
 
+// ensureUTF8Locale guarantees child processes (tmux, shells) see a UTF-8
+// locale even when the parent process was launched in an environment that
+// strips locale vars. macOS launchd gives user agents a minimal env with no
+// LANG/LC_* — that puts tmux in the C locale, where `-F` format strings get
+// their tabs substituted with underscores (breaks list-sessions parsing) and
+// shells emit Nerd Font / powerline UTF-8 that pane viewers can't decode.
+// systemd --user and shell launches already have LANG set (via PAM or the
+// terminal emulator), so this is a no-op there. Respects user override: if
+// LC_ALL or LANG is set to anything non-empty, we don't touch it.
+func ensureUTF8Locale() {
+	if os.Getenv("LC_ALL") != "" || os.Getenv("LANG") != "" {
+		return
+	}
+	os.Setenv("LANG", "en_US.UTF-8")
+}
+
 func main() {
+	ensureUTF8Locale()
+
 	if len(os.Args) > 1 && os.Args[0] != "-" {
 		switch os.Args[1] {
 		case "mcp":
