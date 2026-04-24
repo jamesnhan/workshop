@@ -1,7 +1,6 @@
-import { type RefObject, useState, useLayoutEffect } from 'react';
+import { type RefObject, useState } from 'react';
 import { PaneViewer, type PaneViewerHandle } from './PaneViewer';
 import { ChibiAvatar, variantFromName, type ChibiState } from './ChibiAvatar';
-import { recordBreadcrumb } from '../lib/telemetry';
 import type { LayoutState } from '../types';
 import type { Theme } from '../themes';
 
@@ -53,15 +52,6 @@ export function PaneGrid({
   const { gridRows, gridCols, cells, focusedId, maximizedId } = layout;
   const [dragTab, setDragTab] = useState<{ cellId: string; fromIndex: number } | null>(null);
   const [dragOverIndex, setDragOverIndex] = useState<number | null>(null);
-
-  const focusedTarget = cells.find((c) => c.id === focusedId)?.target ?? null;
-  useLayoutEffect(() => {
-    recordBreadcrumb('commit:PaneGrid', {
-      cells: cells.length,
-      focused: focusedTarget ?? 'none',
-      maximized: maximizedId ?? 'none',
-    });
-  });
 
   const gridStyle = maximizedId ? {
     gridTemplate: '1fr / 1fr',

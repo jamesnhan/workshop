@@ -89,25 +89,6 @@ const MAX_BREADCRUMBS = 50;
 const BREADCRUMBS_KEY = 'workshop:watchdog-breadcrumbs';
 const breadcrumbs: Breadcrumb[] = [];
 
-// Snapshot the prior session's breadcrumbs at module-init time, BEFORE any
-// component mounts and records new ones. Layout effects in React fire during
-// render commit (earlier than useEffect), so by the time the watchdog's
-// useEffect runs, new commit:* breadcrumbs have already overwritten the
-// prior-session localStorage. Capturing here freezes a reference to the
-// real prior trail.
-const priorBreadcrumbs: Breadcrumb[] = (() => {
-  try {
-    const raw = (typeof localStorage !== 'undefined') ? localStorage.getItem(BREADCRUMBS_KEY) : null;
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-})();
-
-let storageFailureReported = false;
-
 export function recordBreadcrumb(
   name: string,
   meta?: Breadcrumb['meta'],
@@ -118,21 +99,7 @@ export function recordBreadcrumb(
   if (ms !== undefined) crumb.ms = ms;
   breadcrumbs.push(crumb);
   if (breadcrumbs.length > MAX_BREADCRUMBS) breadcrumbs.shift();
-  try {
-    localStorage.setItem(BREADCRUMBS_KEY, JSON.stringify(breadcrumbs));
-  } catch (err) {
-    // Quota exceeded, private browsing, or SecurityError. We can't persist
-    // breadcrumbs at all — and the watchdog's state write likely fails too.
-    // Emit one beacon so we can see this class of failure in Loki.
-    if (!storageFailureReported) {
-      storageFailureReported = true;
-      post({
-        msg: 'frontend.breadcrumb_storage_failed',
-        error: (err as Error)?.name || 'unknown',
-        message: (err as Error)?.message || '',
-      });
-    }
-  }
+  try { localStorage.setItem(BREADCRUMBS_KEY, JSON.stringify(breadcrumbs)); } catch {}
 }
 
 // Wrap a synchronous function with timing + breadcrumb. Always records,
@@ -155,10 +122,15 @@ export function timeBreadcrumb<T>(
   }
 }
 
-// Return the prior session's breadcrumbs captured at module init.
-// Safe to call at any time — the snapshot is taken before any new
-// breadcrumb is written, so render-commit layout effects can't contaminate
-// the trail.
+// Read the prior session's breadcrumbs. Call this on mount BEFORE any new
+// breadcrumbs are recorded (which would overwrite the stored array).
 export function readStaleBreadcrumbs(): Breadcrumb[] {
-  return priorBreadcrumbs;
+  try {
+    const raw = localStorage.getItem(BREADCRUMBS_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
 }

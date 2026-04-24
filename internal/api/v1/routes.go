@@ -88,7 +88,6 @@ type API struct {
 	approvals ApprovalHubAPI
 	tmuxProxy *tmuxProxy
 	uploadDir string
-	version   string
 }
 
 func New(logger *slog.Logger, bridge tmux.Bridge, searcher OutputSearcher, database *db.DB, recorder Recorder, status StatusManager, ui UIHub, channels ChannelHubAPI) *API {
@@ -98,20 +97,6 @@ func New(logger *slog.Logger, bridge tmux.Bridge, searcher OutputSearcher, datab
 // SetUploadDir sets the directory for file uploads. Falls back to /tmp/workshop-uploads.
 func (a *API) SetUploadDir(dir string) {
 	a.uploadDir = dir
-}
-
-// SetVersion records the build version string. Exposed via /version so the
-// frontend can detect a backend upgrade and prompt the user to reload.
-func (a *API) SetVersion(v string) {
-	a.version = v
-}
-
-func (a *API) handleVersion(w http.ResponseWriter, _ *http.Request) {
-	v := a.version
-	if v == "" {
-		v = "dev"
-	}
-	a.jsonOK(w, map[string]string{"version": v})
 }
 
 // SetOllama configures the Ollama client for local model integration.
@@ -138,7 +123,6 @@ func (a *API) Routes() http.Handler {
 	}
 
 	mux.HandleFunc("GET /health", a.handleHealth)
-	mux.HandleFunc("GET /version", a.handleVersion)
 	mux.HandleFunc("GET /init", a.handleInit)
 	mux.HandleFunc("POST /debug/log", a.handleDebugLog)
 	mux.HandleFunc("POST /upload", a.handleUpload)

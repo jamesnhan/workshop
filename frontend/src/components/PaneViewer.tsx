@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useImperativeHandle, forwardRef, useCallback } from 'react';
+import { useEffect, useRef, useImperativeHandle, forwardRef, useCallback } from 'react';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { SearchAddon } from '@xterm/addon-search';
@@ -72,12 +72,6 @@ export const PaneViewer = forwardRef<PaneViewerHandle, Props>(
     onTicketClickRef.current = onTicketClick;
     onUrlHoverRef.current = onUrlHover;
     onCommitHoverRef.current = onCommitHover;
-
-    // Render-commit breadcrumb — per-pane, so we can see which viewer
-    // re-rendered most recently before a freeze.
-    useLayoutEffect(() => {
-      recordBreadcrumb('commit:PaneViewer', { target });
-    });
 
     const notifyResizeIfChanged = () => {
       const term = termRef.current;

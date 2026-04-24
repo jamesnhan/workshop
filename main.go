@@ -17,11 +17,6 @@ import (
 //go:embed all:frontend/dist
 var frontendFS embed.FS
 
-// Version is set at build time via -ldflags "-X main.Version=<sha>".
-// Matches the frontend's VITE_BUILD_VERSION so /api/v1/version can tell a
-// stale tab that the server has been upgraded and prompt a reload.
-var Version = "dev"
-
 func main() {
 	if len(os.Args) > 1 && os.Args[0] != "-" {
 		switch os.Args[1] {
@@ -29,7 +24,7 @@ func main() {
 			workshopmcp.Serve()
 			return
 		case "version":
-			fmt.Println("workshop " + Version)
+			fmt.Println("workshop v0.1.0")
 			return
 		}
 	}
@@ -71,7 +66,7 @@ func main() {
 		}
 	}()
 
-	srv, err := server.New(logger, frontendFS, Version)
+	srv, err := server.New(logger, frontendFS)
 	if err != nil {
 		logger.Error("failed to initialize server", "err", err)
 		os.Exit(1)

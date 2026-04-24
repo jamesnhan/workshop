@@ -1,5 +1,5 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { recordBreadcrumb, timeBreadcrumb } from './telemetry';
+import { describe, it, expect, beforeEach } from 'vitest';
+import { recordBreadcrumb, readStaleBreadcrumbs, timeBreadcrumb } from './telemetry';
 
 describe('breadcrumbs', () => {
   beforeEach(() => {
@@ -51,32 +51,19 @@ describe('breadcrumbs', () => {
     expect(last.meta?.threw).toBe(true);
   });
 
-  it('readStaleBreadcrumbs returns [] when no prior snapshot existed', async () => {
-    vi.resetModules();
+  it('readStaleBreadcrumbs returns [] when key is missing', () => {
     localStorage.removeItem('workshop:watchdog-breadcrumbs');
-    const mod = await import('./telemetry');
-    expect(mod.readStaleBreadcrumbs()).toEqual([]);
+    expect(readStaleBreadcrumbs()).toEqual([]);
   });
 
-  it('readStaleBreadcrumbs returns the snapshot taken at module init', async () => {
-    vi.resetModules();
+  it('readStaleBreadcrumbs parses a stored array', () => {
     localStorage.setItem('workshop:watchdog-breadcrumbs', JSON.stringify([{ ts: 1, name: 'a' }]));
-    const mod = await import('./telemetry');
-    expect(mod.readStaleBreadcrumbs()).toEqual([{ ts: 1, name: 'a' }]);
+    const result = readStaleBreadcrumbs();
+    expect(result).toEqual([{ ts: 1, name: 'a' }]);
   });
 
-  it('readStaleBreadcrumbs snapshot is stable even if new breadcrumbs are recorded', async () => {
-    vi.resetModules();
-    localStorage.setItem('workshop:watchdog-breadcrumbs', JSON.stringify([{ ts: 1, name: 'prior' }]));
-    const mod = await import('./telemetry');
-    mod.recordBreadcrumb('new-entry');
-    expect(mod.readStaleBreadcrumbs()).toEqual([{ ts: 1, name: 'prior' }]);
-  });
-
-  it('readStaleBreadcrumbs returns [] on malformed JSON', async () => {
-    vi.resetModules();
+  it('readStaleBreadcrumbs returns [] on malformed JSON', () => {
     localStorage.setItem('workshop:watchdog-breadcrumbs', 'not-json');
-    const mod = await import('./telemetry');
-    expect(mod.readStaleBreadcrumbs()).toEqual([]);
+    expect(readStaleBreadcrumbs()).toEqual([]);
   });
 });

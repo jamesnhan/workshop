@@ -9,9 +9,8 @@ Workshop is a tmux session manager and AI orchestration tool. Tech stack:
 Key directories:
 - `internal/tmux/` — tmux bridge (session/pane management, agent launcher)
 - `internal/server/` — HTTP server, WebSocket handler, output buffer, recording
-- `internal/api/v1/` — REST API routes (sessions, kanban, agents, consensus, docs, git)
+- `internal/api/v1/` — REST API routes (sessions, kanban, agents, docs, git)
 - `internal/db/` — SQLite database (cards, notes, recordings)
-- `internal/consensus/` — Multi-agent consensus engine
 - `internal/mcp/` — MCP server tool definitions
 - `internal/config/` — Lua config engine
 - `frontend/src/` — React SPA (App.tsx, components/, hooks/)

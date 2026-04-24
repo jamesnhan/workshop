@@ -47,7 +47,9 @@
 | Hotkey menu | ? to see all keyboard shortcuts organized by category |
 | Mode tabs | Sessions, Kanban, Graph, Agents, Activity, Docs, Chat, Settings — visual indicator |
 | Git info hover preview | Hover a session's git badge in the sidebar for branch, dirty/ahead/behind counts, and the 5 most recent commits — reuses the shared HoverPreview primitive |
-| Pin hover preview (z) | Press `z` while a hover preview is visible (or just after it disappears) to pin it in place for screenshots; subtle green glow, `z` or `Escape` to unpin |
+| Pin hover preview (z) | Press `z` while any hover preview is visible to pin it globally for screenshots; subtle green glow on all hover types (ticket, link, git commit, git info, usage, pane preview), `z` or `Escape` to unpin |
+| Hover viewport clamping | Hover previews flip above the cursor when they would overflow the bottom of the screen |
+| Usage progress bars | Status bar shows All Models and Sonnet Only weekly usage bars matching Claude's layout; color thresholds (blue/yellow/red); hover for tooltip with token counts, session count, rolling reset times, and "check /usage for exact" disclaimer |
 | Pane output search | Full tmux scrollback, fzf fuzzy matching, 3-mode vim nav (FIND/NAV/PREVIEW) |
 | Search preview | ANSI-rendered context with auto-scroll to match |
 | Live search refresh | Results update every 3 seconds while panel is open |
@@ -74,16 +76,12 @@
 | Trust prompt handling | Auto-dismiss trust/folder prompts for all providers |
 | Agent dashboard | Monitor all agents with status (working/idle/needs_input/done/error) |
 | Chibi avatars | Animated per-state agent visuals with color variants |
-| Consensus engine | Run same prompt through multiple agents, coordinator synthesizes |
-| Mixed-provider consensus | name:provider:model spec format (e.g. deep:gemini:pro) |
-| Consensus cleanup | Kill agent sessions after runs complete |
-| Session audit | Show/hide consensus and control sessions in sidebar |
+| Session audit | Show/hide control sessions in sidebar |
 | Idle detection | Provider-specific prompt pattern matching (Claude/Gemini/Codex) |
 | Auto approval detection | Background pane monitor scans every 3s for permission/trust dialogs and auto-sets yellow status, even on unfocused tabs |
-| Auto-attach new sessions | Sessions created via sidebar/Ctrl+P land as the active tab; agent-launched/dispatched sessions land as inactive tabs without stealing focus |
-| Dispatch tracking | Card-linked agents tracked in DB, supervised goroutine moves card to review on completion |
-| Agent presets | Named specialist roles (reviewer, tester, security, planner, refactorer, architect, orchestrator) with pre-configured provider, model, and system prompt |
-| Phased task orchestrator | `orchestrate_card` MCP tool launches an autonomous agent that drives a card through plan→implement→test→review→PR phases with approval gates at each step |
+| Auto-attach new sessions | Sessions created via sidebar/Ctrl+P land as the active tab; background agent launches land as inactive tabs without stealing focus |
+| Agent presets | Named specialist roles (reviewer, tester, security, planner, refactorer, architect) with pre-configured provider, model, and system prompt |
+| Supervisor pattern | Any Claude Code session in a Workshop pane acts as a supervisor: delegates work via the native Task tool (isolation: worktree), records results via kanban/activity MCP tools |
 | Bypass permissions handling | Trust prompt auto-dismissal for `--dangerously-skip-permissions` mode (Down+Enter to select "Yes, I accept") |
 | Approval gates | `request_approval` MCP tool blocks until user approves/denies in the Activity tab; dedicated ApprovalHub survives WS reconnects |
 
@@ -98,6 +96,7 @@
 | Execution tree view | Activities support `parent_id` for nesting subagent work under parent entries; collapsible tree with child counts |
 | Approval queue | Pending approvals render at the top of the Activity view with markdown-rendered details, diff display, and approve/deny buttons |
 | `report_activity` MCP tool | Agents self-report significant actions; auto-tags pane target; supports `parent_id` for tree nesting |
+| Compaction timeline | Collapsible section in Activity view showing Claude Code context window compaction events with token counts, trigger type, and session slug — parsed from `~/.claude/` session JSONL |
 | Telemetry | `workshop_activity_events_total` and `workshop_approval_requests_total` counters |
 
 ## Inter-Agent Channels
@@ -187,11 +186,10 @@
 
 | Feature | Description |
 |---------|-------------|
-| 45+ MCP tools | Sessions, panes, kanban, agents, consensus, search, status, config, docs, channels, UI control, activity, approvals, presets, orchestrator, usage |
+| 40+ MCP tools | Sessions, panes, kanban, agents, search, status, config, docs, channels, UI control, activity, approvals, presets, orchestrator, usage |
 | Status indicators | set_pane_status (green/yellow/red) for agent state |
 | Kanban from CLI | Create/edit/move cards without leaving the terminal |
 | Agent launch | Launch multi-provider agents via MCP |
-| Consensus runs | Start/monitor/review multi-agent consensus |
 | Pane capture | Read terminal content for AI analysis |
 | UI control tools | `show_toast`, `switch_view`, `focus_cell`, `focus_pane`, `assign_pane`, `open_card` for agents to drive the frontend |
 | Interactive dialogs | `prompt_user` (returns typed string) and `confirm` (returns bool) — themed blocking dialogs for agents to ask the user mid-task |
@@ -210,13 +208,31 @@
 | Regex caching | Notification patterns precompiled, not per-chunk |
 | Capture-pane search | Full scrollback indexed via tmux, not raw PTY |
 
+## Ollama Chat (Local LLM)
+
+| Feature | Description |
+|---------|-------------|
+| Multi-endpoint Ollama | Route to multiple Ollama instances (4090 desktop, M1 Max) via env var or Lua config |
+| Chat UI | Streaming chat with model selector, system prompt, endpoint health badges |
+| Persistent conversations | DB-backed conversation history with sidebar — survives navigation and page reloads |
+| System prompt per conversation | Each conversation stores its own system prompt and model |
+| Auto-continue | Target word count with automatic continuation rounds for long-form generation |
+| Repetition detection | Character-level, vocabulary collapse, and trigram detectors abort degenerate output |
+| Repetition trimming | Garbage text stripped between rounds and before saving; cuts to last clean sentence |
+| Thinking content capture | Falls back to `thinking` field when `content` is empty (models with thinking enabled by default) |
+| Unlimited tokens default | `num_predict: -1` by default — local models run until natural completion |
+| System prompt passthrough | System prompts properly injected as messages for Chat API |
+
 ## Security
 
 | Feature | Description |
 |---------|-------------|
+| API key authentication | `WORKSHOP_API_KEY` env var — Bearer token required on all `/api/v1/*` and `/ws` endpoints; health exempt for K8s probes |
+| Frontend auth gate | Prompts for API key on first visit, validates against API, stores in localStorage |
+| Lua config sandboxing | Inline code execution removed; config loading restricted to `~/.config/workshop/` with symlink-aware path validation |
+| Agent model validation | Model names validated against safe character regex; shell metacharacters rejected with 422 |
 | XSS protection | DOMPurify on all dangerouslySetInnerHTML sites |
-| WebSocket origin check | Restricted to localhost |
-| Shell injection fix | Escaped command concatenation |
+| WebSocket origin check | Restricted to localhost (direct) or authenticated via token query param (K8s) |
 | Error sanitization | Internal details logged, not exposed to clients |
 | Bridge abstraction | No unsafe type assertions |
 
@@ -236,8 +252,8 @@
 |---------|-------------|
 | OTel SDK bootstrap | `internal/telemetry/` package with TracerProvider + MeterProvider + LoggerProvider, gated by `WORKSHOP_OTEL_ENABLED` env var (default off = zero cost) |
 | HTTP instrumentation | otelhttp wraps the REST mux — span per request with method, route, status, duration |
-| Business logic tracing | Spans on channel.publish, db.MoveCard, db.AddDependency, consensus.StartRun with rich attributes |
-| RED metrics | Counters + gauges for channels, kanban mutations, agent launches, consensus runs, activity events, approval requests, agent token usage/cost |
+| Business logic tracing | Spans on channel.publish, db.MoveCard, db.AddDependency with rich attributes |
+| RED metrics | Counters + gauges for channels, kanban mutations, agent launches, activity events, approval requests, agent token usage/cost |
 | Structured log correlation | slog tee handler forwards every log record to Loki via OTel with trace_id/span_id for click-to-trace |
 | Frontend web SDK | `@opentelemetry/sdk-trace-web` with fetch auto-instrumentation — traceparent headers chain browser → backend spans |
 | MCP subprocess tracing | Every tool call produces a `mcp.<tool_name>` span with pane target, linked to backend via traceparent |
@@ -250,12 +266,12 @@
 |---------|-------------|
 | Spec-driven development | Per-area specs under `docs/specs/` are the source of truth for behavior; follows plan → spec → tests → build |
 | Spec test matrices | Every spec file carries a test matrix listing what's covered and what's planned |
-| Backend test suite | 211 Go tests using testify; `internal/testhelpers/` provides `TempDB`, `TempDataDir`, `NewGitRepo` fixtures |
+| Backend test suite | 253 Go tests using testify; `internal/testhelpers/` provides `TempDB`, `TempDataDir`, `NewGitRepo` fixtures |
 | Frontend test suite | 51 Vitest + React Testing Library tests with jsdom environment and localStorage cleanup |
 | Pre-push hook | `.githooks/pre-push` runs `make test-unit` + `make test-frontend` before every push; install once via `make install-hooks` |
 | Coverage reports | `make test-cover` writes HTML coverage under `coverage/backend.html` |
 | Regression guard | Bug fixes include a failing-then-passing test — #442, #443, #444, #445, #447, #330, #441, #439 all pinned |
-| FK cascade fix | Missing `PRAGMA foreign_keys=ON` caught by the first kanban test — notes/deps/log/dispatches now cascade correctly on card delete |
+| FK cascade fix | Missing `PRAGMA foreign_keys=ON` caught by the first kanban test — notes/deps/log now cascade correctly on card delete |
 
 ## Distribution
 

@@ -2577,10 +2577,6 @@
 .notif-permission-banner .btn-small {
   font-size: 0.75rem;
 }
-.version-update-banner {
-  background: color-mix(in srgb, var(--warning) 20%, transparent);
-  border-bottom-color: var(--warning);
-}
 
 /* Status */
 .muted { color: var(--text-dim); }

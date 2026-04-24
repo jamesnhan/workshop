@@ -1,5 +1,4 @@
-import { useState, useCallback, useRef, useEffect, useLayoutEffect, createRef } from 'react';
-import { recordBreadcrumb } from './lib/telemetry';
+import { useState, useCallback, useRef, useEffect, createRef } from 'react';
 import { AuthGate } from './components/AuthGate';
 import { Sidebar } from './components/Sidebar';
 import { PaneGrid } from './components/PaneGrid';
@@ -33,7 +32,6 @@ import { useSettings } from './hooks/useSettings';
 import { useWorkshopSocket } from './hooks/useWebSocket';
 import { useNotifications } from './hooks/useNotifications';
 import { useLockupWatchdog } from './hooks/useLockupWatchdog';
-import { useVersionCheck } from './hooks/useVersionCheck';
 import { get, post, authHeaders } from './api/client';
 import type { LayoutState, PaneInfo, SessionInfo } from './types';
 import { createGrid, navigateGrid, addRow, addCol, removeRow, removeCol, mergeCells, splitCell, swapCellContents, reorderTab } from './types';
@@ -170,13 +168,6 @@ function App() {
   useEffect(() => { requestPermission(); }, [requestPermission]);
   useEffect(() => { try { localStorage.setItem('workshop-split-view', String(splitView)); } catch {} }, [splitView]);
   useEffect(() => { try { localStorage.setItem('workshop-split-ratio', String(splitRatio)); } catch {} }, [splitRatio]);
-
-  // Render-commit breadcrumb — root App re-renders drive the whole tree.
-  // Records view + cell count so we can see what state the app was in on
-  // its last render before a freeze.
-  useLayoutEffect(() => {
-    recordBreadcrumb('commit:App', { view: activeView, cells: layout.cells.length });
-  });
 
   // Wrap subscribe to also mark the pane for notification grace period
   const subscribePane = useCallback((target: string) => {
@@ -430,7 +421,6 @@ function App() {
   useAutoSaveLayout(layout);
   useValidateTargets(allPanes, setLayout);
   useLockupWatchdog(layout, connected);
-  const { updateAvailable: versionUpdateAvailable, latest: latestVersion } = useVersionCheck();
 
   // Remap all pane targets in the layout when a session is renamed.
   const handleSessionRenamed = useCallback((oldName: string, newName: string) => {
@@ -1264,15 +1254,6 @@ function App() {
         <ResizeHandle onResize={(d) => setSidebarWidth((w) => Math.min(500, Math.max(180, w + d)))} />
       )}
       <main className="main-content">
-        {/* Update available banner — backend version differs from embedded.
-            Not dismissible: stale tabs are the root cause of missed freeze
-            fixes, so we keep nudging until the user reloads. */}
-        {versionUpdateAvailable && (
-          <div className="notif-permission-banner version-update-banner">
-            <span>Workshop was updated{latestVersion ? ` (${latestVersion})` : ''} — reload to pick up the new version</span>
-            <button className="btn-create" onClick={() => window.location.reload()}>Reload</button>
-          </div>
-        )}
         {/* Notification permission banner — shown until user grants/denies */}
         {permissionState === 'default' && !notifBannerDismissed && (
           <div className="notif-permission-banner">

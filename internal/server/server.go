@@ -104,7 +104,7 @@ type Server struct {
 	stopReaper chan struct{}
 }
 
-func New(logger *slog.Logger, frontendFS embed.FS, version string) (*Server, error) {
+func New(logger *slog.Logger, frontendFS embed.FS) (*Server, error) {
 	headless := os.Getenv("WORKSHOP_HEADLESS") == "true"
 
 	if !headless {
@@ -148,7 +148,6 @@ func New(logger *slog.Logger, frontendFS embed.FS, version string) (*Server, err
 	approvalHub := NewApprovalHub(statusStore)
 	api := apiv1.New(logger, bridge, outputBuffer, database, recorder, statusStore, &uiHubAdapter{hub: uiHub}, &channelHubAdapter{hub: channelHub})
 	api.SetApprovalHub(approvalHub)
-	api.SetVersion(version)
 
 	// Upload directory: persist uploads alongside the DB so they survive
 	// pod restarts on K8s (both use WORKSHOP_DATA_DIR / PVC).

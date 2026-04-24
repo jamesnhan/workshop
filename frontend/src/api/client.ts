@@ -27,8 +27,8 @@ async function parseError(res: Response): Promise<string> {
   }
 }
 
-export async function get<T>(path: string, signal?: AbortSignal): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, { headers: authHeaders(), signal });
+export async function get<T>(path: string): Promise<T> {
+  const res = await fetch(`${BASE}${path}`, { headers: authHeaders() });
   if (!res.ok) throw new Error(await parseError(res));
   return res.json();
 }

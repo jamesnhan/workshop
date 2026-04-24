@@ -1,6 +1,5 @@
-import { useEffect, useLayoutEffect, useState, useCallback, useRef } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { get, post, del, patch } from '../api/client';
-import { recordBreadcrumb } from '../lib/telemetry';
 import AnsiToHtml from 'ansi-to-html';
 import DOMPurify from 'dompurify';
 import { ConfirmDialog, type DialogKind } from './ConfirmDialog';
@@ -176,28 +175,11 @@ export function Sidebar({ collapsed, onToggleCollapse, onSelectPane, activeTarge
   const isNsfw = (name: string) => sfwMode && nsfwSet.has(name.toLowerCase());
   const visibleSessions = sfwMode ? sessions.filter((s) => !isNsfw(s.name)) : sessions;
 
-  // Abort controller for the in-flight /sessions fetch. Aborted before
-  // each new poll so a slow backend can't stack up N concurrent fetches
-  // in the browser connection pool while the user waits.
-  const refreshAbortRef = useRef<AbortController | null>(null);
   const refresh = useCallback(() => {
-    refreshAbortRef.current?.abort();
-    const ac = new AbortController();
-    refreshAbortRef.current = ac;
-
     const q = showHidden ? '?all=true' : '';
-    const t0 = performance.now();
-    recordBreadcrumb('sidebar.refresh.start');
-    get<Session[]>(`/sessions${q}`, ac.signal)
-      .then((data) => {
-        if (ac.signal.aborted) return;
-        setSessions(data ?? []);
-        recordBreadcrumb('sidebar.refresh.done', { count: (data ?? []).length }, Math.round(performance.now() - t0));
-      })
-      .catch((err: Error) => {
-        const aborted = ac.signal.aborted || err?.name === 'AbortError';
-        recordBreadcrumb(aborted ? 'sidebar.refresh.abort' : 'sidebar.refresh.fail', undefined, Math.round(performance.now() - t0));
-      });
+    get<Session[]>(`/sessions${q}`)
+      .then((data) => setSessions(data ?? []))
+      .catch(() => {});
   }, [showHidden]);
 
   // Ensure we have pane info (for the cwd) for every known session, then
@@ -208,8 +190,6 @@ export function Sidebar({ collapsed, onToggleCollapse, onSelectPane, activeTarge
   const refreshGitInfo = useCallback((sessionList: Session[]) => {
     if (gitFetchingRef.current) return; // Skip if previous batch still running
     gitFetchingRef.current = true;
-    const t0 = performance.now();
-    recordBreadcrumb('sidebar.git.start', { sessions: sessionList.length });
     const promises = sessionList.map(async (s) => {
       let paneList = panesRef.current[s.name];
       if (!paneList) {
@@ -227,18 +207,8 @@ export function Sidebar({ collapsed, onToggleCollapse, onSelectPane, activeTarge
         if (info) setGitInfo((prev) => ({ ...prev, [s.name]: info }));
       } catch { /* not a git repo */ }
     });
-    Promise.allSettled(promises).finally(() => {
-      gitFetchingRef.current = false;
-      recordBreadcrumb('sidebar.git.done', { sessions: sessionList.length }, Math.round(performance.now() - t0));
-    });
+    Promise.allSettled(promises).finally(() => { gitFetchingRef.current = false; });
   }, []);
-
-  // Render-commit breadcrumb — fires every time Sidebar re-renders. During
-  // idle periods a quiet Sidebar still commits on the 5s poll cycle, so this
-  // keeps the ring populated with periodic activity evidence.
-  useLayoutEffect(() => {
-    recordBreadcrumb('commit:Sidebar', { sessions: sessions.length, expanded: expanded.size });
-  });
 
   // panesRef mirrors `panes` so refreshGitInfo can read the latest value
   // inside the interval without re-binding the callback on every change.

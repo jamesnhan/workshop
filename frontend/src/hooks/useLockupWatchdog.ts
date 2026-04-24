@@ -135,73 +135,6 @@ export function useLockupWatchdog(layout: LayoutState, connected: boolean): void
       }, 0);
     }, 2000);
 
-    // --- rAF health check ---
-    // Distinguishes a true main-thread stall (no timers, no rAF) from a
-    // render-only stall (timers fire, rAF is stuck — browser compositor
-    // or paint path hung). If rAF hasn't fired in over 5s while timers
-    // still tick, we emit a `frontend.raf_stall` beacon and attempt a
-    // recovery kick: force reflow + cancel the pending rAF + reschedule.
-    // Observed on Brave/Chromium: the tab can stay visible but have rAF
-    // paused for minutes. Manual tab-switch unfreezes it; the recovery
-    // kick here is an attempt to automate that.
-    let lastRafTs = performance.now();
-    let rafPending = false;
-    let pendingRafHandle: number | null = null;
-    const scheduleRaf = () => {
-      rafPending = true;
-      pendingRafHandle = requestAnimationFrame(() => {
-        pendingRafHandle = null;
-        rafPending = false;
-        lastRafTs = performance.now();
-        scheduleRaf();
-      });
-    };
-    scheduleRaf();
-
-    // Force an immediate rAF recovery. Used both by the setInterval stall
-    // detector and by the focus/pointerdown handlers so waking the tab
-    // doesn't have to wait for the next 2s poll.
-    const kickRaf = (source: string) => {
-      if (pendingRafHandle !== null) {
-        cancelAnimationFrame(pendingRafHandle);
-        pendingRafHandle = null;
-        rafPending = false;
-      }
-      // Force synchronous layout — reading offsetHeight flushes any
-      // pending style/layout work and can trip the compositor back on.
-      void document.body.offsetHeight;
-      scheduleRaf();
-      recordBreadcrumb('raf_kick', { source });
-    };
-
-    // Wake-from-idle: when the system was idle and the user interacts,
-    // kick the compositor immediately instead of waiting for the stall
-    // detector. Idempotent in the healthy case (just queues one extra
-    // rAF that gets cancelled on the next normal tick).
-    const onWindowFocus = () => {
-      if (performance.now() - lastRafTs > 2000) kickRaf('focus');
-    };
-    const onPointerDown = () => {
-      if (performance.now() - lastRafTs > 2000) kickRaf('pointerdown');
-    };
-    window.addEventListener('focus', onWindowFocus);
-    window.addEventListener('pointerdown', onPointerDown, { capture: true, passive: true });
-    const rafWatchdog = setInterval(() => {
-      const gap = performance.now() - lastRafTs;
-      // Ignore when tab is hidden (rAF is legitimately paused).
-      if (gap > 5000 && document.visibilityState === 'visible') {
-        post({
-          msg: 'frontend.raf_stall',
-          gap_ms: Math.round(gap),
-          raf_pending: rafPending,
-          visibility_state: document.visibilityState,
-        });
-        recordBreadcrumb('raf_stall', { gap_ms: Math.round(gap), pending: rafPending });
-        kickRaf('watchdog');
-        lastRafTs = performance.now(); // reset so we don't spam
-      }
-    }, 2000);
-
     // --- Tick loop ---
     let tickCount = 0;
     let lastTickTs = Date.now();
@@ -237,20 +170,7 @@ export function useLockupWatchdog(layout: LayoutState, connected: boolean): void
       };
       try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); } catch {}
 
-      // Record a lightweight tick breadcrumb every 10s so the ring keeps
-      // producing entries during idle periods. Without this, a quiet tab
-      // stops generating breadcrumbs and the post-freeze trail is stale
-      // by the time the main thread actually hangs.
-      if (tickCount % 10 === 0) {
-        recordBreadcrumb('watchdog.tick', {
-          tick: tickCount,
-          visibility: document.visibilityState,
-          connected: connectedRef.current,
-        });
-      }
-
       if (tickCount % HEARTBEAT_EVERY_N_TICKS === 0) {
-        recordBreadcrumb('watchdog.heartbeat.pre', { tick: tickCount });
         post({
           msg: 'watchdog.heartbeat',
           tick_count: state.tickCount,
@@ -271,7 +191,6 @@ export function useLockupWatchdog(layout: LayoutState, connected: boolean): void
           output_flush_bytes_since_beat: counters.outputFlushBytes,
           max_output_flush_ms: Math.round(counters.maxOutputFlushMs),
         });
-        recordBreadcrumb('watchdog.heartbeat.post', { tick: tickCount });
         resetCounters();
       }
     };
@@ -286,15 +205,12 @@ export function useLockupWatchdog(layout: LayoutState, connected: boolean): void
     return () => {
       clearInterval(interval);
       if (lagTimer) clearInterval(lagTimer);
-      clearInterval(rafWatchdog);
       longTaskObserver?.disconnect();
       document.removeEventListener('visibilitychange', onVisibilityChange);
       document.removeEventListener('freeze', onPageFreeze);
       document.removeEventListener('resume', onPageResume);
       window.removeEventListener('pageshow', onPageShow);
       window.removeEventListener('pagehide', onPageHide);
-      window.removeEventListener('focus', onWindowFocus);
-      window.removeEventListener('pointerdown', onPointerDown, { capture: true } as EventListenerOptions);
     };
   }, []);
 }
